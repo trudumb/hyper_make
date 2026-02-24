@@ -19,13 +19,11 @@ pub mod stream;
 use async_trait::async_trait;
 use futures_util::Stream;
 
+use crate::market_maker::{CancelResult, ModifyResult, ModifySpec, OrderResult, OrderSpec};
 use crate::prelude::Result;
 use crate::ws::message_types::{
     ActiveAssetData, AllMids, L2Book, OpenOrders, OrderUpdates, Trades, UserFills,
     UserNonFundingLedgerUpdates, WebData2,
-};
-use crate::market_maker::{
-    CancelResult, ModifyResult, ModifySpec, OrderResult, OrderSpec,
 };
 
 // Re-export core executor types for convenience
@@ -187,11 +185,8 @@ pub trait TradingEnvironment: Send + Sync + 'static {
     ) -> ModifyResult;
 
     /// Modify multiple orders in a single API call.
-    async fn modify_bulk_orders(
-        &self,
-        asset: &str,
-        modifies: Vec<ModifySpec>,
-    ) -> Vec<ModifyResult>;
+    async fn modify_bulk_orders(&self, asset: &str, modifies: Vec<ModifySpec>)
+        -> Vec<ModifyResult>;
 
     /// Startup sync (live: sync position + cancel all orders; paper: no-op).
     async fn sync_state(&mut self) -> Result<()>;

@@ -185,11 +185,16 @@ impl AdaptiveHazard {
     ///
     /// # Returns
     /// Hazard rate (probability of regime change per observation)
-    pub fn compute(&mut self, vpin: f64, hawkes_intensity_ratio: f64, size_anomaly_sigma: f64) -> f64 {
+    pub fn compute(
+        &mut self,
+        vpin: f64,
+        hawkes_intensity_ratio: f64,
+        size_anomaly_sigma: f64,
+    ) -> f64 {
         // Compute stress contributions
         let vpin_stress = self.config.vpin_sensitivity * vpin;
-        let intensity_stress = self.config.intensity_sensitivity
-            * (hawkes_intensity_ratio - 1.0).max(0.0);
+        let intensity_stress =
+            self.config.intensity_sensitivity * (hawkes_intensity_ratio - 1.0).max(0.0);
         let anomaly_stress = self.config.anomaly_sensitivity * size_anomaly_sigma.max(0.0);
 
         // Total stress multiplier
@@ -271,7 +276,11 @@ impl RegressionStats {
     }
 
     /// Compute posterior mean of coefficients (ridge regression solution).
-    fn posterior_mean(&self, prior_precision: f64, prior_mean: &[f64; N_FEATURES]) -> [f64; N_FEATURES] {
+    fn posterior_mean(
+        &self,
+        prior_precision: f64,
+        prior_mean: &[f64; N_FEATURES],
+    ) -> [f64; N_FEATURES] {
         if self.n < N_FEATURES {
             return *prior_mean;
         }
@@ -340,7 +349,10 @@ impl RegressionStats {
 
         // Log of Gaussian PDF
         let residual = y - pred;
-        -0.5 * (var.ln() + residual * residual / var + std::f64::consts::LN_2 + std::f64::consts::PI.ln())
+        -0.5 * (var.ln()
+            + residual * residual / var
+            + std::f64::consts::LN_2
+            + std::f64::consts::PI.ln())
     }
 }
 
@@ -442,13 +454,20 @@ impl BOCPDKappaPredictor {
         hawkes_intensity_ratio: f64,
         size_anomaly_sigma: f64,
     ) -> bool {
-        let hazard = self.adaptive_hazard.compute(vpin, hawkes_intensity_ratio, size_anomaly_sigma);
+        let hazard = self
+            .adaptive_hazard
+            .compute(vpin, hawkes_intensity_ratio, size_anomaly_sigma);
         self.last_hazard_rate = hazard;
         self.update_internal(features, realized_kappa, hazard)
     }
 
     /// Internal update method with explicit hazard rate.
-    fn update_internal(&mut self, features: &[f64; N_FEATURES], realized_kappa: f64, hazard: f64) -> bool {
+    fn update_internal(
+        &mut self,
+        features: &[f64; N_FEATURES],
+        realized_kappa: f64,
+        hazard: f64,
+    ) -> bool {
         self.observation_count += 1;
 
         let max_len = self.config.max_run_length;
@@ -536,7 +555,8 @@ impl BOCPDKappaPredictor {
         self.p_new_regime_cached = self.compute_p_new_regime();
 
         // Detect changepoint
-        self.last_changepoint_detected = self.p_new_regime_cached > self.config.changepoint_threshold;
+        self.last_changepoint_detected =
+            self.p_new_regime_cached > self.config.changepoint_threshold;
         self.last_changepoint_detected
     }
 
@@ -762,7 +782,7 @@ mod tests {
             let x1 = (t as f64 * 0.1).sin() + 1.0;
             let x2 = (t as f64 * 0.05).cos() + 1.0;
             let features = [x1, x2, 0.0, 0.0];
-            let kappa = x1 + x2;  // Simple: kappa = x1 + x2
+            let kappa = x1 + x2; // Simple: kappa = x1 + x2
             predictor.update(&features, kappa);
         }
 
@@ -785,7 +805,11 @@ mod tests {
 
         // Expected run length should be positive
         let expected_rl = predictor.expected_run_length();
-        assert!(expected_rl > 0.0, "Expected run length should be positive: {}", expected_rl);
+        assert!(
+            expected_rl > 0.0,
+            "Expected run length should be positive: {}",
+            expected_rl
+        );
 
         // Entropy should be positive (there's uncertainty in run length)
         let entropy = predictor.run_length_entropy();
@@ -830,7 +854,9 @@ mod tests {
         assert!(
             p_after > p_before * 0.5 || detected_change,
             "Should detect relationship change: p_before={}, p_after={}, detected={}",
-            p_before, p_after, detected_change
+            p_before,
+            p_after,
+            detected_change
         );
     }
 

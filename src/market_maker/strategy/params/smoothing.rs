@@ -223,21 +223,21 @@ impl ParameterSmoother {
         }
 
         // Handle regime change with cooldown
-        let effective_regime_change = if regime_changed && self.cycle_count >= self.cooldown_until_cycle
-        {
-            self.regime_change_cycle = Some(self.cycle_count);
-            self.cooldown_until_cycle =
-                self.cycle_count + u64::from(self.config.regime_cooldown_cycles);
-            // Reset all EMA states to pick up new regime parameters immediately
-            self.sigma_ema.reset();
-            self.kappa_ema.reset();
-            self.gamma_mult_ema.reset();
-            self.lead_lag_ema.reset();
-            self.tail_risk_ema.reset();
-            true
-        } else {
-            false
-        };
+        let effective_regime_change =
+            if regime_changed && self.cycle_count >= self.cooldown_until_cycle {
+                self.regime_change_cycle = Some(self.cycle_count);
+                self.cooldown_until_cycle =
+                    self.cycle_count + u64::from(self.config.regime_cooldown_cycles);
+                // Reset all EMA states to pick up new regime parameters immediately
+                self.sigma_ema.reset();
+                self.kappa_ema.reset();
+                self.gamma_mult_ema.reset();
+                self.lead_lag_ema.reset();
+                self.tail_risk_ema.reset();
+                true
+            } else {
+                false
+            };
 
         let _ = effective_regime_change; // used implicitly via EMA reset
 
@@ -520,14 +520,17 @@ mod tests {
         params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
 
-        assert!((params.sigma - 0.01).abs() < 1e-10, "sigma should converge to constant input");
+        assert!(
+            (params.sigma - 0.01).abs() < 1e-10,
+            "sigma should converge to constant input"
+        );
     }
 
     #[test]
     fn test_deadband_suppression_relative() {
         let mut smoother = ParameterSmoother::new(SmootherConfig {
             enabled: true,
-            sigma_alpha: 1.0, // instant tracking (no smoothing)
+            sigma_alpha: 1.0,         // instant tracking (no smoothing)
             sigma_deadband_pct: 0.05, // 5% deadband
             ..Default::default()
         });
@@ -567,7 +570,7 @@ mod tests {
     fn test_deadband_suppression_absolute() {
         let mut smoother = ParameterSmoother::new(SmootherConfig {
             enabled: true,
-            lead_lag_alpha: 1.0, // instant tracking
+            lead_lag_alpha: 1.0,        // instant tracking
             lead_lag_deadband_bps: 2.0, // 2 bps absolute deadband
             ..Default::default()
         });
@@ -605,7 +608,7 @@ mod tests {
     fn test_regime_reset() {
         let mut smoother = ParameterSmoother::new(SmootherConfig {
             enabled: true,
-            sigma_alpha: 0.10, // slow tracking
+            sigma_alpha: 0.10,     // slow tracking
             regime_ramp_cycles: 0, // no ramp (for simpler test)
             ..Default::default()
         });
@@ -835,7 +838,10 @@ mod tests {
         params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert_eq!(params.regime_kappa, None);
-        assert!(!smoother.kappa_ema.initialized, "kappa EMA should be reset when None");
+        assert!(
+            !smoother.kappa_ema.initialized,
+            "kappa EMA should be reset when None"
+        );
     }
 
     #[test]

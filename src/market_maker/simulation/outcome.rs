@@ -226,7 +226,11 @@ impl OutcomeTracker {
     }
 
     /// Compute PnL decomposition for a single fill
-    fn compute_fill_decomposition(&self, tracked: &TrackedFill, current_mid: f64) -> PnLDecomposition {
+    fn compute_fill_decomposition(
+        &self,
+        tracked: &TrackedFill,
+        current_mid: f64,
+    ) -> PnLDecomposition {
         let fill = &tracked.fill;
         let notional = fill.fill_price * fill.fill_size;
 

@@ -123,11 +123,7 @@ impl ReduceOnlyResult {
         since = "0.7.0",
         note = "Subsumed by Avellaneda-Stoikov reservation price in signal_integration.rs"
     )]
-    pub fn compute_urgency(
-        position_abs: f64,
-        max_position: f64,
-        unrealized_pnl: f64,
-    ) -> f64 {
+    pub fn compute_urgency(position_abs: f64, max_position: f64, unrealized_pnl: f64) -> f64 {
         if position_abs <= max_position {
             return 0.0;
         }
@@ -942,7 +938,10 @@ mod tests {
 
         // Should force reduce (survival > P&L), NOT underwater protection
         assert!(result.was_filtered);
-        assert_eq!(result.reason, Some(ReduceOnlyReason::ApproachingLiquidation));
+        assert_eq!(
+            result.reason,
+            Some(ReduceOnlyReason::ApproachingLiquidation)
+        );
         assert!(result.filtered_bids);
         assert!(!result.filtered_asks);
     }
@@ -1009,7 +1008,10 @@ mod tests {
         // Same excess (1.5x) but underwater
         let urgency_dry = ReduceOnlyResult::compute_urgency(15.0, 10.0, 100.0);
         let urgency_wet = ReduceOnlyResult::compute_urgency(15.0, 10.0, -50.0);
-        assert!(urgency_wet > urgency_dry, "Underwater should increase urgency: wet={urgency_wet} dry={urgency_dry}");
+        assert!(
+            urgency_wet > urgency_dry,
+            "Underwater should increase urgency: wet={urgency_wet} dry={urgency_dry}"
+        );
     }
 
     #[test]
@@ -1031,8 +1033,14 @@ mod tests {
         let (new_bid, new_ask) = apply_close_bias(bid, ask, mid, 5.0, urgency);
         // Long: ask should decrease (tighten sell side), bid unchanged
         assert_eq!(new_bid, bid);
-        assert!(new_ask < ask, "Ask should tighten: new_ask={new_ask} < old_ask={ask}");
-        assert!(new_ask > mid, "Ask must stay above mid: new_ask={new_ask} > mid={mid}");
+        assert!(
+            new_ask < ask,
+            "Ask should tighten: new_ask={new_ask} < old_ask={ask}"
+        );
+        assert!(
+            new_ask > mid,
+            "Ask must stay above mid: new_ask={new_ask} > mid={mid}"
+        );
     }
 
     #[test]
@@ -1045,8 +1053,14 @@ mod tests {
         let (new_bid, new_ask) = apply_close_bias(bid, ask, mid, -5.0, urgency);
         // Short: bid should increase (tighten buy side), ask unchanged
         assert_eq!(new_ask, ask);
-        assert!(new_bid > bid, "Bid should tighten: new_bid={new_bid} > old_bid={bid}");
-        assert!(new_bid < mid, "Bid must stay below mid: new_bid={new_bid} < mid={mid}");
+        assert!(
+            new_bid > bid,
+            "Bid should tighten: new_bid={new_bid} > old_bid={bid}"
+        );
+        assert!(
+            new_bid < mid,
+            "Bid must stay below mid: new_bid={new_bid} < mid={mid}"
+        );
     }
 
     #[test]
@@ -1069,10 +1083,16 @@ mod tests {
 
         // Long with max urgency
         let (_, new_ask) = apply_close_bias(bid, ask, mid, 5.0, 1.0);
-        assert!(new_ask > mid, "Ask must never cross mid: new_ask={new_ask} > mid={mid}");
+        assert!(
+            new_ask > mid,
+            "Ask must never cross mid: new_ask={new_ask} > mid={mid}"
+        );
 
         // Short with max urgency
         let (new_bid, _) = apply_close_bias(bid, ask, mid, -5.0, 1.0);
-        assert!(new_bid < mid, "Bid must never cross mid: new_bid={new_bid} < mid={mid}");
+        assert!(
+            new_bid < mid,
+            "Bid must never cross mid: new_bid={new_bid} < mid={mid}"
+        );
     }
 }

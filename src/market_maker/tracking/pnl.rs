@@ -850,7 +850,8 @@ impl PerformanceGatedCapacity {
             // Losing money → reduce capacity proportionally
             // reduction = loss_ratio × multiplier, clamped to [0, 1 - min_fraction]
             let loss_ratio = pnl_ratio.abs();
-            let reduction = (loss_ratio * self.loss_reduction_mult).min(1.0 - self.min_capacity_fraction);
+            let reduction =
+                (loss_ratio * self.loss_reduction_mult).min(1.0 - self.min_capacity_fraction);
             1.0 - reduction
         };
 
@@ -1019,10 +1020,10 @@ mod tests {
     #[test]
     fn test_performance_gated_capacity_profitable() {
         let capacity = PerformanceGatedCapacity::new(
-            10.0,     // 10 BTC max
-            50000.0,  // $50k reference price
-            2.0,      // 2x loss multiplier
-            0.3,      // 30% minimum
+            10.0,    // 10 BTC max
+            50000.0, // $50k reference price
+            2.0,     // 2x loss multiplier
+            0.3,     // 30% minimum
         );
 
         // Making money → full capacity
@@ -1034,34 +1035,43 @@ mod tests {
     #[test]
     fn test_performance_gated_capacity_losing() {
         let capacity = PerformanceGatedCapacity::new(
-            10.0,     // 10 BTC max
-            50000.0,  // $50k reference price ($500k notional)
-            2.0,      // 2x loss multiplier
-            0.3,      // 30% minimum
+            10.0,    // 10 BTC max
+            50000.0, // $50k reference price ($500k notional)
+            2.0,     // 2x loss multiplier
+            0.3,     // 30% minimum
         );
 
         // Losing 5% of notional ($25k) → reduction = 5% × 2 = 10%
         let allowed = capacity.allowed_max_position(-25000.0);
-        assert!((allowed - 9.0).abs() < 0.1, "Expected ~9.0, got {}", allowed);
+        assert!(
+            (allowed - 9.0).abs() < 0.1,
+            "Expected ~9.0, got {}",
+            allowed
+        );
         assert!(capacity.is_reduced(-25000.0));
 
         // Losing 50% of notional ($250k) → reduction capped at 70% (min 30%)
         let allowed_max_loss = capacity.allowed_max_position(-250000.0);
-        assert!((allowed_max_loss - 3.0).abs() < 0.1, "Expected ~3.0, got {}", allowed_max_loss);
+        assert!(
+            (allowed_max_loss - 3.0).abs() < 0.1,
+            "Expected ~3.0, got {}",
+            allowed_max_loss
+        );
     }
 
     #[test]
     fn test_performance_gated_capacity_floor() {
         let capacity = PerformanceGatedCapacity::new(
-            10.0,
-            50000.0,
-            2.0,
-            0.3, // 30% floor
+            10.0, 50000.0, 2.0, 0.3, // 30% floor
         );
 
         // Even with massive loss, should never go below 30%
         let allowed = capacity.allowed_max_position(-1_000_000.0);
-        assert!(allowed >= 3.0, "Should be at least 30% = 3.0, got {}", allowed);
+        assert!(
+            allowed >= 3.0,
+            "Should be at least 30% = 3.0, got {}",
+            allowed
+        );
     }
 
     #[test]

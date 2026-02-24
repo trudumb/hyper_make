@@ -53,10 +53,7 @@ impl SignalPnLAttributor {
     /// Record a cycle's contributions along with its PnL outcome.
     pub fn record_cycle(&mut self, contributions: &CycleContributions, pnl_bps: f64) {
         for contrib in &contributions.contributions {
-            let entry = self
-                .stats
-                .entry(contrib.signal_name.clone())
-                .or_default();
+            let entry = self.stats.entry(contrib.signal_name.clone()).or_default();
             if contrib.was_active {
                 entry.active_pnl_sum += pnl_bps;
                 entry.active_count += 1;
@@ -69,16 +66,12 @@ impl SignalPnLAttributor {
 
     /// Cumulative PnL when a signal was active.
     pub fn signal_pnl(&self, signal: &str) -> f64 {
-        self.stats
-            .get(signal)
-            .map_or(0.0, |s| s.active_pnl_sum)
+        self.stats.get(signal).map_or(0.0, |s| s.active_pnl_sum)
     }
 
     /// Cumulative PnL when a signal was inactive.
     pub fn signal_pnl_inactive(&self, signal: &str) -> f64 {
-        self.stats
-            .get(signal)
-            .map_or(0.0, |s| s.inactive_pnl_sum)
+        self.stats.get(signal).map_or(0.0, |s| s.inactive_pnl_sum)
     }
 
     /// Marginal value: active PnL/fill minus inactive PnL/fill.
@@ -140,10 +133,7 @@ impl Default for SignalPnLAttributor {
 mod tests {
     use super::*;
 
-    fn make_cycle(
-        cycle_id: u64,
-        signals: &[(&str, bool)],
-    ) -> CycleContributions {
+    fn make_cycle(cycle_id: u64, signals: &[(&str, bool)]) -> CycleContributions {
         CycleContributions {
             cycle_id,
             timestamp_ns: cycle_id * 1_000_000_000,
@@ -180,7 +170,10 @@ mod tests {
 
         // Marginal = 5.0 - (-2.0) = 7.0
         let marginal = attributor.marginal_value("SignalA");
-        assert!((marginal - 7.0).abs() < 1e-10, "Expected 7.0, got {marginal}");
+        assert!(
+            (marginal - 7.0).abs() < 1e-10,
+            "Expected 7.0, got {marginal}"
+        );
     }
 
     #[test]

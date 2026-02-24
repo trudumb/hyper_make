@@ -738,9 +738,7 @@ impl StatisticalValidator {
             t_stat,
             p_value,
             n,
-            &format!(
-                "Mean: {mean:.4}, Std: {std_dev:.4}, SE: {std_error:.4}"
-            ),
+            &format!("Mean: {mean:.4}, Std: {std_dev:.4}, SE: {std_error:.4}"),
         )
     }
 

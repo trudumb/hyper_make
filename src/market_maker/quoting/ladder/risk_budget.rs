@@ -162,21 +162,17 @@ pub fn allocate_risk_budget(
         return (uniform, diag);
     }
 
-    let per_level_cap = (budget.position_capacity * budget.max_single_order_fraction)
-        .max(budget.min_viable_size); // Never cap below exchange minimum
+    let per_level_cap =
+        (budget.position_capacity * budget.max_single_order_fraction).max(budget.min_viable_size); // Never cap below exchange minimum
 
     // Step 1: Compute softmax weights with entropy floor
-    let (weights, effective_temp) = compute_softmax_weights(
-        levels,
-        softmax.temperature,
-        softmax.min_entropy_bits,
-    );
+    let (weights, effective_temp) =
+        compute_softmax_weights(levels, softmax.temperature, softmax.min_entropy_bits);
 
     let entropy = shannon_entropy_bits(&weights);
 
     // Step 2: Compute target sizes from weights
-    let min_level_size = (total_capacity * softmax.min_level_fraction)
-        .max(budget.min_viable_size);
+    let min_level_size = (total_capacity * softmax.min_level_fraction).max(budget.min_viable_size);
     let mut sizes = vec![0.0_f64; levels.len()];
 
     // Initial allocation from weights
@@ -275,8 +271,8 @@ pub fn allocate_risk_budget_uniform(
         return Vec::new();
     }
 
-    let per_level_cap = (budget.position_capacity * budget.max_single_order_fraction)
-        .max(budget.min_viable_size); // Never cap below exchange minimum
+    let per_level_cap =
+        (budget.position_capacity * budget.max_single_order_fraction).max(budget.min_viable_size); // Never cap below exchange minimum
     let mut remaining_position = budget.position_capacity;
     let mut remaining_margin = budget.margin_capacity;
     let mut allocations = Vec::with_capacity(levels.len());
@@ -302,9 +298,7 @@ pub fn allocate_risk_budget_uniform(
             f64::MAX
         };
 
-        let raw_max = per_level_cap
-            .min(remaining_position)
-            .min(margin_limited);
+        let raw_max = per_level_cap.min(remaining_position).min(margin_limited);
 
         let truncated = truncate_float(raw_max, budget.sz_decimals, false);
 
@@ -448,8 +442,8 @@ mod tests {
         SideRiskBudget {
             position_capacity,
             margin_capacity: position_capacity * 29.63 / 10.0, // 10x leverage
-            margin_per_contract: 29.63 / 10.0, // $2.963 margin per HYPE
-            min_viable_size: 0.34, // ~$10 min notional
+            margin_per_contract: 29.63 / 10.0,                 // $2.963 margin per HYPE
+            min_viable_size: 0.34,                             // ~$10 min notional
             max_single_order_fraction: 0.25,
             sz_decimals: 2,
         }
@@ -466,12 +460,12 @@ mod tests {
     #[test]
     fn test_softmax_allocation_skewed() {
         // 5 levels with declining utility — touch should get most size
-        let levels = make_levels(
-            &[8.0, 12.0, 16.0, 20.0, 24.0],
-            &[3.0, 2.2, 1.5, 1.0, 0.5],
-        );
+        let levels = make_levels(&[8.0, 12.0, 16.0, 20.0, 24.0], &[3.0, 2.2, 1.5, 1.0, 0.5]);
         let budget = hype_budget(8.0);
-        let params = SoftmaxParams { temperature: 0.5, ..default_softmax() };
+        let params = SoftmaxParams {
+            temperature: 0.5,
+            ..default_softmax()
+        };
 
         let (allocs, diag) = allocate_risk_budget(&levels, &budget, &params);
 
@@ -484,7 +478,8 @@ mod tests {
         assert!(
             touch_size > deepest_size,
             "Touch ({:.2}) should be larger than deepest ({:.2})",
-            touch_size, deepest_size,
+            touch_size,
+            deepest_size,
         );
 
         // Touch should be at least 2x the deepest level
@@ -508,10 +503,7 @@ mod tests {
     #[test]
     fn test_entropy_floor_prevents_collapse() {
         // One level has vastly higher utility — should still allocate to others
-        let levels = make_levels(
-            &[8.0, 12.0, 16.0, 20.0],
-            &[10.0, 1.0, 0.5, 0.1],
-        );
+        let levels = make_levels(&[8.0, 12.0, 16.0, 20.0], &[10.0, 1.0, 0.5, 0.1]);
         let budget = hype_budget(8.0);
         let params = SoftmaxParams {
             temperature: 0.1, // Very cold — would collapse without entropy floor
@@ -547,49 +539,82 @@ mod tests {
     fn test_temperature_regime_scaling() {
         // Calm regime → cold temperature → more skewed
         let temp_calm = compute_allocation_temperature(1.0, 1.0, false);
-        assert!((temp_calm - 0.3).abs() < 0.01, "Calm should be 0.3, got {}", temp_calm);
+        assert!(
+            (temp_calm - 0.3).abs() < 0.01,
+            "Calm should be 0.3, got {}",
+            temp_calm
+        );
 
         // Normal regime
         let temp_normal = compute_allocation_temperature(1.3, 1.0, false);
-        assert!((temp_normal - 0.5).abs() < 0.01, "Normal should be 0.5, got {}", temp_normal);
+        assert!(
+            (temp_normal - 0.5).abs() < 0.01,
+            "Normal should be 0.5, got {}",
+            temp_normal
+        );
 
         // Volatile regime
         let temp_volatile = compute_allocation_temperature(1.8, 1.0, false);
-        assert!((temp_volatile - 1.0).abs() < 0.01, "Volatile should be 1.0, got {}", temp_volatile);
+        assert!(
+            (temp_volatile - 1.0).abs() < 0.01,
+            "Volatile should be 1.0, got {}",
+            temp_volatile
+        );
 
         // Extreme regime
         let temp_extreme = compute_allocation_temperature(3.0, 1.0, false);
-        assert!((temp_extreme - 2.0).abs() < 0.01, "Extreme should be 2.0, got {}", temp_extreme);
+        assert!(
+            (temp_extreme - 2.0).abs() < 0.01,
+            "Extreme should be 2.0, got {}",
+            temp_extreme
+        );
 
         // Warmup adds 0.5
         let temp_warmup = compute_allocation_temperature(1.0, 0.1, false);
-        assert!((temp_warmup - 0.8).abs() < 0.01, "Warmup should be 0.8, got {}", temp_warmup);
+        assert!(
+            (temp_warmup - 0.8).abs() < 0.01,
+            "Warmup should be 0.8, got {}",
+            temp_warmup
+        );
 
         // Yellow zone adds 0.3
         let temp_yellow = compute_allocation_temperature(1.0, 1.0, true);
-        assert!((temp_yellow - 0.6).abs() < 0.01, "Yellow should be 0.6, got {}", temp_yellow);
+        assert!(
+            (temp_yellow - 0.6).abs() < 0.01,
+            "Yellow should be 0.6, got {}",
+            temp_yellow
+        );
 
         // Combined: extreme + warmup + yellow = 2.0 + 0.5 + 0.3 = 2.8
         let temp_all = compute_allocation_temperature(3.0, 0.1, true);
-        assert!((temp_all - 2.8).abs() < 0.01, "Combined should be 2.8, got {}", temp_all);
+        assert!(
+            (temp_all - 2.8).abs() < 0.01,
+            "Combined should be 2.8, got {}",
+            temp_all
+        );
 
         // gamma_mult=5.0 → base=2.0, warmup=0.0 → +0.5, yellow → +0.3 = 2.8
         let temp_high = compute_allocation_temperature(5.0, 0.0, true);
-        assert!((temp_high - 2.8).abs() < 0.01, "High should be 2.8, got {}", temp_high);
+        assert!(
+            (temp_high - 2.8).abs() < 0.01,
+            "High should be 2.8, got {}",
+            temp_high
+        );
 
         // Clamped at 3.0 max: requires base=2.0 + warmup=0.5 + zone=0.3 + extra
         // Actually 2.8 is max achievable. Verify clamp at lower bound:
         let temp_min = compute_allocation_temperature(0.5, 1.0, false);
-        assert!((temp_min - 0.3).abs() < 0.01, "Min calm should be 0.3, got {}", temp_min);
+        assert!(
+            (temp_min - 0.3).abs() < 0.01,
+            "Min calm should be 0.3, got {}",
+            temp_min
+        );
     }
 
     #[test]
     fn test_high_temperature_nearly_uniform() {
         // Hot temperature → nearly uniform allocation
-        let levels = make_levels(
-            &[8.0, 12.0, 16.0, 20.0],
-            &[3.0, 2.0, 1.5, 1.0],
-        );
+        let levels = make_levels(&[8.0, 12.0, 16.0, 20.0], &[3.0, 2.0, 1.5, 1.0]);
         let budget = hype_budget(8.0);
         let params = SoftmaxParams {
             temperature: 5.0,
@@ -607,7 +632,9 @@ mod tests {
             assert!(
                 max_size / min_size < 1.5,
                 "High temp should be near-uniform: max={:.2}, min={:.2}, ratio={:.2}",
-                max_size, min_size, max_size / min_size,
+                max_size,
+                min_size,
+                max_size / min_size,
             );
         }
     }
@@ -615,12 +642,12 @@ mod tests {
     #[test]
     fn test_softmax_equal_utilities_uniform() {
         // All equal utilities → uniform regardless of temperature
-        let levels = make_levels(
-            &[8.0, 12.0, 16.0, 20.0],
-            &[2.0, 2.0, 2.0, 2.0],
-        );
+        let levels = make_levels(&[8.0, 12.0, 16.0, 20.0], &[2.0, 2.0, 2.0, 2.0]);
         let budget = hype_budget(8.0);
-        let params = SoftmaxParams { temperature: 0.3, ..default_softmax() };
+        let params = SoftmaxParams {
+            temperature: 0.3,
+            ..default_softmax()
+        };
 
         let (allocs, diag) = allocate_risk_budget(&levels, &budget, &params);
 
@@ -640,7 +667,8 @@ mod tests {
             assert!(
                 max_size - min_size < 0.1,
                 "Equal utilities: sizes should be similar, max={:.2}, min={:.2}",
-                max_size, min_size,
+                max_size,
+                min_size,
             );
         }
     }
@@ -651,10 +679,7 @@ mod tests {
 
     #[test]
     fn test_allocate_basic() {
-        let levels = make_levels(
-            &[8.0, 12.0, 16.0, 20.0],
-            &[2.5, 2.0, 1.5, 1.0],
-        );
+        let levels = make_levels(&[8.0, 12.0, 16.0, 20.0], &[2.5, 2.0, 1.5, 1.0]);
         let budget = hype_budget(8.0);
 
         let allocs = allocate_risk_budget_uniform(&levels, &budget);
@@ -662,19 +687,28 @@ mod tests {
         assert!(!allocs.is_empty(), "Should allocate to some levels");
 
         let total = total_allocated_size(&allocs);
-        assert!(total <= 8.0 + 0.01,
-            "Total {} should not exceed capacity 8.0", total);
+        assert!(
+            total <= 8.0 + 0.01,
+            "Total {} should not exceed capacity 8.0",
+            total
+        );
 
         for alloc in &allocs {
-            assert!(alloc.size <= 2.01,
+            assert!(
+                alloc.size <= 2.01,
                 "Level at {}bps has size {} > per_level_cap 2.0",
-                alloc.tick.depth_bps, alloc.size);
+                alloc.tick.depth_bps,
+                alloc.size
+            );
         }
 
         for alloc in &allocs {
-            assert!(alloc.size >= 0.34,
+            assert!(
+                alloc.size >= 0.34,
                 "Level at {}bps has size {} < min_viable 0.34",
-                alloc.tick.depth_bps, alloc.size);
+                alloc.tick.depth_bps,
+                alloc.size
+            );
         }
     }
 
@@ -693,8 +727,12 @@ mod tests {
         let allocs = allocate_risk_budget_uniform(&levels, &budget);
         let total_margin = total_margin_used(&allocs);
 
-        assert!(total_margin <= 2.0 * 2.963 + 0.01,
-            "Total margin {} should not exceed budget {}", total_margin, 2.0 * 2.963);
+        assert!(
+            total_margin <= 2.0 * 2.963 + 0.01,
+            "Total margin {} should not exceed budget {}",
+            total_margin,
+            2.0 * 2.963
+        );
     }
 
     #[test]
@@ -717,25 +755,26 @@ mod tests {
         let levels = make_levels(&[8.0, 12.0], &[2.0, 1.0]);
         let budget = hype_budget(0.20);
         let allocs = allocate_risk_budget_uniform(&levels, &budget);
-        assert!(allocs.is_empty(),
-            "Should not allocate when capacity < min_viable");
+        assert!(
+            allocs.is_empty(),
+            "Should not allocate when capacity < min_viable"
+        );
     }
 
     #[test]
     fn test_allocate_utility_priority() {
-        let levels = make_levels(
-            &[8.0, 12.0, 16.0],
-            &[1.0, 3.0, 2.0],
-        );
+        let levels = make_levels(&[8.0, 12.0, 16.0], &[1.0, 3.0, 2.0]);
         let mut budget = hype_budget(0.50);
         budget.max_single_order_fraction = 0.80;
 
         let allocs = allocate_risk_budget_uniform(&levels, &budget);
 
         assert_eq!(allocs.len(), 1, "Should allocate to exactly 1 level");
-        assert!((allocs[0].tick.depth_bps - 12.0).abs() < 0.1,
+        assert!(
+            (allocs[0].tick.depth_bps - 12.0).abs() < 0.1,
             "Should allocate to highest utility level at 12bps, got {}bps",
-            allocs[0].tick.depth_bps);
+            allocs[0].tick.depth_bps
+        );
     }
 
     #[test]
@@ -752,8 +791,11 @@ mod tests {
 
         let allocs = allocate_risk_budget_uniform(&levels, &budget);
         assert_eq!(allocs.len(), 1);
-        assert!((allocs[0].size - 1.56).abs() < 0.01,
-            "Size should be truncated: {}", allocs[0].size);
+        assert!(
+            (allocs[0].size - 1.56).abs() < 0.01,
+            "Size should be truncated: {}",
+            allocs[0].size
+        );
     }
 
     #[test]
@@ -766,8 +808,11 @@ mod tests {
 
         let allocs = allocate_risk_budget_uniform(&levels, &budget);
 
-        assert!(allocs.len() >= 3,
-            "Should have >=3 levels with $100/10x, got {}", allocs.len());
+        assert!(
+            allocs.len() >= 3,
+            "Should have >=3 levels with $100/10x, got {}",
+            allocs.len()
+        );
 
         let total = total_allocated_size(&allocs);
         assert!(total > 1.0, "Should allocate >1 HYPE total, got {}", total);
@@ -789,8 +834,12 @@ mod tests {
         let (allocs, _) = allocate_risk_budget(&levels, &budget, &default_softmax());
         let total_margin = total_margin_used(&allocs);
 
-        assert!(total_margin <= 2.0 * 2.963 + 0.01,
-            "Total margin {} should not exceed budget {}", total_margin, 2.0 * 2.963);
+        assert!(
+            total_margin <= 2.0 * 2.963 + 0.01,
+            "Total margin {} should not exceed budget {}",
+            total_margin,
+            2.0 * 2.963
+        );
     }
 
     #[test]
@@ -810,17 +859,21 @@ mod tests {
 
     #[test]
     fn test_softmax_full_pipeline_hype() {
-        let levels = make_levels(
-            &[8.0, 11.0, 14.0, 17.0, 20.0],
-            &[2.5, 2.2, 1.9, 1.6, 1.3],
-        );
+        let levels = make_levels(&[8.0, 11.0, 14.0, 17.0, 20.0], &[2.5, 2.2, 1.9, 1.6, 1.3]);
         let budget = hype_budget(4.65); // ~$100 capital per side after warmup
-        let params = SoftmaxParams { temperature: 0.5, ..default_softmax() };
+        let params = SoftmaxParams {
+            temperature: 0.5,
+            ..default_softmax()
+        };
 
         let (allocs, diag) = allocate_risk_budget(&levels, &budget, &params);
 
         // Should have multiple levels
-        assert!(allocs.len() >= 2, "Should have >=2 levels, got {}", allocs.len());
+        assert!(
+            allocs.len() >= 2,
+            "Should have >=2 levels, got {}",
+            allocs.len()
+        );
 
         // Total should not exceed capacity
         let total = total_allocated_size(&allocs);
@@ -833,7 +886,8 @@ mod tests {
             assert!(
                 first >= last,
                 "Touch ({:.2}) should be >= deepest ({:.2})",
-                first, last,
+                first,
+                last,
             );
         }
 
@@ -851,7 +905,11 @@ mod tests {
         // Uniform over 4 items: log2(4) = 2.0 bits
         let weights = vec![0.25, 0.25, 0.25, 0.25];
         let entropy = shannon_entropy_bits(&weights);
-        assert!((entropy - 2.0).abs() < 0.01, "Uniform 4 items should be 2.0 bits, got {}", entropy);
+        assert!(
+            (entropy - 2.0).abs() < 0.01,
+            "Uniform 4 items should be 2.0 bits, got {}",
+            entropy
+        );
     }
 
     #[test]
@@ -859,7 +917,11 @@ mod tests {
         // All weight on one item: 0 bits
         let weights = vec![1.0, 0.0, 0.0, 0.0];
         let entropy = shannon_entropy_bits(&weights);
-        assert!(entropy.abs() < 0.01, "Concentrated should be ~0 bits, got {}", entropy);
+        assert!(
+            entropy.abs() < 0.01,
+            "Concentrated should be ~0 bits, got {}",
+            entropy
+        );
     }
 
     #[test]
@@ -869,12 +931,19 @@ mod tests {
 
         assert_eq!(weights.len(), 2);
         // Higher utility should get higher weight
-        assert!(weights[0] > weights[1],
+        assert!(
+            weights[0] > weights[1],
             "Higher utility ({}) should get higher weight than ({})",
-            weights[0], weights[1]);
+            weights[0],
+            weights[1]
+        );
         // Weights should sum to ~1.0
         let sum: f64 = weights.iter().sum();
-        assert!((sum - 1.0).abs() < 0.001, "Weights should sum to 1.0, got {}", sum);
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Weights should sum to 1.0, got {}",
+            sum
+        );
     }
 
     // =====================================================================
@@ -885,35 +954,50 @@ mod tests {
     fn test_allocate_risk_budget_kelly_basic() {
         // 50% Kelly on 10 contract capacity → 5 contracts
         let result = allocate_risk_budget_kelly(10.0, 0.5);
-        assert!((result - 5.0).abs() < 0.001,
-            "50% Kelly of 10 should be 5.0, got {}", result);
+        assert!(
+            (result - 5.0).abs() < 0.001,
+            "50% Kelly of 10 should be 5.0, got {}",
+            result
+        );
     }
 
     #[test]
     fn test_allocate_risk_budget_kelly_clamps() {
         // Negative Kelly → clamped to 0
         let result = allocate_risk_budget_kelly(10.0, -0.5);
-        assert!((result - 0.0).abs() < 0.001,
-            "Negative Kelly should clamp to 0, got {}", result);
+        assert!(
+            (result - 0.0).abs() < 0.001,
+            "Negative Kelly should clamp to 0, got {}",
+            result
+        );
 
         // Over-sized Kelly → clamped to 1.0
         let result = allocate_risk_budget_kelly(10.0, 1.5);
-        assert!((result - 10.0).abs() < 0.001,
-            "Kelly > 1.0 should clamp to capacity, got {}", result);
+        assert!(
+            (result - 10.0).abs() < 0.001,
+            "Kelly > 1.0 should clamp to capacity, got {}",
+            result
+        );
     }
 
     #[test]
     fn test_allocate_risk_budget_kelly_zero_capacity() {
         let result = allocate_risk_budget_kelly(0.0, 0.5);
-        assert!((result - 0.0).abs() < 0.001,
-            "Zero capacity should give zero, got {}", result);
+        assert!(
+            (result - 0.0).abs() < 0.001,
+            "Zero capacity should give zero, got {}",
+            result
+        );
     }
 
     #[test]
     fn test_allocate_risk_budget_kelly_quarter_kelly() {
         // Quarter Kelly (standard conservative): 25% of capacity
         let result = allocate_risk_budget_kelly(8.0, 0.25);
-        assert!((result - 2.0).abs() < 0.001,
-            "Quarter Kelly of 8 should be 2.0, got {}", result);
+        assert!(
+            (result - 2.0).abs() < 0.001,
+            "Quarter Kelly of 8 should be 2.0, got {}",
+            result
+        );
     }
 }

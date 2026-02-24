@@ -23,11 +23,11 @@ use crate::market_maker::adverse_selection::{
 };
 use crate::market_maker::config::MetricsRecorder;
 use crate::market_maker::control::{PositionPnLTracker, StochasticController};
-use crate::market_maker::tracking::calibration_wiring::ModelCalibrationOrchestrator;
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::infra::PrometheusMetrics;
 use crate::market_maker::messages;
 use crate::market_maker::strategy::MarketParams;
+use crate::market_maker::tracking::calibration_wiring::ModelCalibrationOrchestrator;
 use crate::market_maker::tracking::{
     OrderManager, PnLTracker, PositionTracker, QueuePositionTracker, Side,
 };
@@ -140,13 +140,9 @@ pub struct FillSignalSnapshot {
 
 impl FillSignalSnapshot {
     /// Create a new snapshot from a fill event and market params.
-    pub fn from_fill_and_params(
-        fill: &FillEvent,
-        params: &MarketParams,
-        asset: &str,
-    ) -> Self {
+    pub fn from_fill_and_params(fill: &FillEvent, params: &MarketParams, asset: &str) -> Self {
         let side = if fill.is_buy { "bid" } else { "ask" };
-        
+
         // Get pre-fill toxicity for the correct side
         let pre_fill_toxicity = if fill.is_buy {
             params.pre_fill_toxicity_bid
@@ -177,7 +173,7 @@ impl FillSignalSnapshot {
                 crate::market_maker::estimator::VolatilityRegime::Extreme => 2,
             },
             hmm_confidence: 0.8, // TODO: wire up actual HMM confidence
-            cp_prob: 0.0, // Will be filled from stochastic controller
+            cp_prob: 0.0,        // Will be filled from stochastic controller
             is_toxic_regime: params.is_toxic_regime,
             jump_ratio: params.jump_ratio,
 
@@ -269,16 +265,16 @@ impl PendingMarkout {
     /// Returns true if all markouts are now filled.
     pub fn update(&mut self, current_mid: f64, current_time_ms: u64) -> bool {
         let elapsed_ms = current_time_ms.saturating_sub(self.fill_time_ms);
-        
+
         // Calculate markout: (current_mid - fill_price) / fill_price * 10000
         // For buys: positive markout = price went up = good
         // For sells: positive markout = price went down = good
         // We want: negative = adverse selection (price moved against us)
         let raw_markout_bps = (current_mid - self.fill_price) / self.fill_price * 10000.0;
-        
+
         // Adjust sign: for sells, flip sign so negative = AS
         let markout_bps = if self.is_buy {
-            raw_markout_bps  // Buy: price up = good (+), price down = bad (-)
+            raw_markout_bps // Buy: price up = good (+), price down = bad (-)
         } else {
             -raw_markout_bps // Sell: price down = good (+), price up = bad (-)
         };
@@ -378,7 +374,7 @@ impl FillSignalStore {
     pub fn update_markouts(&mut self, current_mid: f64, current_time_ms: u64) {
         // Update all pending markouts
         let mut completed_tids = Vec::new();
-        
+
         for pending in self.pending_markouts.iter_mut() {
             if pending.update(current_mid, current_time_ms) {
                 completed_tids.push((
@@ -391,7 +387,8 @@ impl FillSignalStore {
         }
 
         // Remove completed and stale markouts
-        self.pending_markouts.retain(|p| !p.is_stale() && p.markout_10s_bps.is_none());
+        self.pending_markouts
+            .retain(|p| !p.is_stale() && p.markout_10s_bps.is_none());
 
         // Update snapshots with completed markouts
         for (tid, m500, m2s, m10s) in completed_tids {
@@ -406,7 +403,8 @@ impl FillSignalStore {
     /// Export snapshots to JSON file.
     pub fn export_to_json(&mut self, path: &str) -> std::io::Result<usize> {
         // Only export snapshots with complete markouts
-        let complete: Vec<_> = self.snapshots
+        let complete: Vec<_> = self
+            .snapshots
             .iter()
             .filter(|s| s.markout_10s_bps.is_some())
             .cloned()
@@ -418,10 +416,9 @@ impl FillSignalStore {
 
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        
+
         // Write as JSON array
-        serde_json::to_writer_pretty(&mut writer, &complete)
-            .map_err(std::io::Error::other)?;
+        serde_json::to_writer_pretty(&mut writer, &complete).map_err(std::io::Error::other)?;
         writer.flush()?;
 
         let count = complete.len();
@@ -443,7 +440,7 @@ impl FillSignalStore {
     pub fn should_export(&self) -> bool {
         let fills_since_export = self.total_recorded - self.total_exported;
         let time_since_export = self.last_export.elapsed().as_secs();
-        
+
         fills_since_export >= 100 || time_since_export >= 300
     }
 
@@ -569,7 +566,7 @@ pub struct FillState<'a> {
     // Fee configuration for edge calculation
     /// Fee in basis points for edge calculation
     pub fee_bps: f64,
-    
+
     // Bayesian learning
     /// Theoretical edge estimator for Bayesian alpha updates
     pub theoretical_edge: &'a mut crate::market_maker::control::TheoreticalEdgeEstimator,
@@ -584,7 +581,6 @@ pub struct FillState<'a> {
     /// Current market params for signal capture (set before process() call)
     pub market_params: Option<&'a MarketParams>,
 }
-
 
 /// A record of a recently cancelled order, used to handle the cancel-fill race condition.
 ///
@@ -979,7 +975,10 @@ impl FillProcessor {
             if let Some(order) = state.orders.get_order(fill.oid) {
                 // Record fill probability outcome (prediction was made at quote time)
                 if let Some(fill_pred_id) = order.fill_prediction_id {
-                    state.model_calibration.fill_model.record_outcome(fill_pred_id, true);
+                    state
+                        .model_calibration
+                        .fill_model
+                        .record_outcome(fill_pred_id, true);
                     debug!(
                         oid = fill.oid,
                         prediction_id = fill_pred_id,
@@ -989,7 +988,10 @@ impl FillProcessor {
 
                 // Record adverse selection outcome with realized AS bps
                 if let Some(as_pred_id) = order.as_prediction_id {
-                    state.model_calibration.as_model.record_outcome(as_pred_id, realized_as_bps);
+                    state
+                        .model_calibration
+                        .as_model
+                        .record_outcome(as_pred_id, realized_as_bps);
                     debug!(
                         oid = fill.oid,
                         prediction_id = as_pred_id,
@@ -1004,11 +1006,9 @@ impl FillProcessor {
             // to adapt its signal weights based on actual fill outcomes.
             let is_bid = fill.is_buy;
             let was_adverse = realized_as_bps > 3.0; // Same threshold as adverse_threshold_default
-            state.pre_fill_classifier.record_outcome(
-                is_bid,
-                was_adverse,
-                Some(realized_as_bps),
-            );
+            state
+                .pre_fill_classifier
+                .record_outcome(is_bid, was_adverse, Some(realized_as_bps));
             debug!(
                 is_bid = is_bid,
                 was_adverse = was_adverse,
@@ -1018,11 +1018,9 @@ impl FillProcessor {
 
             // === EnhancedASClassifier Online Learning ===
             // Record outcome for microstructure-based classifier with z-score features
-            state.enhanced_classifier.record_outcome(
-                is_bid,
-                was_adverse,
-                Some(realized_as_bps),
-            );
+            state
+                .enhanced_classifier
+                .record_outcome(is_bid, was_adverse, Some(realized_as_bps));
             debug!(
                 is_bid = is_bid,
                 was_adverse = was_adverse,
@@ -1115,14 +1113,22 @@ impl FillProcessor {
         //   - Negative AS (price moved in our favor) = prediction was correct
         let book_imbalance = state.estimator.book_imbalance();
         let predicted_direction = if book_imbalance > 0.0 { 1i8 } else { -1 };
-        
+
         // For buys: negative AS means price went up (correct if imbalance was positive)
         // For sells: negative AS means price went down (correct if imbalance was negative)
         // Simplified: was_adverse = false means our fill was "correct" (price moved in our favor)
         let actual_direction = if fill.is_buy {
-            if was_adverse { -1i8 } else { 1 }  // Adverse on buy = price dropped
-        } else if was_adverse { 1i8 } else { -1 };
-        
+            if was_adverse {
+                -1i8
+            } else {
+                1
+            } // Adverse on buy = price dropped
+        } else if was_adverse {
+            1i8
+        } else {
+            -1
+        };
+
         state.theoretical_edge.update_from_fill(
             book_imbalance,
             predicted_direction,
@@ -1152,13 +1158,14 @@ impl FillProcessor {
         // Uses provided market_params if available, otherwise builds from estimator.
         let snapshot_params = state.market_params.cloned().unwrap_or(params);
         let cp_prob = state.stochastic_controller.changepoint_summary().cp_prob_5;
-        
-        let snapshot = FillSignalSnapshot::from_fill_and_params(fill, &snapshot_params, state.asset)
-            .with_position(state.position.position())
-            .with_cp_prob(cp_prob);
-        
+
+        let snapshot =
+            FillSignalSnapshot::from_fill_and_params(fill, &snapshot_params, state.asset)
+                .with_position(state.position.position())
+                .with_cp_prob(cp_prob);
+
         state.signal_store.record(snapshot);
-        
+
         // Log diagnostic capture
         let (recorded, exported, stored, pending) = state.signal_store.stats();
         if recorded % 10 == 0 {

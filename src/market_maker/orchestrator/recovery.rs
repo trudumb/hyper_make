@@ -9,8 +9,8 @@ use tracing::{debug, info, warn};
 use crate::prelude::Result;
 
 use super::super::{
-    calculate_dynamic_max_position_value, safety, CancelResult, MarketMaker, TradingEnvironment,
-    QuotingStrategy,
+    calculate_dynamic_max_position_value, safety, CancelResult, MarketMaker, QuotingStrategy,
+    TradingEnvironment,
 };
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -414,7 +414,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         // Force remove from WS State (Fix synchronization)
                         if let Some(order) = self.ws_state.remove_order(oid) {
                             self.safety.fill_processor.record_cancelled_order(
-                                oid, order.side, order.price, order.size,
+                                oid,
+                                order.side,
+                                order.price,
+                                order.size,
                             );
                             warn!(oid = oid, "[SafetySync] Ghost order removed from ws_state (Verified gone via WS Snapshot)");
                         }
@@ -450,7 +453,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     if result.order_is_gone() {
                         if let Some(order) = self.ws_state.remove_order(*oid) {
                             self.safety.fill_processor.record_cancelled_order(
-                                *oid, order.side, order.price, order.size,
+                                *oid,
+                                order.side,
+                                order.price,
+                                order.size,
                             );
                             warn!(
                                 oid = oid,

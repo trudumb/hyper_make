@@ -350,7 +350,7 @@ mod tests {
     fn test_prediction_log_clamping() {
         let log = PredictionLog::new(
             PredictionType::FillProbability,
-            1.5, // Should be clamped to 1.0
+            1.5,  // Should be clamped to 1.0
             -0.5, // Should be clamped to 0.0
             HashMap::new(),
         );

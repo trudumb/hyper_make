@@ -603,9 +603,7 @@ impl KappaOrchestrator {
         // Uses total_own_fills (cumulative) instead of observation_count() (rolling window)
         // so graduation survives restarts via checkpoint persistence.
         const MIN_OWN_FILLS_FOR_WARMUP_EXIT: u64 = 5;
-        if !self.has_exited_warmup
-            && self.total_own_fills >= MIN_OWN_FILLS_FOR_WARMUP_EXIT
-        {
+        if !self.has_exited_warmup && self.total_own_fills >= MIN_OWN_FILLS_FOR_WARMUP_EXIT {
             self.has_exited_warmup = true;
             tracing::info!(
                 own_fills = self.own_kappa.observation_count(),
@@ -719,7 +717,9 @@ impl KappaOrchestrator {
     }
 
     /// Extract checkpoint state for persistence.
-    pub(crate) fn to_checkpoint(&self) -> crate::market_maker::checkpoint::KappaOrchestratorCheckpoint {
+    pub(crate) fn to_checkpoint(
+        &self,
+    ) -> crate::market_maker::checkpoint::KappaOrchestratorCheckpoint {
         crate::market_maker::checkpoint::KappaOrchestratorCheckpoint {
             has_exited_warmup: self.has_exited_warmup,
             total_own_fills: self.total_own_fills,
@@ -727,7 +727,10 @@ impl KappaOrchestrator {
     }
 
     /// Restore checkpoint state from persistence.
-    pub(crate) fn restore_from_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::KappaOrchestratorCheckpoint) {
+    pub(crate) fn restore_from_checkpoint(
+        &mut self,
+        cp: &crate::market_maker::checkpoint::KappaOrchestratorCheckpoint,
+    ) {
         self.total_own_fills = cp.total_own_fills;
         self.has_exited_warmup = cp.has_exited_warmup;
         if self.has_exited_warmup {
@@ -973,7 +976,10 @@ mod tests {
 
         // Verify warmup is NOT re-entered (even though rolling window is empty)
         let (_, _, _, _, is_warmup) = orch2.component_breakdown();
-        assert!(!is_warmup, "Should not re-enter warmup after checkpoint restore");
+        assert!(
+            !is_warmup,
+            "Should not re-enter warmup after checkpoint restore"
+        );
     }
 
     #[test]

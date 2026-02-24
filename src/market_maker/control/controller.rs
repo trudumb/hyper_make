@@ -629,8 +629,11 @@ mod tests {
 
         let reward = controller.immediate_reward(&state, &action);
         // Should use realized edge: 3 bps = 0.0003
-        assert!((reward - 0.0003).abs() < 1e-8,
-            "Quote reward should use realized edge (0.0003), got {}", reward);
+        assert!(
+            (reward - 0.0003).abs() < 1e-8,
+            "Quote reward should use realized edge (0.0003), got {}",
+            reward
+        );
     }
 
     #[test]
@@ -645,8 +648,11 @@ mod tests {
 
         let reward = controller.immediate_reward(&state, &action);
         // No realized edge → should use expected_value
-        assert!((reward - 0.05).abs() < 1e-8,
-            "Quote reward should fall back to expected_value (0.05), got {}", reward);
+        assert!(
+            (reward - 0.05).abs() < 1e-8,
+            "Quote reward should fall back to expected_value (0.05), got {}",
+            reward
+        );
     }
 
     #[test]
@@ -663,8 +669,11 @@ mod tests {
 
         let reward = controller.immediate_reward(&state, &action);
         // Should be: -(10/10000) * 1.0 = -0.001
-        assert!((reward - (-0.001)).abs() < 1e-8,
-            "Dump reward should be -spread_cost * urgency = -0.001, got {}", reward);
+        assert!(
+            (reward - (-0.001)).abs() < 1e-8,
+            "Dump reward should be -spread_cost * urgency = -0.001, got {}",
+            reward
+        );
     }
 
     #[test]
@@ -686,8 +695,12 @@ mod tests {
         let low_reward = controller.immediate_reward(&state, &low_urgency);
         let high_reward = controller.immediate_reward(&state, &high_urgency);
 
-        assert!(high_reward < low_reward,
-            "Higher urgency should be more costly: low={}, high={}", low_reward, high_reward);
+        assert!(
+            high_reward < low_reward,
+            "Higher urgency should be more costly: low={}, high={}",
+            low_reward,
+            high_reward
+        );
     }
 
     #[test]
@@ -701,7 +714,10 @@ mod tests {
         };
 
         let reward = controller.immediate_reward(&state, &action);
-        assert!((reward - 0.0).abs() < 1e-10,
-            "WaitToLearn reward should be exactly 0.0, got {}", reward);
+        assert!(
+            (reward - 0.0).abs() < 1e-10,
+            "WaitToLearn reward should be exactly 0.0, got {}",
+            reward
+        );
     }
 }

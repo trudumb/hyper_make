@@ -122,7 +122,7 @@ impl CentralBeliefConfig {
             kappa_prior: 1500.0,
             kappa_prior_strength: 15.0,
             min_fills: 3,
-            changepoint_hazard: 1.0 / 150.0, // More sensitive
+            changepoint_hazard: 1.0 / 150.0,  // More sensitive
             changepoint_min_confirmations: 4, // 4 consecutive required (vs default 2)
             changepoint_cooldown_ms: 300_000, // 5 minute cooldown between confirmed changepoints
             bayesian_fv_config: Some(BayesianFairValueConfig::default()),
@@ -286,7 +286,11 @@ impl Default for InternalState {
         // Initialize changepoint with spread distribution (not all mass on r=0)
         let init_spread = 20;
         let mut changepoint_run_probs = vec![0.0; init_spread];
-        for (i, prob) in changepoint_run_probs.iter_mut().enumerate().take(init_spread) {
+        for (i, prob) in changepoint_run_probs
+            .iter_mut()
+            .enumerate()
+            .take(init_spread)
+        {
             *prob = (0.8_f64).powi(i as i32);
         }
         let sum: f64 = changepoint_run_probs.iter().sum();
@@ -489,9 +493,9 @@ impl CentralBeliefState {
     pub fn warmup_progress(&self) -> f64 {
         let state = self.state.read().unwrap();
 
-        let price_progress =
-            (state.n_price_obs as f64 / self.config.min_price_obs as f64).min(1.0);
-        let fill_progress = (state.own_kappa_n_fills as f64 / self.config.min_fills as f64).min(1.0);
+        let price_progress = (state.n_price_obs as f64 / self.config.min_price_obs as f64).min(1.0);
+        let fill_progress =
+            (state.own_kappa_n_fills as f64 / self.config.min_fills as f64).min(1.0);
         let time_progress = (state.total_time / self.config.min_observation_time).min(1.0);
 
         // Geometric mean
@@ -929,8 +933,8 @@ impl CentralBeliefState {
             state.cv_divergence = (1.0 - alpha) * state.cv_divergence + alpha * params.divergence;
             state.cv_intensity_ratio =
                 (1.0 - alpha) * state.cv_intensity_ratio + alpha * params.intensity_ratio;
-            state.cv_imbalance_correlation =
-                (1.0 - alpha) * state.cv_imbalance_correlation + alpha * params.imbalance_correlation;
+            state.cv_imbalance_correlation = (1.0 - alpha) * state.cv_imbalance_correlation
+                + alpha * params.imbalance_correlation;
         } else {
             // First update - initialize directly
             state.cv_direction = params.direction;
@@ -1179,7 +1183,8 @@ impl CentralBeliefState {
     }
 
     fn build_continuation_beliefs(&self, state: &InternalState) -> ContinuationBeliefs {
-        let p_fill_raw = state.continuation_alpha / (state.continuation_alpha + state.continuation_beta);
+        let p_fill_raw =
+            state.continuation_alpha / (state.continuation_alpha + state.continuation_beta);
 
         // Regime prior
         let p_regime = state.regime_probs[0] * 0.3
@@ -1192,12 +1197,14 @@ impl CentralBeliefState {
         let changepoint_discount = (cp_prob * 0.5).clamp(0.0, 0.8);
 
         // Fused probability
-        let p_fill_discounted = (1.0 - changepoint_discount) * p_fill_raw + changepoint_discount * p_regime;
+        let p_fill_discounted =
+            (1.0 - changepoint_discount) * p_fill_raw + changepoint_discount * p_regime;
         let p_trend = 0.5 + 0.5 * state.trend_agreement;
 
-        let fill_conf = 1.0 - (state.continuation_alpha * state.continuation_beta)
-            / ((state.continuation_alpha + state.continuation_beta).powi(2)
-                * (state.continuation_alpha + state.continuation_beta + 1.0));
+        let fill_conf = 1.0
+            - (state.continuation_alpha * state.continuation_beta)
+                / ((state.continuation_alpha + state.continuation_beta).powi(2)
+                    * (state.continuation_alpha + state.continuation_beta + 1.0));
 
         // Weighted fusion
         let w_fill = 0.4 * fill_conf;
@@ -1270,7 +1277,9 @@ impl CentralBeliefState {
             ChangepointResult::None
         } else if state.changepoint_consecutive_high >= self.config.changepoint_min_confirmations {
             // Check cooldown: suppress confirmed if too soon after last one
-            let elapsed_ms = state.last_update_ms.saturating_sub(state.last_changepoint_confirmed_ms);
+            let elapsed_ms = state
+                .last_update_ms
+                .saturating_sub(state.last_changepoint_confirmed_ms);
             if self.config.changepoint_cooldown_ms > 0
                 && state.last_changepoint_confirmed_ms > 0
                 && elapsed_ms < self.config.changepoint_cooldown_ms
@@ -1341,9 +1350,8 @@ impl CentralBeliefState {
         // 1. Toxicity not extreme (< 0.8)
         // 2. Adjusted edge > minimum threshold (-1 bps)
         // 3. P(positive adjusted) > 0.3
-        let should_quote = toxicity_score < 0.8
-            && toxicity_adjusted_edge > -1.0
-            && p_positive_adjusted > 0.3;
+        let should_quote =
+            toxicity_score < 0.8 && toxicity_adjusted_edge > -1.0 && p_positive_adjusted > 0.3;
 
         EdgeBeliefs {
             expected_edge: mean,
@@ -1460,9 +1468,9 @@ impl CentralBeliefState {
     }
 
     fn compute_warmup_progress(&self, state: &InternalState) -> f64 {
-        let price_progress =
-            (state.n_price_obs as f64 / self.config.min_price_obs as f64).min(1.0);
-        let fill_progress = (state.own_kappa_n_fills as f64 / self.config.min_fills as f64).min(1.0);
+        let price_progress = (state.n_price_obs as f64 / self.config.min_price_obs as f64).min(1.0);
+        let fill_progress =
+            (state.own_kappa_n_fills as f64 / self.config.min_fills as f64).min(1.0);
         let time_progress = (state.total_time / self.config.min_observation_time).min(1.0);
 
         (price_progress * fill_progress * time_progress).powf(1.0 / 3.0)

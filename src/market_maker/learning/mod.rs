@@ -34,28 +34,30 @@ pub mod decision;
 pub mod ensemble;
 pub mod execution;
 pub mod experience;
-pub mod rl_agent;
 pub mod quote_outcome;
+pub mod rl_agent;
 pub mod spread_bandit;
 pub mod types;
 
 // Re-export key types
-pub use baseline_tracker::BaselineTracker;
 pub use adaptive_ensemble::{AdaptiveEnsemble, EnsembleSummary, ModelPerformance};
-pub use confidence::{AggregateConfidence, EdgeBiasSummary, EdgeBiasTracker, ModelConfidenceTracker};
+pub use baseline_tracker::BaselineTracker;
+pub use competitor_model::{
+    BayesianGamma, CompetitorModel, CompetitorModelConfig, CompetitorSummary, MarketEvent, Side,
+    SnipeTracker,
+};
+pub use confidence::{
+    AggregateConfidence, EdgeBiasSummary, EdgeBiasTracker, ModelConfidenceTracker,
+};
 pub use decision::DecisionEngine;
 pub use ensemble::{EdgeModel, ModelEnsemble};
 pub use execution::ExecutionOptimizer;
-pub use rl_agent::{
-    MDPAction, MDPState, QLearningAgent, QLearningConfig, RLPolicyRecommendation,
-    Reward, RewardConfig, ExplorationStrategy, SimToRealConfig,
-};
 pub use experience::{ExperienceLogger, ExperienceParams, ExperienceRecord, ExperienceSource};
-pub use competitor_model::{
-    CompetitorModel, CompetitorModelConfig, CompetitorSummary,
-    MarketEvent, Side, BayesianGamma, SnipeTracker,
+pub use rl_agent::{
+    ExplorationStrategy, MDPAction, MDPState, QLearningAgent, QLearningConfig,
+    RLPolicyRecommendation, Reward, RewardConfig, SimToRealConfig,
 };
-pub use spread_bandit::{SpreadBandit, SpreadContext, BanditSelection, SpreadBanditCheckpoint};
+pub use spread_bandit::{BanditSelection, SpreadBandit, SpreadBanditCheckpoint, SpreadContext};
 pub use types::*;
 
 use crate::market_maker::calibration::{CalibrationSample, CoefficientEstimator};
@@ -165,7 +167,10 @@ impl LearningModule {
     }
 
     /// Create a new learning module with custom risk model config.
-    pub fn with_risk_model_config(config: LearningConfig, risk_model_config: RiskModelConfig) -> Self {
+    pub fn with_risk_model_config(
+        config: LearningConfig,
+        risk_model_config: RiskModelConfig,
+    ) -> Self {
         Self {
             config,
             confidence_tracker: ModelConfidenceTracker::new(),
@@ -268,7 +273,8 @@ impl LearningModule {
             // === Risk Model Calibration Pipeline ===
             // Record sample for coefficient estimator (log-additive gamma calibration)
             // Use config to ensure baselines match those used in GLFTStrategy
-            let features = RiskFeatures::from_state(&outcome.prediction.state, &self.risk_model_config);
+            let features =
+                RiskFeatures::from_state(&outcome.prediction.state, &self.risk_model_config);
             let sample = CalibrationSample {
                 timestamp_ms: outcome.prediction.timestamp_ms,
                 features,
@@ -708,12 +714,13 @@ impl LearningModule {
     /// reducing size — all within the existing A-S framework.
     pub fn update_realized_edge_stats(&mut self, mean_bps: f64, std_bps: f64, count: usize) {
         let config = self.decision_engine.config().clone();
-        self.decision_engine.set_config(decision::DecisionEngineConfig {
-            realized_edge_mean: mean_bps,
-            realized_edge_std: std_bps,
-            realized_edge_n: count,
-            ..config
-        });
+        self.decision_engine
+            .set_config(decision::DecisionEngineConfig {
+                realized_edge_mean: mean_bps,
+                realized_edge_std: std_bps,
+                realized_edge_n: count,
+                ..config
+            });
     }
 
     /// Generate output for Layer 3 (StochasticController).

@@ -302,7 +302,6 @@ pub struct InformedFlowEstimator {
     impact_ewma: f64,
 
     // === NEW FIELDS FOR ENHANCED FEATURES ===
-
     /// Kyle's lambda: rolling estimate of price impact per unit size
     /// Computed via exponentially-weighted regression of impact ~ size
     kyle_lambda: f64,
@@ -378,7 +377,7 @@ impl InformedFlowEstimator {
             recent_p_informed: VecDeque::with_capacity(20),
             max_cluster_size: 1,
             was_ever_warmed: false,
-            buy_side_toxicity_ewma: 0.05,  // Start at baseline p_informed prior
+            buy_side_toxicity_ewma: 0.05, // Start at baseline p_informed prior
             sell_side_toxicity_ewma: 0.05,
         }
     }
@@ -500,7 +499,6 @@ impl InformedFlowEstimator {
     pub fn impact_ewma(&self) -> f64 {
         self.impact_ewma
     }
-
 
     /// Update Kyle's lambda using EWMA regression.
     ///
@@ -856,7 +854,10 @@ impl InformedFlowEstimator {
     }
 
     /// Restore mixture model state from a checkpoint.
-    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::InformedFlowCheckpoint) {
+    pub fn restore_checkpoint(
+        &mut self,
+        cp: &crate::market_maker::checkpoint::InformedFlowCheckpoint,
+    ) {
         self.components = cp.component_params;
         self.mixing_weights = cp.mixing_weights;
         self.observation_count = cp.observation_count;

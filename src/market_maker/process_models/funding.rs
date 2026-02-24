@@ -351,7 +351,11 @@ impl FundingRateEstimator {
     /// Alias for `funding_volatility()` — used by Phase 6 drift observation.
     pub fn rate_std(&self) -> f64 {
         let vol = self.funding_volatility();
-        if vol > 0.0 { vol } else { 0.001 } // Floor at 0.001 during warmup
+        if vol > 0.0 {
+            vol
+        } else {
+            0.001
+        } // Floor at 0.001 during warmup
     }
 
     // === Premium Tracking Methods (First Principles Gap 6) ===
@@ -696,7 +700,7 @@ mod tests {
     fn test_basis_velocity_single_update() {
         let mut estimator = FundingRateEstimator::new(FundingConfig::default());
         estimator.update_from_prices(100.01, 100.0); // 0.01% premium
-        // Only one update, prev_basis_time is None
+                                                     // Only one update, prev_basis_time is None
         assert_eq!(estimator.basis_velocity(), 0.0);
     }
 
@@ -714,7 +718,10 @@ mod tests {
         estimator.update_from_prices(100.05, 100.0);
 
         let vel = estimator.basis_velocity();
-        assert!(vel > 0.0, "Increasing premium should give positive velocity, got {vel}");
+        assert!(
+            vel > 0.0,
+            "Increasing premium should give positive velocity, got {vel}"
+        );
     }
 
     #[test]
@@ -729,7 +736,10 @@ mod tests {
         estimator.update_from_prices(100.01, 100.0);
 
         let vel = estimator.basis_velocity();
-        assert!(vel < 0.0, "Decreasing premium should give negative velocity, got {vel}");
+        assert!(
+            vel < 0.0,
+            "Decreasing premium should give negative velocity, got {vel}"
+        );
     }
 
     #[test]
@@ -744,6 +754,9 @@ mod tests {
         estimator.update_from_prices(110.0, 100.0); // 10% premium jump
 
         let vel = estimator.basis_velocity();
-        assert!(vel <= 1.0 && vel >= -1.0, "Velocity should be clamped, got {vel}");
+        assert!(
+            vel <= 1.0 && vel >= -1.0,
+            "Velocity should be clamped, got {vel}"
+        );
     }
 }

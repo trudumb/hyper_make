@@ -10,15 +10,15 @@ use crate::Message;
 use super::super::{
     adverse_selection::TradeObservation as MicroTradeObs,
     belief::BeliefUpdate,
-    CascadeEvent,
     environment::Observation,
+    environment::TradingEnvironment,
     estimator::{HmmObservation, MarketEstimator},
     fills,
     infra::{BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate},
-    messages, tracking::ws_order_state::WsFillEvent,
-    tracking::ws_order_state::WsOrderUpdateEvent, MarketMaker, OrderState,
-    QuotingStrategy, Side, TrackedOrder,
-    environment::TradingEnvironment,
+    messages,
+    tracking::ws_order_state::WsFillEvent,
+    tracking::ws_order_state::WsOrderUpdateEvent,
+    CascadeEvent, MarketMaker, OrderState, QuotingStrategy, Side, TrackedOrder,
 };
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -57,16 +57,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             Observation::Trades(trades) => self.handle_trades(trades),
             Observation::UserFills(user_fills) => self.handle_user_fills(user_fills).await,
             Observation::L2Book(l2_book) => self.handle_l2_book(l2_book),
-            Observation::OrderUpdates(order_updates) => {
-                self.handle_order_updates(order_updates)
-            }
+            Observation::OrderUpdates(order_updates) => self.handle_order_updates(order_updates),
             Observation::OpenOrders(open_orders) => self.handle_open_orders(open_orders),
             Observation::ActiveAssetData(active_asset_data) => {
                 self.handle_active_asset_data(active_asset_data)
             }
             Observation::WebData2(web_data2) => self.handle_web_data2(*web_data2),
             Observation::LedgerUpdate(update) => self.handle_ledger_update(update),
-            Observation::CrossVenuePrice { price, timestamp_ms } => {
+            Observation::CrossVenuePrice {
+                price,
+                timestamp_ms,
+            } => {
                 self.handle_binance_price_update(BinancePriceUpdate {
                     timestamp_ms: timestamp_ms as i64,
                     mid_price: price,
@@ -141,8 +142,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            self.safety.signal_store.update_markouts(self.latest_mid, current_time_ms);
-            
+            self.safety
+                .signal_store
+                .update_markouts(self.latest_mid, current_time_ms);
+
             // Check if export is due (every 5 min or 100 fills)
             if self.safety.signal_store.should_export() {
                 if let Some(path) = self.safety.signal_store.export_path() {
@@ -164,7 +167,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             if prev_mid > 0.0 && self.latest_mid > 0.0 {
                 let return_bps = (self.latest_mid - prev_mid) / prev_mid * 10_000.0;
                 self.stochastic.threshold_kappa.update(return_bps);
-                
+
                 // Track information gain for AdaptiveCycleTimer
                 self.cycle_state_changes.mid_move_bps += return_bps.abs();
             }
@@ -195,10 +198,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Update SignalIntegrator with Hyperliquid mid price for lead-lag calculation.
             // This pairs with Binance prices from handle_binance_price_update(),
             // OR reference perp prices for HIP-3 tokens (below).
-            self.stochastic.signal_integrator.on_hl_price(
-                self.latest_mid,
-                current_time_ms as i64,
-            );
+            self.stochastic
+                .signal_integrator
+                .on_hl_price(self.latest_mid, current_time_ms as i64);
 
             // === Reference Perp Lead-Lag (Fix C) ===
             // For HIP-3 tokens (e.g. hyna:HYPE), the main perp (HYPE) is the
@@ -212,26 +214,35 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             self.reference_perp_mid = ref_mid;
 
                             // Compute EMA-smoothed drift rate for GLFT asymmetric spreads
-                            if self.prev_reference_perp_mid > 0.0 && self.reference_perp_last_update_ms > 0 {
-                                let dt_secs = ((current_time_ms as i64 - self.reference_perp_last_update_ms) as f64 / 1000.0).max(0.1);
-                                let return_per_sec = (ref_mid / self.prev_reference_perp_mid - 1.0) / dt_secs;
+                            if self.prev_reference_perp_mid > 0.0
+                                && self.reference_perp_last_update_ms > 0
+                            {
+                                let dt_secs = ((current_time_ms as i64
+                                    - self.reference_perp_last_update_ms)
+                                    as f64
+                                    / 1000.0)
+                                    .max(0.1);
+                                let return_per_sec =
+                                    (ref_mid / self.prev_reference_perp_mid - 1.0) / dt_secs;
                                 // EMA α=0.1: smooth over ~10 updates (~10-30s depending on AllMids frequency)
-                                self.reference_perp_drift_ema = 0.9 * self.reference_perp_drift_ema + 0.1 * return_per_sec;
+                                self.reference_perp_drift_ema =
+                                    0.9 * self.reference_perp_drift_ema + 0.1 * return_per_sec;
                             }
                             self.reference_perp_last_update_ms = current_time_ms as i64;
 
                             // Feed reference perp as the leading signal for lead-lag
-                            self.stochastic.signal_integrator.on_binance_price(
-                                ref_mid,
-                                current_time_ms as i64,
-                            );
-                            
+                            self.stochastic
+                                .signal_integrator
+                                .on_binance_price(ref_mid, current_time_ms as i64);
+
                             // Fix 13: Update EchoEstimator on external reference move
                             // If reference mid changed, feed the current trend magnitude
                             if (ref_mid - self.prev_reference_perp_mid).abs() > 0.0 {
-                                let position_value = (self.position.position().abs() * self.latest_mid).max(1.0);
+                                let position_value =
+                                    (self.position.position().abs() * self.latest_mid).max(1.0);
                                 let trend_signal = self.estimator.trend_signal(position_value);
-                                self.echo_estimator.update_on_reference_move(trend_signal.long_momentum_bps.abs());
+                                self.echo_estimator
+                                    .update_on_reference_move(trend_signal.long_momentum_bps.abs());
                             }
                         }
                     }
@@ -266,16 +277,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Checks adverse selection outcomes from pending fills.
     fn check_pending_fill_outcomes(&mut self, now_ms: u64) {
         const OUTCOME_DELAY_MS: u64 = 5_000; // 5-second markout window
-        // Volatility-scaled threshold: 2σ × √τ prevents noise misclassification.
-        // Random walk E[|ΔP|] = σ × √τ. At 2σ, only ~5% of noise moves are misclassified.
-        // BTC (σ≈2bps/√s): threshold ≈ 8.9 bps. HYPE (σ≈1bps/√s): threshold ≈ 4.5 bps.
+                                             // Volatility-scaled threshold: 2σ × √τ prevents noise misclassification.
+                                             // Random walk E[|ΔP|] = σ × √τ. At 2σ, only ~5% of noise moves are misclassified.
+                                             // BTC (σ≈2bps/√s): threshold ≈ 8.9 bps. HYPE (σ≈1bps/√s): threshold ≈ 4.5 bps.
         const ADVERSE_NOISE_MULT: f64 = 2.0;
         const MIN_ADVERSE_THRESHOLD_BPS: f64 = 1.0;
         const MARKOUT_SECONDS: f64 = OUTCOME_DELAY_MS as f64 / 1000.0;
 
         let sigma_bps = self.estimator.sigma() * 10_000.0;
-        let adverse_threshold_bps =
-            (ADVERSE_NOISE_MULT * sigma_bps * MARKOUT_SECONDS.sqrt()).max(MIN_ADVERSE_THRESHOLD_BPS);
+        let adverse_threshold_bps = (ADVERSE_NOISE_MULT * sigma_bps * MARKOUT_SECONDS.sqrt())
+            .max(MIN_ADVERSE_THRESHOLD_BPS);
 
         while let Some(front) = self.infra.pending_fill_outcomes.front() {
             if now_ms.saturating_sub(front.timestamp_ms) < OUTCOME_DELAY_MS {
@@ -323,11 +334,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Uses mid_at_fill as reference (not fill_price) to isolate pure mid movement
                 // from the depth/spread component which is already captured in fill_distance_bps.
                 let mid_at_markout = self.latest_mid;
-                let as_realized = (mid_at_markout - pending.mid_at_fill) * direction / pending.mid_at_fill;
+                let as_realized =
+                    (mid_at_markout - pending.mid_at_fill) * direction / pending.mid_at_fill;
                 let as_realized_bps = as_realized * 10_000.0;
-                let fill_distance_bps = ((pending.fill_price - pending.mid_at_fill).abs() / pending.mid_at_fill) * 10_000.0;
+                let fill_distance_bps = ((pending.fill_price - pending.mid_at_fill).abs()
+                    / pending.mid_at_fill)
+                    * 10_000.0;
                 let fill_pnl = -as_realized; // Negative AS = profit
-                // Use actual AS estimate (bps) from the estimator, not toxicity probability × 10,000
+                                             // Use actual AS estimate (bps) from the estimator, not toxicity probability × 10,000
                 let predicted_as_bps_val = self.estimator.total_as_bps();
 
                 let outcome = FillOutcome {
@@ -377,22 +391,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let markout_direction_for_bias = if pending.is_buy { 1.0 } else { -1.0 };
             let markout_as_bps_for_bias = if pending.mid_at_fill > 0.0 {
                 (self.latest_mid - pending.mid_at_fill) * markout_direction_for_bias
-                    / pending.mid_at_fill * 10_000.0
+                    / pending.mid_at_fill
+                    * 10_000.0
             } else {
                 0.0
             };
             let predicted_as_bps_for_bias = self.estimator.total_as_bps();
-            self.tier1.pre_fill_classifier.observe_as_outcome(
-                predicted_as_bps_for_bias, markout_as_bps_for_bias,
-            );
+            self.tier1
+                .pre_fill_classifier
+                .observe_as_outcome(predicted_as_bps_for_bias, markout_as_bps_for_bias);
 
             // === RESOLVED EDGE SNAPSHOT: markout-based edge measurement ===
             // This is the ground-truth edge measurement using 5-second markout AS.
             // Fill-time "instant AS" was tautological (AS ≈ depth from same mid).
             // Now: spread = |fill - placement_mid|, AS = markout mid movement.
             {
-                use crate::market_maker::analytics::EdgeSnapshot;
                 use crate::market_maker::analytics::edge_metrics::EdgePhase;
+                use crate::market_maker::analytics::EdgeSnapshot;
                 const MAKER_FEE_BPS: f64 = 1.5;
 
                 let markout_direction = if pending.is_buy { 1.0 } else { -1.0 };
@@ -401,7 +416,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // from the depth/spread component already captured in quoted_spread_bps.
                 let markout_as_bps = if pending.mid_at_fill > 0.0 {
                     (self.latest_mid - pending.mid_at_fill) * markout_direction
-                        / pending.mid_at_fill * 10_000.0
+                        / pending.mid_at_fill
+                        * 10_000.0
                 } else {
                     0.0
                 };
@@ -414,7 +430,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     predicted_as_bps: predicted_as_bps_val,
                     realized_as_bps: markout_as_bps,
                     fee_bps: MAKER_FEE_BPS,
-                    predicted_edge_bps: pending.quoted_spread_bps - predicted_as_bps_val - MAKER_FEE_BPS,
+                    predicted_edge_bps: pending.quoted_spread_bps
+                        - predicted_as_bps_val
+                        - MAKER_FEE_BPS,
                     realized_edge_bps: pending.quoted_spread_bps - markout_as_bps - MAKER_FEE_BPS,
                     gross_edge_bps: pending.quoted_spread_bps - markout_as_bps,
                     phase: EdgePhase::Resolved,
@@ -423,20 +441,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 };
 
                 // === PHASE 4: Close measurement loop — feed markout AS to regime state ===
-                self.stochastic.regime_state.params.update_as_from_markout(markout_as_bps);
+                self.stochastic
+                    .regime_state
+                    .params
+                    .update_as_from_markout(markout_as_bps);
 
                 // === PHASE 5: Online drift parameter adaptation ===
                 // Feed realized drift (mid movement in bps over markout window) to Kalman
                 // parameter adaptation. This adjusts θ and process_noise for better calibration.
                 let realized_drift_bps_per_sec = if pending.mid_at_fill > 0.0 {
-                    let mid_change_bps = (self.latest_mid - pending.mid_at_fill)
-                        / pending.mid_at_fill * 10_000.0;
+                    let mid_change_bps =
+                        (self.latest_mid - pending.mid_at_fill) / pending.mid_at_fill * 10_000.0;
                     // Convert to bps/sec: markout window is 5 seconds
                     mid_change_bps / 5.0
                 } else {
                     0.0
                 };
-                self.drift_estimator.update_parameters(realized_drift_bps_per_sec);
+                self.drift_estimator
+                    .update_parameters(realized_drift_bps_per_sec);
 
                 // === PHASE 8: Adaptive spread learning at markout time ===
                 // Moved from fill-time handler where AS was tautological (AS ≈ depth).
@@ -463,13 +485,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     crate::market_maker::adverse_selection::ToxicityRegime::Normal, // conservative default
                     0.0, // queue rank not tracked at fill time
                 );
-                self.queue_value_heuristic.observe_outcome(predicted_qv, markout_fill_pnl * 10_000.0);
+                self.queue_value_heuristic
+                    .observe_outcome(predicted_qv, markout_fill_pnl * 10_000.0);
 
                 // Feed fill outcome to reconcile outcome tracker for action-type learning
-                self.reconcile_outcome_tracker.record_fill(
-                    pending.oid,
-                    resolved_snap.realized_edge_bps,
-                );
+                self.reconcile_outcome_tracker
+                    .record_fill(pending.oid, resolved_snap.realized_edge_bps);
 
                 // Feed fill to cancel-race AS tracker (Sprint 6.3)
                 // Uses markout AS (not fill-time) for true adverse selection measurement
@@ -482,17 +503,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Feed resolved snapshot to learning systems
                 self.tier2.edge_tracker.add_snapshot(resolved_snap.clone());
                 let fill_pnl_bps = resolved_snap.realized_edge_bps;
-                self.live_analytics.record_fill(fill_pnl_bps, Some(&resolved_snap));
+                self.live_analytics
+                    .record_fill(fill_pnl_bps, Some(&resolved_snap));
 
                 // Update AdaptiveEnsemble with GLFT prediction performance
                 {
-                    let prediction_error = resolved_snap.predicted_edge_bps - resolved_snap.realized_edge_bps;
+                    let prediction_error =
+                        resolved_snap.predicted_edge_bps - resolved_snap.realized_edge_bps;
                     // IR proxy: realized edge (positive = model captured value)
                     let ir_proxy = resolved_snap.realized_edge_bps;
                     // Brier proxy: squared prediction error (lower = better calibration)
                     let brier_proxy = prediction_error * prediction_error;
                     self.stochastic.ensemble.update_performance(
-                        "GLFT", ir_proxy, brier_proxy, pending.timestamp_ms,
+                        "GLFT",
+                        ir_proxy,
+                        brier_proxy,
+                        pending.timestamp_ms,
                     );
                 }
 
@@ -565,10 +591,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
             let is_buy = trade.side == "B";
             let timestamp_ms = trade.time;
+            let trade_price: f64 = trade.px.parse().unwrap_or(0.0);
+
+            // Feed trade to Shadow Tuner buffer (lock-free, non-blocking)
+            if trade_price > 0.0 {
+                self.feed_shadow_buffer(crate::market_maker::simulation::ReplayEvent::Trade {
+                    timestamp_ns: timestamp_ms * 1_000_000,
+                    price: trade_price,
+                    size,
+                    is_buy,
+                });
+            }
 
             // Add to buffer
             self.cached_trades.push_back((size, is_buy, timestamp_ms));
-            
+
             // Track information gain for AdaptiveCycleTimer
             self.cycle_state_changes.trades_observed += 1;
 
@@ -578,7 +615,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // Phase 7: Forward market trade to centralized belief state (primary consumer)
-            let trade_price: f64 = trade.px.parse().unwrap_or(0.0);
             if trade_price > 0.0 {
                 self.central_beliefs.update(BeliefUpdate::MarketTrade {
                     price: trade_price,
@@ -588,7 +624,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                 // Decrement queue depth for orders at this trade's price level.
                 // A buy trade lifts asks, a sell trade hits bids.
-                self.tier1.queue_tracker.on_market_trade(trade_price, size, is_buy);
+                self.tier1
+                    .queue_tracker
+                    .on_market_trade(trade_price, size, is_buy);
             }
 
             // === Phase 1: Microstructure Signals - VPIN Update ===
@@ -608,7 +646,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             });
 
             // Wire trade to buy pressure tracker in SignalIntegrator
-            self.stochastic.signal_integrator.on_trade_for_pressure(size, is_buy);
+            self.stochastic
+                .signal_integrator
+                .on_trade_for_pressure(size, is_buy);
 
             // Wire trade to EWMA flow tracker for FlowFeatureVec
             self.stochastic.trade_flow_tracker.on_trade(size, is_buy);
@@ -618,20 +658,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // For now, use price impact as a proxy for levels crossed:
             // impact > 1 tick ≈ swept through multiple levels.
             let levels_crossed = if trade_price > 0.0 && self.latest_mid > 0.0 {
-                let impact_bps = ((trade_price - self.latest_mid).abs() / self.latest_mid) * 10_000.0;
+                let impact_bps =
+                    ((trade_price - self.latest_mid).abs() / self.latest_mid) * 10_000.0;
                 // Assume ~5 bps per level for typical HIP assets
                 (impact_bps / 5.0).ceil().max(1.0) as u32
             } else {
                 1
             };
-            self.tier1.sweep_detector.record_fill(is_buy, size, levels_crossed, timestamp_ms);
+            self.tier1
+                .sweep_detector
+                .record_fill(is_buy, size, levels_crossed, timestamp_ms);
 
             // === P0: Wire trade features to SignalIntegrator for informed flow classification ===
             {
                 use crate::market_maker::estimator::informed_flow::TradeFeatures;
 
                 // Compute inter-arrival from last cached trade
-                let inter_arrival_ms = self.cached_trades.back()
+                let inter_arrival_ms = self
+                    .cached_trades
+                    .back()
                     .map(|&(_, _, prev_ts)| timestamp_ms.saturating_sub(prev_ts))
                     .unwrap_or(1000); // Default 1s if no previous trade
 
@@ -658,25 +703,27 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // This replaces hardcoded alpha weights (0.3, 0.4, 0.3) with empirical values.
                 let flow_decomp = self.stochastic.signal_integrator.flow_decomposition();
                 if flow_decomp.confidence > 0.25 {
-                    self.tier1.adverse_selection.calibrate_alpha_from_flow(
-                        flow_decomp.p_informed,
-                        flow_decomp.confidence,
-                    );
+                    self.tier1
+                        .adverse_selection
+                        .calibrate_alpha_from_flow(flow_decomp.p_informed, flow_decomp.confidence);
                 }
             }
 
-            if let Some(_vpin_value) = self.stochastic.vpin.on_trade(size, trade_price, self.latest_mid, timestamp_ms) {
+            if let Some(_vpin_value) =
+                self.stochastic
+                    .vpin
+                    .on_trade(size, trade_price, self.latest_mid, timestamp_ms)
+            {
                 // Bucket completed - publish microstructure update to central beliefs
                 let vpin = self.stochastic.vpin.vpin();
                 let vpin_velocity = self.stochastic.vpin.vpin_velocity();
 
                 // Wire VPIN into SignalIntegrator for toxicity blending
-                let vpin_fresh = self.stochastic.vpin.is_valid() && !self.stochastic.vpin.is_stale(timestamp_ms);
-                self.stochastic.signal_integrator.set_vpin(
-                    vpin,
-                    vpin_velocity,
-                    vpin_fresh,
-                );
+                let vpin_fresh =
+                    self.stochastic.vpin.is_valid() && !self.stochastic.vpin.is_stale(timestamp_ms);
+                self.stochastic
+                    .signal_integrator
+                    .set_vpin(vpin, vpin_velocity, vpin_fresh);
                 let order_flow_direction = self.stochastic.vpin.order_flow_direction();
                 let vpin_buckets = self.stochastic.vpin.bucket_count();
 
@@ -684,47 +731,54 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Note: using imbalance (static snapshot) rather than OFI (delta)
                 // since we don't track previous book state here
                 use crate::market_maker::estimator::BookLevel;
-                let bid_levels: Vec<BookLevel> = self.cached_bid_sizes.iter()
+                let bid_levels: Vec<BookLevel> = self
+                    .cached_bid_sizes
+                    .iter()
                     .map(|&sz| BookLevel { size: sz })
                     .collect();
-                let ask_levels: Vec<BookLevel> = self.cached_ask_sizes.iter()
+                let ask_levels: Vec<BookLevel> = self
+                    .cached_ask_sizes
+                    .iter()
                     .map(|&sz| BookLevel { size: sz })
                     .collect();
-                let depth_ofi = self.stochastic.enhanced_flow.depth_weighted_imbalance(
-                    &bid_levels,
-                    &ask_levels,
-                );
+                let depth_ofi = self
+                    .stochastic
+                    .enhanced_flow
+                    .depth_weighted_imbalance(&bid_levels, &ask_levels);
 
                 // Get liquidity evaporation (updated by L2 handler, just read current value)
-                let liquidity_evaporation = self.stochastic.liquidity_evaporation.evaporation_score();
+                let liquidity_evaporation =
+                    self.stochastic.liquidity_evaporation.evaporation_score();
 
                 // Confidence based on bucket count (more buckets = more confidence)
                 let confidence = (vpin_buckets as f64 / 50.0).min(1.0);
 
                 // Phase 1A: Get trade size anomaly metrics
                 let trade_size_sigma = self.stochastic.trade_size_dist.median_sigma();
-                let toxicity_acceleration = self.stochastic.trade_size_dist.toxicity_acceleration(vpin);
+                let toxicity_acceleration =
+                    self.stochastic.trade_size_dist.toxicity_acceleration(vpin);
 
                 // Phase 1A: Get COFI metrics (updated by L2 handler)
                 let cofi = self.stochastic.cofi.cofi();
                 let cofi_velocity = self.stochastic.cofi.cofi_velocity();
                 let is_sustained_shift = self.stochastic.cofi.is_sustained_shift();
 
-                self.central_beliefs.update(BeliefUpdate::MicrostructureUpdate {
-                    vpin,
-                    vpin_velocity,
-                    depth_ofi,
-                    liquidity_evaporation,
-                    order_flow_direction,
-                    confidence,
-                    vpin_buckets,
-                    // Phase 1A fields
-                    trade_size_sigma,
-                    toxicity_acceleration,
-                    cofi,
-                    cofi_velocity,
-                    is_sustained_shift,
-                });
+                self.central_beliefs
+                    .update(BeliefUpdate::MicrostructureUpdate {
+                        vpin,
+                        vpin_velocity,
+                        depth_ofi,
+                        liquidity_evaporation,
+                        order_flow_direction,
+                        confidence,
+                        vpin_buckets,
+                        // Phase 1A fields
+                        trade_size_sigma,
+                        toxicity_acceleration,
+                        cofi,
+                        cofi_velocity,
+                        is_sustained_shift,
+                    });
 
                 trace!(
                     vpin = %format!("{:.3}", vpin),
@@ -737,7 +791,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     "Microstructure update: VPIN bucket completed"
                 );
             }
-
         }
 
         // === Phase 2/3 Component Updates ===
@@ -754,7 +807,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === P0: Forward HMM regime probabilities to SignalIntegrator ===
         // This feeds the RegimeKappaEstimator for regime-blended kappa estimation.
-        self.stochastic.signal_integrator.set_regime_probabilities(regime_probs);
+        self.stochastic
+            .signal_integrator
+            .set_regime_probabilities(regime_probs);
 
         if regime_probs[3] > 0.2 || regime_probs[2] > 0.4 {
             trace!(
@@ -787,7 +842,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 p_extreme = %format!("{:.2}", regime_probs[3]),
                 "Position continuation: regime change detected"
             );
-            self.stochastic.position_decision.reset_for_regime(continuation_regime);
+            self.stochastic
+                .position_decision
+                .reset_for_regime(continuation_regime);
         }
 
         // === P0: Forward HL flow features to SignalIntegrator for cross-venue comparison ===
@@ -809,9 +866,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 order_flow_direction: self.stochastic.vpin.order_flow_direction(),
                 timestamp_ms: self.cached_trades.back().map(|t| t.2 as i64).unwrap_or(0),
                 trade_count: self.cached_trades.len() as u64,
-                confidence: if self.stochastic.vpin.is_valid() { 0.8 } else { 0.1 },
+                confidence: if self.stochastic.vpin.is_valid() {
+                    0.8
+                } else {
+                    0.1
+                },
             };
-            self.stochastic.signal_integrator.set_hl_flow_features(hl_flow);
+            self.stochastic
+                .signal_integrator
+                .set_hl_flow_features(hl_flow);
         }
 
         // === Feed Hawkes excitation predictor for reactive spread widening ===
@@ -819,7 +882,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This drives spread_widening_factor() consumed in the quote engine.
         {
             let hawkes_summary = self.tier2.hawkes.summary();
-            self.stochastic.hawkes_predictor.update_summary(hawkes_summary);
+            self.stochastic
+                .hawkes_predictor
+                .update_summary(hawkes_summary);
         }
 
         Ok(())
@@ -913,7 +978,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let is_buy = fill.side == "B" || fill.side.to_lowercase() == "buy";
             let fill_side = if is_buy { Side::Buy } else { Side::Sell };
             let current_pos = self.position.position();
-            if let Some(cascade_event) = self.fill_cascade_tracker.record_fill(fill_side, current_pos) {
+            if let Some(cascade_event) = self
+                .fill_cascade_tracker
+                .record_fill(fill_side, current_pos)
+            {
                 // Cascade threshold newly crossed — cancel resting orders on the
                 // accumulating side immediately, before they get filled in the race.
                 let cancel_side = match cascade_event {
@@ -958,12 +1026,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // Feed fill to Kalman drift estimator: bid fill → bearish, ask fill → bullish
             let sigma = self.estimator.sigma_effective();
-            self.drift_estimator.update_fill(is_buy, fill_price, self.latest_mid, sigma);
+            self.drift_estimator
+                .update_fill(is_buy, fill_price, self.latest_mid, sigma);
 
             // Fix 13: Update EchoEstimator with current trend magnitude on own fill
             let position_value = (self.position.position().abs() * self.latest_mid).max(1.0);
             let trend_signal = self.estimator.trend_signal(position_value);
-            self.echo_estimator.update_on_fill(trend_signal.long_momentum_bps.abs());
+            self.echo_estimator
+                .update_on_fill(trend_signal.long_momentum_bps.abs());
 
             // GM fill update on microprice V̂: adversarial evidence shifts fair value
             // Ask fill (they bought from us) → V̂ shifts upward
@@ -1040,9 +1110,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // This is the mid price when the order was originally placed,
                 // NOT the mid at fill time. Using fill-time mid causes the
                 // tautology bug where AS ≈ depth ≈ 0 (same reference point).
-                let mid_at_placement = self.orders.get_order(fill.oid)
+                let mid_at_placement = self
+                    .orders
+                    .get_order(fill.oid)
                     .and_then(|tracked| {
-                        if tracked.mid_at_placement > 0.0 { Some(tracked.mid_at_placement) } else { None }
+                        if tracked.mid_at_placement > 0.0 {
+                            Some(tracked.mid_at_placement)
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or(self.latest_mid); // Fallback for untracked orders
 
@@ -1079,11 +1155,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // teaching the kappa estimator from our own fills.
                 let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
                 self.estimator.on_own_fill(
-                    fill.time,       // timestamp_ms
-                    fill_price,      // placement_price (best approximation)
-                    fill_price,      // fill_price
-                    fill_size,
-                    is_buy,
+                    fill.time,  // timestamp_ms
+                    fill_price, // placement_price (best approximation)
+                    fill_price, // fill_price
+                    fill_size, is_buy,
                 );
 
                 // === AS Outcome Queue: Record fill for 5-second markout ===
@@ -1127,8 +1202,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // suffers from the tautology bug (AS ≈ depth when using fill-time mid).
                 // The Resolved snapshot is created in check_pending_fill_outcomes().
                 {
-                    use crate::market_maker::analytics::EdgeSnapshot;
                     use crate::market_maker::analytics::edge_metrics::EdgePhase;
+                    use crate::market_maker::analytics::EdgeSnapshot;
                     const MAKER_FEE_BPS: f64 = 1.5;
                     let predicted_as_bps = self.estimator.total_as_bps();
                     let snap = EdgeSnapshot {
@@ -1136,11 +1211,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         predicted_spread_bps: quoted_spread_bps,
                         realized_spread_bps: quoted_spread_bps,
                         predicted_as_bps,
-                        realized_as_bps: 0.0,  // Deferred to markout
+                        realized_as_bps: 0.0, // Deferred to markout
                         fee_bps: MAKER_FEE_BPS,
                         predicted_edge_bps: quoted_spread_bps - predicted_as_bps - MAKER_FEE_BPS,
-                        realized_edge_bps: 0.0,  // Deferred to markout
-                        gross_edge_bps: 0.0,     // Deferred to markout
+                        realized_edge_bps: 0.0, // Deferred to markout
+                        gross_edge_bps: 0.0,    // Deferred to markout
                         phase: EdgePhase::Pending,
                         mid_at_placement,
                         markout_as_bps: None,
@@ -1155,7 +1230,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     );
 
                     // Phase 5: Resolve pending quote as filled (immediate, uses quoted spread)
-                    let _ = self.quote_outcome_tracker.on_fill(is_buy, snap.predicted_edge_bps);
+                    let _ = self
+                        .quote_outcome_tracker
+                        .on_fill(is_buy, snap.predicted_edge_bps);
                     let _ = snap; // Explicit drop — real snapshot created at markout
                 }
 
@@ -1171,7 +1248,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     let size_anomaly_sigma = self.stochastic.trade_size_dist.anomaly_sigma();
 
                     // Wire Hawkes intensity into Kalman filter for activity-scaled Q
-                    self.estimator.set_hawkes_intensity_ratio(hawkes_intensity_ratio);
+                    self.estimator
+                        .set_hawkes_intensity_ratio(hawkes_intensity_ratio);
 
                     // Use stress-aware BOCPD update (First-Principles Gap 1)
                     let changepoint = self.stochastic.bocpd_kappa.update_with_stress(
@@ -1232,18 +1310,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     self.stochastic.baseline_tracker.observe(realized_edge_bps);
 
                     // Baseline-adjusted reward: removes fee drag (~-1.5 bps)
-                    let bandit_reward = self.stochastic.baseline_tracker
+                    let bandit_reward = self
+                        .stochastic
+                        .baseline_tracker
                         .counterfactual_reward(realized_edge_bps);
 
                     // Update bandit with 1:1 quote→outcome reward attribution
-                    let bandit_updated = self.stochastic.spread_bandit
+                    let bandit_updated = self
+                        .stochastic
+                        .spread_bandit
                         .update_from_pending(bandit_reward);
 
                     // Update ensemble performance for SpreadBandit (enables GLFT vs Bandit comparison)
                     if bandit_updated {
                         let bandit_brier = bandit_reward * bandit_reward;
                         self.stochastic.ensemble.update_performance(
-                            "SpreadBandit", realized_edge_bps, bandit_brier, fill.time,
+                            "SpreadBandit",
+                            realized_edge_bps,
+                            bandit_brier,
+                            fill.time,
                         );
                     }
 
@@ -1262,10 +1347,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     let queue_position = depth_from_mid * 100.0; // Simplified: bps * 100
                     let time_in_queue_ms = 100; // Placeholder: would need order timestamp tracking
 
-                    self.stochastic.competitor_model.observe(&MarketEvent::OurFill {
-                        queue_position,
-                        time_in_queue_ms,
-                    });
+                    self.stochastic
+                        .competitor_model
+                        .observe(&MarketEvent::OurFill {
+                            queue_position,
+                            time_in_queue_ms,
+                        });
                 }
             }
         }
@@ -1359,15 +1446,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // Check if order is now fully filled by looking at orders tracker
                     // Check if this was a full fill (remaining size = 0)
                     // remaining = size - filled; if order not found, assume full fill
-                    let is_full_fill = self.orders.get_order(fill.oid).is_none_or(|o| o.size - o.filled <= 0.0);
-                    let _trigger = self.event_accumulator.on_fill(side, fill.oid, size, is_full_fill);
+                    let is_full_fill = self
+                        .orders
+                        .get_order(fill.oid)
+                        .is_none_or(|o| o.size - o.filled <= 0.0);
+                    let _trigger =
+                        self.event_accumulator
+                            .on_fill(side, fill.oid, size, is_full_fill);
 
                     // === Position Continuation Model: Update posterior on fill ===
                     // Track whether fill is aligned with current position direction
                     // Aligned fills increase P(continuation), adverse fills decrease it
                     let fill_side_sign = if side == Side::Buy { 1.0 } else { -1.0 };
                     let position_sign = self.position.position().signum();
-                    self.stochastic.position_decision.observe_fill(fill_side_sign, position_sign, size);
+                    self.stochastic.position_decision.observe_fill(
+                        fill_side_sign,
+                        position_sign,
+                        size,
+                    );
                 }
                 // Note: actual reconciliation happens in event loop via check_event_accumulator()
                 Ok(())
@@ -1424,7 +1520,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // Update BBO in data quality monitor for quote gating crossed-book check.
             if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
-                self.infra.data_quality.update_bbo(&self.config.asset, best_bid, best_ask);
+                self.infra
+                    .data_quality
+                    .update_bbo(&self.config.asset, best_bid, best_ask);
+
+                // Feed L2 snapshot to Shadow Tuner buffer (lock-free, non-blocking)
+                let bid_depth: f64 = bids.iter().take(5).map(|(_, sz)| sz).sum();
+                let ask_depth: f64 = asks.iter().take(5).map(|(_, sz)| sz).sum();
+                let timestamp_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                self.feed_shadow_buffer(crate::market_maker::simulation::ReplayEvent::L2Update {
+                    timestamp_ns,
+                    best_bid,
+                    best_ask,
+                    bid_depth,
+                    ask_depth,
+                });
             }
 
             // Record book snapshot for dashboard unconditionally
@@ -1444,7 +1557,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Update queue position tracker with full L2 depth snapshot.
             // This refines depth_ahead estimates using min(current, book) to
             // preserve queue advancement from observed fills/cancellations.
-            self.tier1.queue_tracker.update_depth_from_book(&bids, &asks);
+            self.tier1
+                .queue_tracker
+                .update_depth_from_book(&bids, &asks);
 
             // === Bootstrap from Book: Feed L2 to MarketProfile ===
             // MarketProfile tracks BBO spread, depth, and trade rate for kappa estimation.
@@ -1453,14 +1568,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
                 let bid_depth_50bps: f64 = bids.iter().map(|(_, sz)| sz).sum();
                 let ask_depth_50bps: f64 = asks.iter().map(|(_, sz)| sz).sum();
-                self.market_profile.on_l2_book(best_bid, best_ask, bid_depth_50bps, ask_depth_50bps);
+                self.market_profile.on_l2_book(
+                    best_bid,
+                    best_ask,
+                    bid_depth_50bps,
+                    ask_depth_50bps,
+                );
 
                 // Seed coordinator once when profile is ready and bootstrap is enabled
                 if self.capital_policy.bootstrap_from_book
                     && !self.calibration_coordinator.is_seeded()
                     && self.market_profile.is_initialized()
                 {
-                    self.calibration_coordinator.initialize_from_profile(&self.market_profile);
+                    self.calibration_coordinator
+                        .initialize_from_profile(&self.market_profile);
                     info!(
                         profile_kappa = %format!("{:.0}", self.market_profile.conservative_kappa()),
                         profile_sigma = %format!("{:.6}", self.market_profile.implied_sigma()),
@@ -1477,11 +1598,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let bid_depth_deep: f64 = bids.iter().map(|(_, sz)| sz).sum();
                 let ask_depth_deep: f64 = asks.iter().map(|(_, sz)| sz).sum();
                 self.tier1.book_dynamics.update(
-                    bid_depth_deep, ask_depth_deep, std::time::Instant::now(),
+                    bid_depth_deep,
+                    ask_depth_deep,
+                    std::time::Instant::now(),
                 );
                 self.tier1.book_dynamics.update_imbalances(
-                    bid_depth_shallow, ask_depth_shallow,
-                    bid_depth_deep, ask_depth_deep,
+                    bid_depth_shallow,
+                    ask_depth_shallow,
+                    bid_depth_deep,
+                    ask_depth_deep,
                 );
             }
 
@@ -1493,7 +1618,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let total_ask_depth: f64 = asks.iter().map(|(_, sz)| sz).sum();
                 let other_bid_depth = (total_bid_depth - our_bid_size).max(0.0);
                 let other_ask_depth = (total_ask_depth - our_ask_size).max(0.0);
-                self.self_impact.update(our_bid_size, other_bid_depth, our_ask_size, other_ask_depth);
+                self.self_impact.update(
+                    our_bid_size,
+                    other_bid_depth,
+                    our_ask_size,
+                    other_ask_depth,
+                );
             }
 
             // === Phase 3: Pre-Fill AS Classifier - Orderbook Imbalance Update ===
@@ -1501,7 +1631,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             {
                 let bid_depth: f64 = bids.iter().take(5).map(|(_, sz)| sz).sum();
                 let ask_depth: f64 = asks.iter().take(5).map(|(_, sz)| sz).sum();
-                self.tier1.pre_fill_classifier.update_orderbook(bid_depth, ask_depth);
+                self.tier1
+                    .pre_fill_classifier
+                    .update_orderbook(bid_depth, ask_depth);
 
                 // === Enhanced Microstructure Classifier: Book Update ===
                 // Feed BBO and depth to z-score normalized feature extractor
@@ -1511,7 +1643,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     self.tier1.enhanced_classifier.on_book_update(
-                        best_bid, best_ask, bid_depth, ask_depth, timestamp_ms,
+                        best_bid,
+                        best_ask,
+                        bid_depth,
+                        ask_depth,
+                        timestamp_ms,
                     );
                 }
             }
@@ -1527,7 +1663,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                self.stochastic.liquidity_evaporation.on_book(near_touch_depth, timestamp_ms);
+                self.stochastic
+                    .liquidity_evaporation
+                    .on_book(near_touch_depth, timestamp_ms);
 
                 // Phase 1A: Update COFI (Cumulative OFI with decay)
                 // We use top-of-book depth as the OFI proxy
@@ -1536,7 +1674,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // by treating current depth as a "flow" signal
                 let bid_delta = near_bid_depth * 0.1; // Scale factor to normalize
                 let ask_delta = near_ask_depth * 0.1;
-                self.stochastic.cofi.on_book_update(bid_delta, ask_delta, timestamp_ms);
+                self.stochastic
+                    .cofi
+                    .on_book_update(bid_delta, ask_delta, timestamp_ms);
             }
 
             // === Phase 8: Competitor Model Depth Observation ===
@@ -1552,16 +1692,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // For now, observe raw depth as proxy for competitor activity
                 // Large depths suggest more competitor presence
                 if bid_depth > 100.0 {
-                    self.stochastic.competitor_model.observe(&MarketEvent::DepthChange {
-                        side: LearningSide::Bid,
-                        delta: bid_depth,
-                    });
+                    self.stochastic
+                        .competitor_model
+                        .observe(&MarketEvent::DepthChange {
+                            side: LearningSide::Bid,
+                            delta: bid_depth,
+                        });
                 }
                 if ask_depth > 100.0 {
-                    self.stochastic.competitor_model.observe(&MarketEvent::DepthChange {
-                        side: LearningSide::Ask,
-                        delta: ask_depth,
-                    });
+                    self.stochastic
+                        .competitor_model
+                        .observe(&MarketEvent::DepthChange {
+                            side: LearningSide::Ask,
+                            delta: ask_depth,
+                        });
                 }
             }
 
@@ -1811,7 +1955,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         for oid in &stale_oids {
             if let Some(order) = self.ws_state.remove_order(*oid) {
                 self.safety.fill_processor.record_cancelled_order(
-                    *oid, order.side, order.price, order.size,
+                    *oid,
+                    order.side,
+                    order.price,
+                    order.size,
                 );
                 // Record unfilled outcome for reconcile action-type learning
                 self.reconcile_outcome_tracker.record_unfilled(*oid);
@@ -2099,7 +2246,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.stochastic.model_calibration.update_all(now);
 
         // Log calibration metrics periodically (every ~60 calls ≈ 1 minute at 1s interval)
-        static PERIODIC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PERIODIC_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let count = PERIODIC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if count.is_multiple_of(60) {
@@ -2139,7 +2287,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
-            self.live_analytics.snapshot_equity(now_ns, total_equity_usd);
+            self.live_analytics
+                .snapshot_equity(now_ns, total_equity_usd);
         }
 
         // === Live Analytics: Periodic summary (Sharpe, signal attribution) ===
@@ -2209,7 +2358,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Check event-driven triggers first, then fallback timer.
         // The fallback guarantees minimum quote frequency even without accumulated events.
-        let trigger = self.event_accumulator.should_trigger()
+        let trigger = self
+            .event_accumulator
+            .should_trigger()
             .or_else(|| self.event_accumulator.check_fallback());
 
         if let Some(trigger) = trigger {
@@ -2250,22 +2401,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Called from the event loop when Binance feed is enabled.
     pub(crate) fn handle_binance_price_update(&mut self, update: BinancePriceUpdate) {
         // Feed Binance price to SignalIntegrator
-        self.stochastic.signal_integrator.on_binance_price(
-            update.mid_price,
-            update.timestamp_ms,
-        );
+        self.stochastic
+            .signal_integrator
+            .on_binance_price(update.mid_price, update.timestamp_ms);
 
         // Feed BTC returns to CrossAssetSignals (Sprint 4.1)
         if self.last_binance_mid > 0.0 && update.mid_price > 0.0 {
-            let return_bps =
-                (update.mid_price / self.last_binance_mid - 1.0) * 10_000.0;
+            let return_bps = (update.mid_price / self.last_binance_mid - 1.0) * 10_000.0;
             self.cross_asset_signals
                 .update_btc_return(update.timestamp_ms as u64, return_bps);
         }
         self.last_binance_mid = update.mid_price;
 
         // Log periodically (every 1000 updates ≈ every 10 seconds at 100 updates/sec)
-        static BINANCE_UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static BINANCE_UPDATE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let count = BINANCE_UPDATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if count.is_multiple_of(1000) {
@@ -2301,7 +2451,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.stochastic.signal_integrator.on_binance_trade(&trade);
 
         // Log periodically (every 500 trades)
-        static BINANCE_TRADE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static BINANCE_TRADE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let count = BINANCE_TRADE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if count.is_multiple_of(500) {

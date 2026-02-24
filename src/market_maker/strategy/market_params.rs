@@ -1115,56 +1115,56 @@ impl Default for MarketParams {
             use_kappa_robust: true, // Default ON - use robust kappa for spreads
             kappa_outlier_count: 0, // No outliers detected yet
             // V2: Uncertainty Quantification
-            kappa_uncertainty: 0.0,    // Will be computed from posterior
-            kappa_95_lower: 100.0,     // Conservative lower bound
-            kappa_95_upper: 100.0,     // Conservative upper bound
-            kappa_ci_width: 1.0,       // High uncertainty initially (CI width / mean)
-            toxicity_score: 0.0,       // No toxicity initially
-            param_correlation: 0.0,    // No correlation initially
-            as_factor: 1.0,            // No AS adjustment initially
-            arrival_intensity: 0.5,    // 0.5 volume ticks per second
-            is_toxic_regime: false,    // Default: not toxic
-            jump_ratio: 1.0,           // Default: normal diffusion
-            momentum_bps: 0.0,         // Default: no momentum
-            flow_imbalance: 0.0,       // Default: balanced flow
-            lead_lag_signal_bps: 0.0,  // Default: no cross-exchange signal
+            kappa_uncertainty: 0.0,   // Will be computed from posterior
+            kappa_95_lower: 100.0,    // Conservative lower bound
+            kappa_95_upper: 100.0,    // Conservative upper bound
+            kappa_ci_width: 1.0,      // High uncertainty initially (CI width / mean)
+            toxicity_score: 0.0,      // No toxicity initially
+            param_correlation: 0.0,   // No correlation initially
+            as_factor: 1.0,           // No AS adjustment initially
+            arrival_intensity: 0.5,   // 0.5 volume ticks per second
+            is_toxic_regime: false,   // Default: not toxic
+            jump_ratio: 1.0,          // Default: normal diffusion
+            momentum_bps: 0.0,        // Default: no momentum
+            flow_imbalance: 0.0,      // Default: balanced flow
+            lead_lag_signal_bps: 0.0, // Default: no cross-exchange signal
             drift_signal_bps: 0.0,    // Default: no drift signal
-            lead_lag_confidence: 0.0,  // Default: no confidence
-            falling_knife_score: 0.0,  // Default: no falling knife
-            rising_knife_score: 0.0,   // Default: no rising knife
-            book_imbalance: 0.0,       // Default: balanced book
-            microprice: 0.0,           // Will be set from estimator
-            market_mid: 0.0,           // Will be set from latest AllMids
-            beta_book: 0.0,            // Will be learned from data
-            beta_flow: 0.0,            // Will be learned from data
+            lead_lag_confidence: 0.0, // Default: no confidence
+            falling_knife_score: 0.0, // Default: no falling knife
+            rising_knife_score: 0.0,  // Default: no rising knife
+            book_imbalance: 0.0,      // Default: balanced book
+            microprice: 0.0,          // Will be set from estimator
+            market_mid: 0.0,          // Will be set from latest AllMids
+            beta_book: 0.0,           // Will be learned from data
+            beta_flow: 0.0,           // Will be learned from data
             // Tier 1: Adverse Selection
             as_spread_adjustment: 0.0, // No adjustment until warmed up
             as_spread_adjustment_bid: 0.0,
             as_spread_adjustment_ask: 0.0,
-            predicted_alpha: 0.0,      // Default: no informed flow detected
-            as_warmed_up: false,       // Starts not warmed up
-            depth_decay_as: None,      // No calibrated model initially
+            predicted_alpha: 0.0, // Default: no informed flow detected
+            as_warmed_up: false,  // Starts not warmed up
+            depth_decay_as: None, // No calibrated model initially
             conditional_as_posterior_mean_bps: None, // Learned from fill AS data, not magic number
             // Tier 1: Pre-Fill AS Classifier (Phase 3)
-            pre_fill_toxicity_bid: 0.0,      // No toxicity initially
-            pre_fill_toxicity_ask: 0.0,      // No toxicity initially
+            pre_fill_toxicity_bid: 0.0, // No toxicity initially
+            pre_fill_toxicity_ask: 0.0, // No toxicity initially
             // Tier 1: Liquidation Cascade
             tail_risk_intensity: 0.0, // Default to 0 intensity (calm)
             should_pull_quotes: false,
-            cascade_intensity: 0.0,  // Default to 0 intensity (calm): full size
+            cascade_intensity: 0.0, // Default to 0 intensity (calm): full size
             // Tier 2: Hawkes Order Flow
             hawkes_buy_intensity: 0.0,
             hawkes_sell_intensity: 0.0,
             hawkes_imbalance: 0.0,
             hawkes_activity_percentile: 0.5,
             // Hawkes Excitation Prediction (Phase 7: Bayesian Fusion)
-            hawkes_p_cluster: 0.0,               // No cluster risk initially
-            hawkes_excitation_penalty: 1.0,      // No penalty (full edge)
-            hawkes_is_high_excitation: false,    // Not excited initially
-            hawkes_branching_ratio: 0.3,         // Moderate default (from prior)
-            hawkes_spread_widening: 1.0,         // No widening initially
+            hawkes_p_cluster: 0.0,            // No cluster risk initially
+            hawkes_excitation_penalty: 1.0,   // No penalty (full edge)
+            hawkes_is_high_excitation: false, // Not excited initially
+            hawkes_branching_ratio: 0.3,      // Moderate default (from prior)
+            hawkes_spread_widening: 1.0,      // No widening initially
             hawkes_expected_cluster_time: f64::INFINITY, // No imminent cluster
-            hawkes_excess_intensity_ratio: 1.0,  // At baseline
+            hawkes_excess_intensity_ratio: 1.0, // At baseline
             // Phase 8: RL Policy Recommendations
             rl_spread_delta_bps: 0.0,
             rl_bid_skew_bps: 0.0,
@@ -1176,19 +1176,19 @@ impl Default for MarketParams {
             bandit_spread_additive_bps: 0.0,
             bandit_is_exploration: false,
             // Phase 8: Competitor Model
-            competitor_snipe_prob: 0.1,      // 10% baseline
-            competitor_spread_factor: 1.0,   // No adjustment
-            competitor_count: 3.0,           // Assume 3 competitors
-            market_share: 0.0,               // Unknown until observed
+            competitor_snipe_prob: 0.1,    // 10% baseline
+            competitor_spread_factor: 1.0, // No adjustment
+            competitor_count: 3.0,         // Assume 3 competitors
+            market_share: 0.0,             // Unknown until observed
             // Phase 9: Rate Limit Death Spiral Prevention
-            rate_limit_headroom_pct: 1.0,    // Full budget available
-            quota_shadow_spread_bps: 0.0,    // No shadow spread at full headroom
+            rate_limit_headroom_pct: 1.0, // Full budget available
+            quota_shadow_spread_bps: 0.0, // No shadow spread at full headroom
             // Tier 2: Funding Rate
             funding_rate: 0.0,
             predicted_funding_cost: 0.0,
             time_to_funding_settlement_s: 28800.0, // 8 hours in seconds (unknown)
-            open_interest: 0.0,                     // Will be set from exchange data
-            oi_change_1m: 0.0,                      // Will be computed from OI history
+            open_interest: 0.0,                    // Will be set from exchange data
+            oi_change_1m: 0.0,                     // Will be computed from OI history
             // Tier 2: Spread Process
             fair_spread: 0.0,
             spread_percentile: 0.5,
@@ -1239,8 +1239,8 @@ impl Default for MarketParams {
             exchange_effective_ask_limit: f64::MAX, // No constraint until fetched
             exchange_limits_age_ms: u64::MAX,       // Never fetched
             // Pending Exposure
-            pending_bid_exposure: 0.0, // No resting orders initially
-            pending_ask_exposure: 0.0, // No resting orders initially
+            pending_bid_exposure: 0.0,      // No resting orders initially
+            pending_ask_exposure: 0.0,      // No resting orders initially
             available_bid_budget: f64::MAX, // Unconstrained until ExposureBudget wired
             available_ask_budget: f64::MAX,
             // Dynamic Position Limits
@@ -1248,9 +1248,9 @@ impl Default for MarketParams {
             dynamic_limit_valid: false,   // Not valid until margin state refreshed
             margin_quoting_capacity: 0.0, // Will be computed from margin_available
             // Stochastic Constraints
-            tick_size_bps: 0.5,           // Conservative default; overridden by compute_tick_size_bps()
+            tick_size_bps: 0.5, // Conservative default; overridden by compute_tick_size_bps()
             latency_spread_floor: 0.0003, // 3 bps default floor
-            near_touch_depth_usd: 0.0,    // No depth data initially
+            near_touch_depth_usd: 0.0, // No depth data initially
             tight_quoting_allowed: false, // Conservative default
             tight_quoting_block_reason: Some("Warmup".to_string()),
             // NOTE: stochastic_spread_multiplier removed - uncertainty flows through gamma
@@ -1308,20 +1308,20 @@ impl Default for MarketParams {
             l2_reservation_shift: 0.0, // No shift initially (neutral)
             // NOTE: l2_spread_multiplier removed - uncertainty flows through gamma
             // Proactive Position Management (Small Fish)
-            enable_proactive_skew: false,            // Off by default, opt-in
-            proactive_skew_sensitivity: 2.0,         // 2 bps per unit momentum×confidence
-            proactive_min_momentum_confidence: 0.6,  // Need 60% confidence
-            proactive_min_momentum_bps: 5.0,         // Need 5 bps minimum momentum
+            enable_proactive_skew: false,    // Off by default, opt-in
+            proactive_skew_sensitivity: 2.0, // 2 bps per unit momentum×confidence
+            proactive_min_momentum_confidence: 0.6, // Need 60% confidence
+            proactive_min_momentum_bps: 5.0, // Need 5 bps minimum momentum
             // Regime-Conditioned Kappa
-            regime_kappa: None,                // Not available until regime estimator warmed up
-            regime_kappa_current_regime: 1,    // Normal regime default
+            regime_kappa: None, // Not available until regime estimator warmed up
+            regime_kappa_current_regime: 1, // Normal regime default
             // Regime-conditioned objective and parameters
             regime_as_expected_bps: 1.0,
             regime_risk_premium_bps: 1.0,
             regime_skew_gain: 1.0,
             controller_objective: ControllerObjective::MeanRevert,
             max_position_fraction: 0.8,
-            total_risk_premium_bps: 1.0, // Default: 1 bps risk premium
+            total_risk_premium_bps: 1.0,  // Default: 1 bps risk premium
             regime_gamma_multiplier: 1.0, // Default: Normal regime
             avg_entry_price: None,
             breakeven_price: 0.0,
@@ -1330,32 +1330,32 @@ impl Default for MarketParams {
             cascade_bid_addon_bps: 0.0,
             cascade_ask_addon_bps: 0.0,
             // Bayesian Gamma Components (Alpha Plan)
-            trend_confidence: 0.5,        // 50% confidence initially (uncertain)
-            bootstrap_confidence: 0.0,    // Not calibrated initially
-            adverse_uncertainty: 0.1,     // Moderate uncertainty (10% std)
-            adverse_regime: 1,            // Normal regime initially
+            trend_confidence: 0.5,     // 50% confidence initially (uncertain)
+            bootstrap_confidence: 0.0, // Not calibrated initially
+            adverse_uncertainty: 0.1,  // Moderate uncertainty (10% std)
+            adverse_regime: 1,         // Normal regime initially
             // Predictive Bias (A-S Extension)
-            changepoint_prob: 0.0,        // No changepoint detected initially
+            changepoint_prob: 0.0, // No changepoint detected initially
             // First-Principles Stochastic Control
-            belief_predictive_bias: 0.0,  // No drift bias until beliefs updated
+            belief_predictive_bias: 0.0, // No drift bias until beliefs updated
             belief_expected_sigma: 0.0001, // Default sigma
             belief_expected_kappa: 200.0, // Conservative default for thin DEX
-            belief_confidence: 0.0,       // Not confident until warmed up
-            use_belief_system: true,      // Use first-principles belief system
+            belief_confidence: 0.0,      // Not confident until warmed up
+            use_belief_system: true,     // Use first-principles belief system
             // Position Direction Confidence
             position_direction_confidence: 0.5, // Neutral confidence initially
             time_since_adverse_move: 0.0,       // No history initially
             // Position Continuation Model
             position_action: super::PositionAction::default(), // Default REDUCE
-            continuation_p: 0.5,                // Neutral prior
-            continuation_confidence: 0.0,       // No confidence until fills observed
-            effective_inventory_ratio: 0.0,     // Will be computed from position_action
+            continuation_p: 0.5,                               // Neutral prior
+            continuation_confidence: 0.0,                      // No confidence until fills observed
+            effective_inventory_ratio: 0.0, // Will be computed from position_action
             // Bayesian Learned Parameters (Phase 6)
-            use_learned_parameters: false,      // Off until calibrated
-            learned_kappa: 2000.0,              // Prior mean
-            learned_alpha_touch: 0.25,          // Prior mean (25% informed)
-            learned_spread_floor_bps: 5.0,      // Prior mean (5 bps)
-            learned_params_calibrated: false,   // Not calibrated initially
+            use_learned_parameters: false,    // Off until calibrated
+            learned_kappa: 2000.0,            // Prior mean
+            learned_alpha_touch: 0.25,        // Prior mean (25% informed)
+            learned_spread_floor_bps: 5.0,    // Prior mean (5 bps)
+            learned_params_calibrated: false, // Not calibrated initially
             // Cached BBO (0.0 = not yet received from L2 book)
             cached_best_bid: 0.0,
             cached_best_ask: 0.0,
@@ -1985,8 +1985,8 @@ impl MarketParams {
         // If we're long and drift is positive, or short and drift is negative
         let belief_alignment = if self.belief_confidence > 0.1 {
             let bias = self.belief_predictive_bias;
-            let aligned = (position_sign > 0.0 && bias > 0.0)
-                || (position_sign < 0.0 && bias < 0.0);
+            let aligned =
+                (position_sign > 0.0 && bias > 0.0) || (position_sign < 0.0 && bias < 0.0);
             if aligned {
                 // Confidence-weighted alignment: stronger beliefs = more confidence
                 // bias magnitude is typically small (e.g., 0.0001), so we normalize

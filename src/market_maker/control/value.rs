@@ -506,18 +506,27 @@ mod tests {
         state.position = 2.0;
         state.drift_rate = 0.001;
         let basis = ValueFunction::compute_basis(&state);
-        assert!(basis[18] > 0.0, "drift*position should be positive when aligned");
+        assert!(
+            basis[18] > 0.0,
+            "drift*position should be positive when aligned"
+        );
 
         // Long position + negative drift = negative feature (opposing, bad)
         state.drift_rate = -0.001;
         let basis = ValueFunction::compute_basis(&state);
-        assert!(basis[18] < 0.0, "drift*position should be negative when opposing");
+        assert!(
+            basis[18] < 0.0,
+            "drift*position should be negative when opposing"
+        );
 
         // Short position + negative drift = positive feature (aligned)
         state.position = -2.0;
         state.drift_rate = -0.001;
         let basis = ValueFunction::compute_basis(&state);
-        assert!(basis[18] > 0.0, "drift*position should be positive when short + down");
+        assert!(
+            basis[18] > 0.0,
+            "drift*position should be positive when short + down"
+        );
     }
 
     #[test]

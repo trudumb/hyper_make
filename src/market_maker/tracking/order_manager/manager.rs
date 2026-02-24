@@ -222,7 +222,14 @@ impl OrderManager {
     /// - `price`: Limit price
     /// - `size`: Order size
     /// - `cloid`: Client Order ID (UUID string, generated before placement)
-    pub fn add_pending_with_cloid(&mut self, side: Side, price: f64, size: f64, cloid: String, mid: f64) {
+    pub fn add_pending_with_cloid(
+        &mut self,
+        side: Side,
+        price: f64,
+        size: f64,
+        cloid: String,
+        mid: f64,
+    ) {
         // Store in CLOID map (primary lookup)
         let pending = PendingOrder::with_cloid(side, price, size, cloid.clone(), mid);
         self.pending_by_cloid.insert(cloid, pending.clone());

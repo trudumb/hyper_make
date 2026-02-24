@@ -81,25 +81,63 @@ pub struct MarketToxicityConfig {
 }
 
 // --- serde default helpers ---
-fn default_w_vpin() -> f64 { 0.25 }
-fn default_w_informed() -> f64 { 0.25 }
-fn default_w_trend() -> f64 { 0.20 }
-fn default_w_book() -> f64 { 0.15 }
-fn default_w_velocity() -> f64 { 0.15 }
-fn default_vpin_mid() -> f64 { 0.55 }
-fn default_vpin_k() -> f64 { 15.0 }
-fn default_informed_mid() -> f64 { 0.40 }
-fn default_informed_k() -> f64 { 12.0 }
-fn default_trend_sat_bps() -> f64 { 30.0 }
-fn default_book_sat() -> f64 { 0.70 }
-fn default_vel_sat() -> f64 { 10.0 }
-fn default_min_tox() -> f64 { 0.3 }
-fn default_max_mult() -> f64 { 5.0 }
-fn default_max_composed() -> f64 { 10.0 }
-fn default_cold_frac() -> f64 { 0.35 }
-fn default_cold_mult() -> f64 { 1.5 }
-fn default_max_skew() -> f64 { 2.0 }
-fn default_skew_trend_w() -> f64 { 0.60 }
+fn default_w_vpin() -> f64 {
+    0.25
+}
+fn default_w_informed() -> f64 {
+    0.25
+}
+fn default_w_trend() -> f64 {
+    0.20
+}
+fn default_w_book() -> f64 {
+    0.15
+}
+fn default_w_velocity() -> f64 {
+    0.15
+}
+fn default_vpin_mid() -> f64 {
+    0.55
+}
+fn default_vpin_k() -> f64 {
+    15.0
+}
+fn default_informed_mid() -> f64 {
+    0.40
+}
+fn default_informed_k() -> f64 {
+    12.0
+}
+fn default_trend_sat_bps() -> f64 {
+    30.0
+}
+fn default_book_sat() -> f64 {
+    0.70
+}
+fn default_vel_sat() -> f64 {
+    10.0
+}
+fn default_min_tox() -> f64 {
+    0.3
+}
+fn default_max_mult() -> f64 {
+    5.0
+}
+fn default_max_composed() -> f64 {
+    10.0
+}
+fn default_cold_frac() -> f64 {
+    0.35
+}
+fn default_cold_mult() -> f64 {
+    1.5
+}
+fn default_max_skew() -> f64 {
+    2.0
+}
+fn default_skew_trend_w() -> f64 {
+    0.60
+}
 
 impl Default for MarketToxicityConfig {
     fn default() -> Self {
@@ -209,7 +247,11 @@ impl MarketToxicityComposite {
             None => (0.0, false),
         };
 
-        let informed_score = sigmoid(input.p_informed, cfg.informed_sigmoid_mid, cfg.informed_sigmoid_k);
+        let informed_score = sigmoid(
+            input.p_informed,
+            cfg.informed_sigmoid_mid,
+            cfg.informed_sigmoid_k,
+        );
 
         let (trend_score, trend_valid) = match input.trend_long_bps {
             Some(bps) => {
@@ -224,7 +266,10 @@ impl MarketToxicityComposite {
 
         let book_score = ramp(input.book_imbalance.abs(), cfg.book_imbalance_saturation);
 
-        let vel_score = ramp(input.price_velocity_1s.abs(), cfg.velocity_saturation_bps_per_s);
+        let vel_score = ramp(
+            input.price_velocity_1s.abs(),
+            cfg.velocity_saturation_bps_per_s,
+        );
 
         // ---- cold-start detection ----
         let total_signals = 5u32;
@@ -232,7 +277,8 @@ impl MarketToxicityComposite {
             .iter()
             .filter(|&&b| b)
             .count() as u32;
-        let cold_start = (invalid_count as f64 / total_signals as f64) > cfg.cold_start_invalid_fraction;
+        let cold_start =
+            (invalid_count as f64 / total_signals as f64) > cfg.cold_start_invalid_fraction;
 
         let components = ToxicityComponents {
             vpin: vpin_score,
@@ -336,7 +382,10 @@ mod tests {
     fn test_benign_market_below_threshold() {
         let s = scorer();
         let result = s.evaluate(&default_input());
-        assert!(result.composite_score < 0.3, "benign market should be below min_toxicity");
+        assert!(
+            result.composite_score < 0.3,
+            "benign market should be below min_toxicity"
+        );
         assert!(
             (result.spread_multiplier - 1.0).abs() < 1e-9,
             "multiplier should be 1.0 when below threshold"
@@ -422,7 +471,10 @@ mod tests {
             price_velocity_1s: 0.0,
         };
         let result = s.evaluate(&input);
-        assert!(result.cold_start, "should be cold-start with VPIN and trend invalid");
+        assert!(
+            result.cold_start,
+            "should be cold-start with VPIN and trend invalid"
+        );
         assert!(
             (result.spread_multiplier - 1.5).abs() < 1e-9,
             "cold-start multiplier should be 1.5"
@@ -483,13 +535,21 @@ mod tests {
         input.trend_agreement = Some(0.8);
         input.book_imbalance = 0.5;
         let result = s.evaluate(&input);
-        assert!(result.skew_bps > 0.0, "skew should be positive: {}", result.skew_bps);
+        assert!(
+            result.skew_bps > 0.0,
+            "skew should be positive: {}",
+            result.skew_bps
+        );
 
         // Negative trend + negative book → negative skew.
         input.trend_long_bps = Some(-20.0);
         input.book_imbalance = -0.5;
         let neg = s.evaluate(&input);
-        assert!(neg.skew_bps < 0.0, "skew should be negative: {}", neg.skew_bps);
+        assert!(
+            neg.skew_bps < 0.0,
+            "skew should be negative: {}",
+            neg.skew_bps
+        );
     }
 
     #[test]

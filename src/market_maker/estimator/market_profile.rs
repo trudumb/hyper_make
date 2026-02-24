@@ -194,7 +194,8 @@ impl MarketProfile {
             self.ask_depth_50bps = ask_depth_within_50bps;
         } else {
             // EWMA update
-            self.bbo_half_spread_bps = ewma(self.bbo_half_spread_bps, half_spread_bps, SPREAD_ALPHA);
+            self.bbo_half_spread_bps =
+                ewma(self.bbo_half_spread_bps, half_spread_bps, SPREAD_ALPHA);
             self.bid_depth_50bps = ewma(self.bid_depth_50bps, bid_depth_within_50bps, DEPTH_ALPHA);
             self.ask_depth_50bps = ewma(self.ask_depth_50bps, ask_depth_within_50bps, DEPTH_ALPHA);
         }

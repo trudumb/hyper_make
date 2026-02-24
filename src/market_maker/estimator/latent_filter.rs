@@ -3,7 +3,7 @@
 //! Replaces the scalar mid-price and isolated drift estimators with a joint filter
 //! tracking Latent Fair Value (V), Instantaneous Drift (μ), and Realized Volatility (σ).
 //!
-//! Includes Glosten-Milgrom updates to incorporate our own fills as 
+//! Includes Glosten-Milgrom updates to incorporate our own fills as
 //! adversarial information.
 
 use tracing::debug;
@@ -53,7 +53,7 @@ impl LatentStateFilter {
             v: 0.0,
             mu: 0.0,
             sigma: 0.025, // default assumption (e.g. 0.025 bps/sqrt(s))
-            p_v: 1e6, // High initial uncertainty
+            p_v: 1e6,     // High initial uncertainty
             p_mu: 1e3,
             p_sigma: 1e1,
             q_v: 1e-4, // base process noise for V
@@ -74,7 +74,7 @@ impl LatentStateFilter {
         // V(t) = V(t-1) * (1 + μ*dt) (approx for small dt)
         if self.v > 0.0 {
             // Apply drift to latent value
-            let drift_return = (self.mu / 10000.0) * dt; 
+            let drift_return = (self.mu / 10000.0) * dt;
             self.v *= 1.0 + drift_return;
         }
 
@@ -109,7 +109,7 @@ impl LatentStateFilter {
             self.v += k * y;
             // Update covariance
             self.p_v *= 1.0 - k;
-            
+
             // Also update mu based on the innovation if dt > 0
             if dt > 0.1 {
                 let implied_mu = (y / self.v) * 10000.0 / dt;
@@ -129,23 +129,29 @@ impl LatentStateFilter {
     /// Treat our own fill as an adversarial Glosten-Milgrom observation.
     /// If an ask is filled, the true value is likely higher (informed buy).
     /// If a bid is filled, the true value is likely lower (informed sell).
-    pub fn glosten_milgrom_update(&mut self, timestamp_ms: u64, is_buy: bool, p_informed: f64, spread_bps: f64) {
+    pub fn glosten_milgrom_update(
+        &mut self,
+        timestamp_ms: u64,
+        is_buy: bool,
+        p_informed: f64,
+        spread_bps: f64,
+    ) {
         if self.v <= 0.0 {
             return;
         }
-        
+
         // P(informed) is the fraction of flow that knows the true value V.
         // E[V | Ask Lifted] = V + (P_inf * Spread/2)
         // E[V | Bid Hit] = V - (P_inf * Spread/2)
-        
+
         let shift_bps = p_informed * (spread_bps / 2.0);
         let shift_factor = 1.0 + (if is_buy { -shift_bps } else { shift_bps } / 10000.0);
-        
+
         self.v *= shift_factor;
-        
+
         // Decrease confidence in V because adversarial selection just occurred
-        self.p_v *= 1.1; 
-        
+        self.p_v *= 1.1;
+
         debug!(
             is_bid_filled = is_buy,
             p_informed = %format!("{:.2}", p_informed),
@@ -153,7 +159,7 @@ impl LatentStateFilter {
             new_v = %format!("{:.2}", self.v),
             "Glosten-Milgrom Latent State Shift"
         );
-        
+
         self.last_update_ms = timestamp_ms;
     }
 

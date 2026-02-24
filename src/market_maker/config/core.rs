@@ -221,10 +221,10 @@ impl Default for MonitoringConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market_maker::config::ImpulseControlConfig;
     use crate::market_maker::config::risk::CascadeConfig;
     use crate::market_maker::config::runtime::AssetRuntimeConfig;
     use crate::market_maker::config::stochastic::StochasticConfig;
+    use crate::market_maker::config::ImpulseControlConfig;
     use crate::market_maker::tracking::ReconcileConfig;
     use crate::meta::CollateralInfo;
 
@@ -267,7 +267,10 @@ mod tests {
         let mut cfg = test_valid_config();
         cfg.risk_aversion = 0.0;
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("risk_aversion"), "error should mention risk_aversion: {err}");
+        assert!(
+            err.contains("risk_aversion"),
+            "error should mention risk_aversion: {err}"
+        );
     }
 
     #[test]
@@ -275,7 +278,10 @@ mod tests {
         let mut cfg = test_valid_config();
         cfg.max_position = -1.0;
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("max_position"), "error should mention max_position: {err}");
+        assert!(
+            err.contains("max_position"),
+            "error should mention max_position: {err}"
+        );
     }
 
     #[test]
@@ -283,7 +289,10 @@ mod tests {
         let mut cfg = test_valid_config();
         cfg.target_liquidity = 0.0;
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("target_liquidity"), "error should mention target_liquidity: {err}");
+        assert!(
+            err.contains("target_liquidity"),
+            "error should mention target_liquidity: {err}"
+        );
     }
 
     #[test]
@@ -291,6 +300,9 @@ mod tests {
         let mut cfg = test_valid_config();
         cfg.fee_bps = -0.5;
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("fee_bps"), "error should mention fee_bps: {err}");
+        assert!(
+            err.contains("fee_bps"),
+            "error should mention fee_bps: {err}"
+        );
     }
 }

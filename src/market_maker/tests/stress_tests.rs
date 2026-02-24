@@ -16,15 +16,12 @@ mod tests {
         CreateOrderParams, OrderEvent, OrderLifecycleTracker, OrderState, Side,
     };
     use crate::market_maker::infra::{
-        ConnectionHealthMonitor, ConnectionState, ReconnectionConfig,
-        RejectionRateLimiter,
+        ConnectionHealthMonitor, ConnectionState, ReconnectionConfig, RejectionRateLimiter,
     };
-    use crate::market_maker::monitoring::{
-        AlertConfig, Alerter, PostMortemDump,
-    };
+    use crate::market_maker::monitoring::{AlertConfig, Alerter, PostMortemDump};
     use crate::market_maker::risk::{
-        KillReason, KillSwitch, KillSwitchConfig, KillSwitchState,
-        ReentryConfig, ReentryManager, ReentryPhase,
+        KillReason, KillSwitch, KillSwitchConfig, KillSwitchState, ReentryConfig, ReentryManager,
+        ReentryPhase,
     };
 
     fn now_ms() -> u64 {
@@ -46,7 +43,12 @@ mod tests {
         }
     }
 
-    fn make_event(state: OrderState, filled: f64, remaining: f64, reason: Option<&str>) -> OrderEvent {
+    fn make_event(
+        state: OrderState,
+        filled: f64,
+        remaining: f64,
+        reason: Option<&str>,
+    ) -> OrderEvent {
         OrderEvent {
             timestamp: now_ms(),
             state,
@@ -144,7 +146,10 @@ mod tests {
             assert!(
                 delays[i] >= delays[i - 1],
                 "Delay {} ({:?}) should be >= delay {} ({:?})",
-                i, delays[i], i - 1, delays[i - 1]
+                i,
+                delays[i],
+                i - 1,
+                delays[i - 1]
             );
         }
     }
@@ -170,7 +175,10 @@ mod tests {
         let tracker = OrderLifecycleTracker::new(100);
 
         tracker.create_order(make_order_params(2, true));
-        tracker.update_order(2, make_event(OrderState::Cancelled, 0.0, 0.01, Some("user_cancel")));
+        tracker.update_order(
+            2,
+            make_event(OrderState::Cancelled, 0.0, 0.01, Some("user_cancel")),
+        );
 
         let completed = tracker.completed_orders(1);
         assert_eq!(completed.len(), 1);
@@ -183,8 +191,19 @@ mod tests {
         let tracker = OrderLifecycleTracker::new(100);
 
         tracker.create_order(make_order_params(3, false));
-        tracker.update_order(3, make_event(OrderState::PartiallyFilled, 0.004, 0.006, None));
-        tracker.update_order(3, make_event(OrderState::Cancelled, 0.004, 0.006, Some("remainder_cancel")));
+        tracker.update_order(
+            3,
+            make_event(OrderState::PartiallyFilled, 0.004, 0.006, None),
+        );
+        tracker.update_order(
+            3,
+            make_event(
+                OrderState::Cancelled,
+                0.004,
+                0.006,
+                Some("remainder_cancel"),
+            ),
+        );
 
         let completed = tracker.completed_orders(1);
         assert_eq!(completed.len(), 1);
@@ -196,7 +215,10 @@ mod tests {
         let tracker = OrderLifecycleTracker::new(100);
 
         tracker.create_order(make_order_params(4, true));
-        tracker.update_order(4, make_event(OrderState::Rejected, 0.0, 0.01, Some("PerpMaxPosition")));
+        tracker.update_order(
+            4,
+            make_event(OrderState::Rejected, 0.0, 0.01, Some("PerpMaxPosition")),
+        );
 
         let completed = tracker.completed_orders(1);
         assert_eq!(completed.len(), 1);
@@ -232,7 +254,10 @@ mod tests {
         // 2 partial fills + cancel
         for i in 3..5u64 {
             tracker.create_order(make_order_params(i, false));
-            tracker.update_order(i, make_event(OrderState::PartiallyFilled, 0.005, 0.005, None));
+            tracker.update_order(
+                i,
+                make_event(OrderState::PartiallyFilled, 0.005, 0.005, None),
+            );
             tracker.update_order(i, make_event(OrderState::Cancelled, 0.005, 0.005, None));
         }
         // 1 pure cancel
@@ -369,9 +394,13 @@ mod tests {
         };
         let mut reentry = ReentryManager::new(config);
 
-        reentry.on_kill(KillReason::Manual { reason: "test".into() });
+        reentry.on_kill(KillReason::Manual {
+            reason: "test".into(),
+        });
         reentry.force_normal();
-        reentry.on_kill(KillReason::Manual { reason: "test2".into() });
+        reentry.on_kill(KillReason::Manual {
+            reason: "test2".into(),
+        });
         assert_eq!(reentry.phase(), ReentryPhase::ManualReviewRequired);
 
         reentry.reset_daily();
@@ -392,7 +421,10 @@ mod tests {
         let reason = ks.check(&state);
         assert!(reason.is_some());
         match reason.unwrap() {
-            KillReason::MaxLoss { loss: 60.0, limit: 50.0 } => {}
+            KillReason::MaxLoss {
+                loss: 60.0,
+                limit: 50.0,
+            } => {}
             other => panic!("Expected MaxLoss 60>50, got {:?}", other),
         }
     }

@@ -205,7 +205,7 @@ impl HybridEVEstimator {
 
             return HybridEVResult {
                 expected_edge_bps: theo.expected_edge_bps * 0.5, // Conservative
-                should_quote: false, // Don't quote during warmup
+                should_quote: false,                             // Don't quote during warmup
                 alpha: 0.0,
                 ir_edge_bps: 0.0,
                 theoretical_edge_bps: theo.expected_edge_bps,
@@ -282,7 +282,13 @@ impl HybridEVEstimator {
     }
 
     /// Compute blending alpha based on data quality.
-    fn compute_alpha(&self, filled_bins: usize, total_samples: usize, accuracy: f64, ir: f64) -> f64 {
+    fn compute_alpha(
+        &self,
+        filled_bins: usize,
+        total_samples: usize,
+        accuracy: f64,
+        ir: f64,
+    ) -> f64 {
         // Base alpha from bin count
         // At min_bins we start with a base alpha (0.1), then scale up to 1.0 at full_bins
         let bin_alpha = if filled_bins < self.config.min_bins_for_ir {
@@ -483,8 +489,16 @@ mod tests {
 
         // With 4 bins and good discrimination, alpha should be moderate
         // bins_for_full_ir defaults to 5, so 4 bins gives ~0.8 of full alpha
-        assert!(result.alpha > 0.1, "Expected alpha > 0.1, got {}", result.alpha);
-        assert!(result.current_ir > 0.0, "Expected positive IR, got {}", result.current_ir);
+        assert!(
+            result.alpha > 0.1,
+            "Expected alpha > 0.1, got {}",
+            result.alpha
+        );
+        assert!(
+            result.current_ir > 0.0,
+            "Expected positive IR, got {}",
+            result.current_ir
+        );
     }
 
     #[test]
@@ -498,7 +512,7 @@ mod tests {
 
         // Add predictions that are accurate but don't spread across bins
         for _ in 0..50 {
-            estimator.record_outcome(0.6, true);  // Correct
+            estimator.record_outcome(0.6, true); // Correct
             estimator.record_outcome(0.4, false); // Correct
         }
 

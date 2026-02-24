@@ -45,7 +45,6 @@ pub enum Action {
     // through gamma scaling (kappa_ci_width flows through uncertainty_scalar).
     // The GLFT formula naturally widens spreads when gamma increases due to uncertainty.
     // This eliminates arbitrary spread_multiplier and size_fraction values.
-
     /// Wait to learn more before acting.
     WaitToLearn {
         /// Expected information gain from waiting

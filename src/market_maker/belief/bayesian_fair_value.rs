@@ -245,9 +245,10 @@ impl BayesianFairValue {
     /// Restore learned parameters from checkpoint.
     pub fn restore_from_checkpoint(&mut self, ckpt: &BayesianFairValueCheckpoint) {
         if ckpt.n_fills > 0 {
-            self.alpha_book = ckpt
-                .alpha_book
-                .clamp(self.config.alpha_book_bounds.0, self.config.alpha_book_bounds.1);
+            self.alpha_book = ckpt.alpha_book.clamp(
+                self.config.alpha_book_bounds.0,
+                self.config.alpha_book_bounds.1,
+            );
             for i in 0..3 {
                 self.beta_flow[i] = ckpt.beta_flow[i].clamp(
                     self.config.beta_flow_bounds.0,
@@ -371,8 +372,7 @@ impl BayesianFairValue {
 
         // VPIN-modulated noise: high toxicity → fills more informative → lower noise
         let vpin_clamped = vpin.clamp(0.0, 1.0);
-        let sigma_noise =
-            self.sigma_noise_bps * (1.0 - self.config.gamma_vpin * vpin_clamped);
+        let sigma_noise = self.sigma_noise_bps * (1.0 - self.config.gamma_vpin * vpin_clamped);
         let r = sigma_noise * sigma_noise;
 
         // Kalman update
@@ -587,17 +587,18 @@ impl BayesianFairValue {
 
         // Update alpha_book: gradient of prediction error w.r.t. alpha
         // Simplified: alpha moves toward value that minimizes (realized - alpha × imbalance)²
-        let alpha_gradient =
-            realized_return_bps * book_imbalance - self.alpha_book * book_imbalance * book_imbalance;
+        let alpha_gradient = realized_return_bps * book_imbalance
+            - self.alpha_book * book_imbalance * book_imbalance;
         self.alpha_book += lr * alpha_gradient;
 
         // Decay toward prior
         self.alpha_book += decay * (self.config.alpha_book_prior - self.alpha_book);
 
         // Hard bounds
-        self.alpha_book = self
-            .alpha_book
-            .clamp(self.config.alpha_book_bounds.0, self.config.alpha_book_bounds.1);
+        self.alpha_book = self.alpha_book.clamp(
+            self.config.alpha_book_bounds.0,
+            self.config.alpha_book_bounds.1,
+        );
 
         // Update sigma_noise: move toward realized prediction error magnitude
         let prediction_error = realized_return_bps.abs();
@@ -610,22 +611,18 @@ impl BayesianFairValue {
     }
 
     /// Update flow sensitivity learned params from realized return.
-    pub fn update_learned_flow_params(
-        &mut self,
-        realized_return_bps: f64,
-        flows: [f64; 3],
-    ) {
+    pub fn update_learned_flow_params(&mut self, realized_return_bps: f64, flows: [f64; 3]) {
         let lr = self.config.learning_rate;
         let decay = self.config.learned_decay_to_prior_rate;
 
         for (i, &flow_val) in flows.iter().enumerate() {
-            let gradient = realized_return_bps * flow_val
-                - self.beta_flow[i] * flow_val * flow_val;
+            let gradient = realized_return_bps * flow_val - self.beta_flow[i] * flow_val * flow_val;
             self.beta_flow[i] += lr * gradient;
             self.beta_flow[i] += decay * (self.config.beta_flow_prior[i] - self.beta_flow[i]);
-            self.beta_flow[i] = self
-                .beta_flow[i]
-                .clamp(self.config.beta_flow_bounds.0, self.config.beta_flow_bounds.1);
+            self.beta_flow[i] = self.beta_flow[i].clamp(
+                self.config.beta_flow_bounds.0,
+                self.config.beta_flow_bounds.1,
+            );
         }
     }
 }
@@ -704,7 +701,12 @@ mod tests {
 
         // After 155s of process noise, variance caps at 100
         model.predict(100.0, 155.0, 155_000);
-        assert_approx(model.sigma_sq_bps, 100.0, TOLERANCE, "variance capped at 100");
+        assert_approx(
+            model.sigma_sq_bps,
+            100.0,
+            TOLERANCE,
+            "variance capped at 100",
+        );
 
         // First fill: K = 100 / (100 + 9) = 0.917
         let fill_price = 100.0 * (1.0 + 3.0 / 10_000.0);
@@ -715,7 +717,12 @@ mod tests {
         assert_approx(model.mu_offset_bps, expected_mu, 0.05, "first fill mu");
 
         let expected_sigma_sq = 100.0 * (1.0 - expected_k);
-        assert_approx(model.sigma_sq_bps, expected_sigma_sq, 0.1, "first fill sigma_sq");
+        assert_approx(
+            model.sigma_sq_bps,
+            expected_sigma_sq,
+            0.1,
+            "first fill sigma_sq",
+        );
     }
 
     #[test]
@@ -936,7 +943,12 @@ mod tests {
         model.predict(100.0, 155.0, 155_000);
 
         // Variance should cap at 100
-        assert_approx(model.sigma_sq_bps, 100.0, TOLERANCE, "pre-fill variance capped");
+        assert_approx(
+            model.sigma_sq_bps,
+            100.0,
+            TOLERANCE,
+            "pre-fill variance capped",
+        );
 
         // Fill 1: ask fill at 3 bps from mid, VPIN ≈ 0
         let fill_price = 100.0 * (1.0 + 3.0 / 10_000.0);
@@ -1025,7 +1037,12 @@ mod tests {
 
         assert!(!beliefs.is_warmed_up);
         assert!(!beliefs.is_cascade);
-        assert_approx(beliefs.offset_from_mid_bps, 0.0, TOLERANCE, "default offset");
+        assert_approx(
+            beliefs.offset_from_mid_bps,
+            0.0,
+            TOLERANCE,
+            "default offset",
+        );
         assert_approx(beliefs.confidence, 0.0, TOLERANCE, "default confidence");
     }
 
@@ -1081,7 +1098,12 @@ mod tests {
 
         model.predict(100.0, 0.0, 1000);
         assert_approx(model.mu_offset_bps, 3.0, 1e-10, "zero dt no mu change");
-        assert_approx(model.sigma_sq_bps, sigma_before, 1e-10, "zero dt no sigma change");
+        assert_approx(
+            model.sigma_sq_bps,
+            sigma_before,
+            1e-10,
+            "zero dt no sigma change",
+        );
     }
 
     #[test]

@@ -51,17 +51,19 @@ mod reentry;
 mod state;
 
 pub use aggregator::{AggregatedRisk, RiskAggregator};
-pub use inventory_governor::{
-    InventoryGovernor, PositionAssessment, PositionBudget, PositionLimits, PositionZone,
-};
 pub use circuit_breaker::{
     CircuitBreakerAction, CircuitBreakerConfig, CircuitBreakerMonitor, CircuitBreakerType,
 };
 pub use drawdown::{DrawdownConfig, DrawdownLevel, DrawdownSummary, DrawdownTracker};
+pub use inventory_governor::{
+    InventoryGovernor, PositionAssessment, PositionBudget, PositionLimits, PositionZone,
+};
 pub use kill_switch::*;
 pub use limits::{RiskCheckResult, RiskChecker, RiskLimits};
 pub use monitor::{RiskAction, RiskAssessment, RiskMonitor, RiskMonitorBox, RiskSeverity};
-pub use position_guard::{OrderEntryCheck, PositionGuard, PositionGuardConfig, PositionGuardSummary};
+pub use position_guard::{
+    OrderEntryCheck, PositionGuard, PositionGuardConfig, PositionGuardSummary,
+};
 // Note: Side enum is NOT re-exported to avoid conflict with tracking::Side
 // Use position_guard::Side explicitly if needed
 pub use reentry::{ReentryConfig, ReentryManager, ReentryPhase, ReentrySummary};
@@ -148,8 +150,9 @@ impl EmergencyDecision {
 
         // Circuit breaker: widen spreads (additive max)
         if circuit_breaker_active {
-            decision.spread_addon_bps =
-                decision.spread_addon_bps.max(circuit_breaker_spread_addon_bps);
+            decision.spread_addon_bps = decision
+                .spread_addon_bps
+                .max(circuit_breaker_spread_addon_bps);
             reasons.push("circuit_breaker");
         }
 
@@ -198,8 +201,14 @@ mod emergency_tests {
 
     /// Helper: construct EmergencyInput from positional args for test convenience.
     fn eval(
-        kill: bool, governor: bool, cb: bool, cb_bps: f64,
-        cascade: bool, cascade_bps: f64, overlay_bps: f64, pos: f64,
+        kill: bool,
+        governor: bool,
+        cb: bool,
+        cb_bps: f64,
+        cascade: bool,
+        cascade_bps: f64,
+        overlay_bps: f64,
+        pos: f64,
     ) -> EmergencyDecision {
         EmergencyDecision::evaluate(&EmergencyInput {
             kill_switch_triggered: kill,
@@ -218,14 +227,14 @@ mod emergency_tests {
     #[test]
     fn test_kill_switch_overrides_everything() {
         let d = eval(
-            true,  // kill switch triggered
-            true,  // governor also says reduce-only
-            true,  // circuit breaker also active
-            50.0,  // circuit breaker addon
-            true,  // cascade active
-            30.0,  // cascade addon
-            20.0,  // risk overlay addon
-            1.5,   // long position
+            true, // kill switch triggered
+            true, // governor also says reduce-only
+            true, // circuit breaker also active
+            50.0, // circuit breaker addon
+            true, // cascade active
+            30.0, // cascade addon
+            20.0, // risk overlay addon
+            1.5,  // long position
         );
 
         assert!(!d.allowed_bid, "kill switch must block bids");
@@ -239,9 +248,7 @@ mod emergency_tests {
     #[test]
     fn test_kill_switch_blocks_even_reducing_side() {
         // Kill switch is the ONLY mechanism that blocks the reducing side
-        let d = eval(
-            true, false, false, 0.0, false, 0.0, 0.0, 5.0,
-        );
+        let d = eval(true, false, false, 0.0, false, 0.0, 0.0, 5.0);
         assert!(!d.allowed_ask, "kill switch blocks even reducing asks");
         assert!(!d.allowed_bid);
     }
@@ -250,9 +257,7 @@ mod emergency_tests {
 
     #[test]
     fn test_governor_reduce_only_long_preserves_asks() {
-        let d = eval(
-            false, true, false, 0.0, false, 0.0, 0.0, 2.0,
-        );
+        let d = eval(false, true, false, 0.0, false, 0.0, 0.0, 2.0);
 
         assert!(d.reduce_only);
         assert!(!d.allowed_bid, "long + reduce-only → no bids");
@@ -262,9 +267,7 @@ mod emergency_tests {
 
     #[test]
     fn test_governor_reduce_only_short_preserves_bids() {
-        let d = eval(
-            false, true, false, 0.0, false, 0.0, 0.0, -3.0,
-        );
+        let d = eval(false, true, false, 0.0, false, 0.0, 0.0, -3.0);
 
         assert!(d.reduce_only);
         assert!(d.allowed_bid, "short + reduce-only → bids MUST be allowed");
@@ -273,9 +276,7 @@ mod emergency_tests {
 
     #[test]
     fn test_governor_reduce_only_flat_allows_both() {
-        let d = eval(
-            false, true, false, 0.0, false, 0.0, 0.0, 0.0,
-        );
+        let d = eval(false, true, false, 0.0, false, 0.0, 0.0, 0.0);
 
         assert!(d.reduce_only);
         assert!(d.allowed_bid, "flat + reduce-only → bids allowed");
@@ -290,19 +291,18 @@ mod emergency_tests {
         // but fill cascade would clear the closing side → stuck
         // Fix: reduce-only reducing side is NEVER blocked
         let d = eval(
-            false,
-            true,   // governor: reduce-only
-            false,
-            0.0,
-            true,   // cascade active
-            15.0,   // cascade widens
-            0.0,
-            3.0,    // long position
+            false, true, // governor: reduce-only
+            false, 0.0, true, // cascade active
+            15.0, // cascade widens
+            0.0, 3.0, // long position
         );
 
         assert!(d.reduce_only);
         assert!(!d.allowed_bid, "long → bids blocked");
-        assert!(d.allowed_ask, "CRITICAL: asks (reducing side) must survive cascade");
+        assert!(
+            d.allowed_ask,
+            "CRITICAL: asks (reducing side) must survive cascade"
+        );
         assert_eq!(d.spread_addon_bps, 15.0);
         assert!(d.reason.contains("governor_reduce_only"));
         assert!(d.reason.contains("fill_cascade"));
@@ -310,12 +310,13 @@ mod emergency_tests {
 
     #[test]
     fn test_cascade_plus_reduce_only_no_paralysis_short() {
-        let d = eval(
-            false, true, false, 0.0, true, 10.0, 0.0, -2.0,
-        );
+        let d = eval(false, true, false, 0.0, true, 10.0, 0.0, -2.0);
 
         assert!(d.reduce_only);
-        assert!(d.allowed_bid, "CRITICAL: bids (reducing side) must survive cascade");
+        assert!(
+            d.allowed_bid,
+            "CRITICAL: bids (reducing side) must survive cascade"
+        );
         assert!(!d.allowed_ask, "short → asks blocked");
         assert_eq!(d.spread_addon_bps, 10.0);
     }
@@ -325,13 +326,11 @@ mod emergency_tests {
     #[test]
     fn test_spread_addon_takes_max_not_product() {
         let d = eval(
-            false,
-            false,
-            true,  // circuit breaker
-            20.0,  // circuit breaker addon
-            true,  // cascade
-            30.0,  // cascade addon
-            15.0,  // risk overlay addon
+            false, false, true, // circuit breaker
+            20.0, // circuit breaker addon
+            true, // cascade
+            30.0, // cascade addon
+            15.0, // risk overlay addon
             0.0,
         );
 
@@ -344,9 +343,7 @@ mod emergency_tests {
 
     #[test]
     fn test_circuit_breaker_only_widens_no_side_restriction() {
-        let d = eval(
-            false, false, true, 25.0, false, 0.0, 0.0, 1.0,
-        );
+        let d = eval(false, false, true, 25.0, false, 0.0, 0.0, 1.0);
 
         assert!(!d.reduce_only);
         assert!(d.allowed_bid);
@@ -357,9 +354,7 @@ mod emergency_tests {
 
     #[test]
     fn test_risk_overlay_only_widens() {
-        let d = eval(
-            false, false, false, 0.0, false, 0.0, 12.5, 0.0,
-        );
+        let d = eval(false, false, false, 0.0, false, 0.0, 12.5, 0.0);
 
         assert_eq!(d.spread_addon_bps, 12.5);
         assert_eq!(d.reason, "risk_overlay");
@@ -369,9 +364,7 @@ mod emergency_tests {
 
     #[test]
     fn test_zero_risk_overlay_not_reported() {
-        let d = eval(
-            false, false, false, 0.0, false, 0.0, 0.0, 0.0,
-        );
+        let d = eval(false, false, false, 0.0, false, 0.0, 0.0, 0.0);
 
         assert_eq!(d.reason, "normal");
         assert_eq!(d.spread_addon_bps, 0.0);
@@ -381,9 +374,7 @@ mod emergency_tests {
 
     #[test]
     fn test_default_normal_operation() {
-        let d = eval(
-            false, false, false, 0.0, false, 0.0, 0.0, 0.5,
-        );
+        let d = eval(false, false, false, 0.0, false, 0.0, 0.0, 0.5);
 
         assert!(!d.reduce_only);
         assert!(d.allowed_bid);
@@ -407,14 +398,11 @@ mod emergency_tests {
     #[test]
     fn test_all_mechanisms_except_kill() {
         let d = eval(
-            false,
-            true,   // governor reduce-only
-            true,   // circuit breaker
-            20.0,
-            true,   // cascade
-            35.0,
-            10.0,   // overlay
-            -1.0,   // short
+            false, true, // governor reduce-only
+            true, // circuit breaker
+            20.0, true, // cascade
+            35.0, 10.0, // overlay
+            -1.0, // short
         );
 
         assert!(d.reduce_only);
@@ -430,9 +418,7 @@ mod emergency_tests {
     #[test]
     fn test_cascade_without_governor_no_side_restriction() {
         // Fill cascade alone should NOT restrict sides — only widen
-        let d = eval(
-            false, false, false, 0.0, true, 20.0, 0.0, 5.0,
-        );
+        let d = eval(false, false, false, 0.0, true, 20.0, 0.0, 5.0);
 
         assert!(!d.reduce_only);
         assert!(d.allowed_bid, "cascade alone doesn't block sides");
@@ -442,9 +428,7 @@ mod emergency_tests {
 
     #[test]
     fn test_governor_with_circuit_breaker_spreads_compound() {
-        let d = eval(
-            false, true, true, 40.0, false, 0.0, 0.0, 2.0,
-        );
+        let d = eval(false, true, true, 40.0, false, 0.0, 0.0, 2.0);
 
         assert!(d.reduce_only);
         assert!(!d.allowed_bid, "long → bids blocked");

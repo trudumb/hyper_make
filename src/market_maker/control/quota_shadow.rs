@@ -142,8 +142,8 @@ impl QuotaShadowPricer {
             return max_levels;
         }
 
-        let min_headroom = min_headroom_override
-            .unwrap_or(self.config.min_headroom_for_full_ladder);
+        let min_headroom =
+            min_headroom_override.unwrap_or(self.config.min_headroom_for_full_ladder);
         if headroom_pct >= min_headroom {
             return max_levels;
         }
@@ -168,11 +168,11 @@ impl QuotaShadowPricer {
     pub fn compute_request_shadow_price(headroom_pct: f64, vol_regime: u8) -> f64 {
         // Regime adjustment: high-vol -> fills -> faster recharge -> lower shadow
         let regime_mult = match vol_regime {
-            0 => 1.2,  // Low volatility: conservative (fills rare)
-            1 => 1.0,  // Normal: baseline
-            2 => 0.7,  // High: can afford more requests
-            3 => 0.5,  // Extreme: fills plentiful
-            _ => 1.0,  // Fallback
+            0 => 1.2, // Low volatility: conservative (fills rare)
+            1 => 1.0, // Normal: baseline
+            2 => 0.7, // High: can afford more requests
+            3 => 0.5, // Extreme: fills plentiful
+            _ => 1.0, // Fallback
         };
 
         // When headroom is high (>50%), shadow price ~ 0
@@ -227,10 +227,7 @@ impl QuotaShadowPricer {
         rate_limit_headroom_pct: f64,
         vol_regime: u8,
     ) -> bool {
-        let shadow_price = Self::compute_request_shadow_price(
-            rate_limit_headroom_pct,
-            vol_regime,
-        );
+        let shadow_price = Self::compute_request_shadow_price(rate_limit_headroom_pct, vol_regime);
         expected_edge_bps > shadow_price
     }
 }
@@ -413,7 +410,11 @@ mod tests {
         let pricer = default_pricer();
         // Even at extremely low headroom, should always get at least 1 level
         let levels = pricer.continuous_ladder_levels(10, 0.001, true, None);
-        assert_eq!(levels, 1, "Should always get at least 1 level, got {}", levels);
+        assert_eq!(
+            levels, 1,
+            "Should always get at least 1 level, got {}",
+            levels
+        );
     }
 
     #[test]
@@ -457,7 +458,10 @@ mod tests {
         let pricer = default_pricer();
         // With min_headroom override of 0.05 (Micro policy), full levels at 5%+ headroom
         let levels = pricer.continuous_ladder_levels(10, 0.05, true, Some(0.05));
-        assert_eq!(levels, 10, "At overridden min_headroom should get all levels");
+        assert_eq!(
+            levels, 10,
+            "At overridden min_headroom should get all levels"
+        );
 
         // Below override threshold, sqrt scaling kicks in
         let levels = pricer.continuous_ladder_levels(10, 0.01, true, Some(0.05));

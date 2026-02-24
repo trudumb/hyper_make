@@ -215,7 +215,13 @@ impl EventAccumulator {
     }
 
     /// Record a fill event.
-    pub(crate) fn on_fill(&mut self, side: Side, oid: u64, size: f64, is_full_fill: bool) -> QuoteUpdateTrigger {
+    pub(crate) fn on_fill(
+        &mut self,
+        side: Side,
+        oid: u64,
+        size: f64,
+        is_full_fill: bool,
+    ) -> QuoteUpdateTrigger {
         let event = QuoteUpdateEvent::FillReceived {
             side,
             oid,
@@ -245,7 +251,9 @@ impl EventAccumulator {
             return None;
         }
 
-        if fill_prob < self.config.queue_depletion_p_fill && prev_fill_prob >= self.config.queue_depletion_p_fill {
+        if fill_prob < self.config.queue_depletion_p_fill
+            && prev_fill_prob >= self.config.queue_depletion_p_fill
+        {
             let event = QuoteUpdateEvent::QueueDepletion {
                 oid,
                 fill_prob,
@@ -260,7 +268,11 @@ impl EventAccumulator {
     }
 
     /// Record a signal change event.
-    pub(crate) fn on_signal_change(&mut self, signal_name: &str, magnitude: f64) -> Option<QuoteUpdateTrigger> {
+    pub(crate) fn on_signal_change(
+        &mut self,
+        signal_name: &str,
+        magnitude: f64,
+    ) -> Option<QuoteUpdateTrigger> {
         if !self.config.enabled {
             return None;
         }
@@ -291,7 +303,9 @@ impl EventAccumulator {
         let ratio = sigma / self.last_sigma;
         self.last_sigma = sigma;
 
-        if ratio >= self.config.volatility_spike_ratio || ratio <= (1.0 / self.config.volatility_spike_ratio) {
+        if ratio >= self.config.volatility_spike_ratio
+            || ratio <= (1.0 / self.config.volatility_spike_ratio)
+        {
             let event = QuoteUpdateEvent::VolatilitySpike {
                 sigma,
                 prev_sigma: self.last_sigma,
@@ -310,11 +324,16 @@ impl EventAccumulator {
         }
 
         let elapsed = self.last_reconcile.elapsed();
-        let fallback = self.dynamic_fallback.unwrap_or(self.config.fallback_interval);
+        let fallback = self
+            .dynamic_fallback
+            .unwrap_or(self.config.fallback_interval);
         if elapsed >= fallback {
             // Unconditionally trigger after fallback interval to guarantee minimum quote frequency.
             // Even without accumulated events, we must ensure quotes exist on the book.
-            let scope = if self.affected.bids_affected || self.affected.asks_affected || !self.events.is_empty() {
+            let scope = if self.affected.bids_affected
+                || self.affected.asks_affected
+                || !self.events.is_empty()
+            {
                 self.affected.to_scope()
             } else {
                 ReconcileScope::Full
@@ -327,7 +346,11 @@ impl EventAccumulator {
     }
 
     /// Record an event and return the trigger.
-    fn record_event(&mut self, event: QuoteUpdateEvent, scope: ReconcileScope) -> QuoteUpdateTrigger {
+    fn record_event(
+        &mut self,
+        event: QuoteUpdateEvent,
+        scope: ReconcileScope,
+    ) -> QuoteUpdateTrigger {
         self.total_events += 1;
 
         let trigger = QuoteUpdateTrigger::new(event, scope);
@@ -361,7 +384,9 @@ impl EventAccumulator {
         // High priority events trigger immediately
         if self.affected.max_priority >= 80 {
             return Some(QuoteUpdateTrigger::new(
-                QuoteUpdateEvent::FallbackTimer { elapsed: Duration::ZERO },
+                QuoteUpdateEvent::FallbackTimer {
+                    elapsed: Duration::ZERO,
+                },
                 self.affected.to_scope(),
             ));
         }
@@ -388,7 +413,9 @@ impl EventAccumulator {
         // Fill events trigger side update
         if self.affected.had_fill {
             return Some(QuoteUpdateTrigger::new(
-                QuoteUpdateEvent::FallbackTimer { elapsed: Duration::ZERO },
+                QuoteUpdateEvent::FallbackTimer {
+                    elapsed: Duration::ZERO,
+                },
                 self.affected.to_scope(),
             ));
         }
@@ -520,7 +547,7 @@ impl AdaptiveCycleTimer {
         Self::default()
     }
 
-    /// Compute whether we should trigger a new cycle right now based on accumulated 
+    /// Compute whether we should trigger a new cycle right now based on accumulated
     /// information and time elapsed.
     pub fn should_trigger(
         &self,
@@ -530,7 +557,7 @@ impl AdaptiveCycleTimer {
         headroom: f64,
     ) -> bool {
         let elapsed = self.last_cycle_time.elapsed();
-        
+
         // 1. Time-bounds override
         if elapsed < self.min_interval {
             return false;
@@ -538,33 +565,32 @@ impl AdaptiveCycleTimer {
         if elapsed >= self.max_interval {
             return true;
         }
-        
+
         // 2. Headroom penalty: if API budget is running low, require MORE information to trigger
         let headroom_penalty = (0.5 / headroom.max(0.01)).clamp(0.5, 5.0);
-        
+
         // 3. Information threshold
         // The base threshold is the expected price move to hit the latch.
         let target_info = latch_bps * headroom_penalty;
-        
+
         // 4. Realized information gain
         // Sum of different information channels, converted into a "bps equivalent" metric
-        let realized_info = 
-            changes.mid_move_bps.abs() + 
+        let realized_info = changes.mid_move_bps.abs() +
             (changes.trades_observed as f64 * 0.1) + // 10 trades ~ 1 bps of information
-            changes.signal_divergence_bps.abs();     // Signal changes factor into bps equivalent
+            changes.signal_divergence_bps.abs(); // Signal changes factor into bps equivalent
 
-        // 5. Time decay: as time passes, we lower the information threshold 
+        // 5. Time decay: as time passes, we lower the information threshold
         // to eventually trigger even in quiet markets (converges to compute_next_cycle_time logic).
         let sigma_bps = (sigma * 10_000.0).max(0.0001);
-        
+
         // Expected time to hit latch under Brownian motion
         let t_stale_expected = (latch_bps / sigma_bps).powi(2).clamp(1.0, 30.0);
-        
+
         let time_progress = (elapsed.as_secs_f64() / t_stale_expected).clamp(0.0, 1.0);
-        
+
         // As time_progress -> 1.0, required_info -> 0.0
         let required_info = target_info * (1.0 - time_progress);
-        
+
         realized_info >= required_info
     }
 
@@ -604,7 +630,10 @@ mod tests {
 
         // Large move should trigger
         let trigger = acc.on_mid_update(100.6).unwrap();
-        assert!(matches!(trigger.event, QuoteUpdateEvent::MidPriceMove { .. }));
+        assert!(matches!(
+            trigger.event,
+            QuoteUpdateEvent::MidPriceMove { .. }
+        ));
     }
 
     #[test]
@@ -612,7 +641,10 @@ mod tests {
         let mut acc = EventAccumulator::default_config();
 
         let trigger = acc.on_fill(Side::Buy, 123, 1.0, true);
-        assert!(matches!(trigger.event, QuoteUpdateEvent::FillReceived { .. }));
+        assert!(matches!(
+            trigger.event,
+            QuoteUpdateEvent::FillReceived { .. }
+        ));
         assert!(acc.affected.had_fill);
     }
 

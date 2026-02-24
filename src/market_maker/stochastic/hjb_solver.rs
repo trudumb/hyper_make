@@ -197,8 +197,10 @@ impl HJBSolver {
         let half_spread_bps = half_spread_raw * 10000.0; // Convert to bps
 
         // Add fee and apply bounds
-        let half_spread = (half_spread_bps + self.config.maker_fee_bps)
-            .clamp(self.config.min_half_spread_bps, self.config.max_half_spread_bps);
+        let half_spread = (half_spread_bps + self.config.maker_fee_bps).clamp(
+            self.config.min_half_spread_bps,
+            self.config.max_half_spread_bps,
+        );
 
         // === Optimal Skew (Inventory + Predictive) ===
         // Inventory skew: γ × σ² × q × T / 2

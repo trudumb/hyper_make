@@ -425,10 +425,7 @@ mod tests {
             spread.is_finite(),
             "spread should be finite for large gamma, got {spread}"
         );
-        assert!(
-            spread > 0.0,
-            "spread should be positive for large gamma"
-        );
+        assert!(spread > 0.0, "spread should be positive for large gamma");
     }
 
     #[test]

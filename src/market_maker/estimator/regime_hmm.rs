@@ -59,7 +59,6 @@ pub struct Observation {
     pub flow_imbalance: f64,
 
     // === LEADING INDICATORS ===
-
     /// Open Interest level relative to recent average (ratio, 1.0 = average)
     /// Low OI can signal reduced liquidity/increased fragility
     pub oi_level: f64,
@@ -79,8 +78,8 @@ impl Default for Observation {
             volatility: 0.00025,
             spread_bps: 5.0,
             flow_imbalance: 0.0,
-            oi_level: 1.0,       // Average
-            oi_velocity: 0.0,    // No change
+            oi_level: 1.0,             // Average
+            oi_velocity: 0.0,          // No change
             liquidation_pressure: 0.0, // No pressure
         }
     }
@@ -140,7 +139,6 @@ pub struct EmissionParams {
     pub std_spread: f64,
 
     // === Leading indicator parameters ===
-
     /// Expected OI level for this regime (1.0 = average)
     /// Lower OI suggests cascade regime
     pub mean_oi_level: f64,
@@ -264,7 +262,8 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: 0.0,
             std_oi_velocity: 0.02,
             liquidation_weight: 0.0,
-        }.validated(),
+        }
+        .validated(),
         // Normal regime: standard conditions
         EmissionParams {
             mean_volatility: 0.0025,
@@ -276,7 +275,8 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: 0.0,
             std_oi_velocity: 0.03,
             liquidation_weight: 0.0,
-        }.validated(),
+        }
+        .validated(),
         // High regime: elevated vol, OI starting to drop
         EmissionParams {
             mean_volatility: 0.01,
@@ -288,7 +288,8 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: -0.02,
             std_oi_velocity: 0.05,
             liquidation_weight: 0.2,
-        }.validated(),
+        }
+        .validated(),
         // Extreme/Cascade regime: crisis conditions, OI dropping fast
         EmissionParams {
             mean_volatility: 0.05,
@@ -300,7 +301,8 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: -0.1,
             std_oi_velocity: 0.08,
             liquidation_weight: 0.8,
-        }.validated(),
+        }
+        .validated(),
     ]
 }
 
@@ -484,30 +486,13 @@ impl RegimeHMM {
         let bv = baseline_vol.max(1e-6);
         let bs = baseline_spread_bps.max(0.5);
 
-        self.emission_params[regime_idx::LOW] = EmissionParams::new(
-            bv * 0.3,
-            bv * 0.15,
-            bs * 0.6,
-            bs * 0.3,
-        );
-        self.emission_params[regime_idx::NORMAL] = EmissionParams::new(
-            bv,
-            bv * 0.4,
-            bs,
-            bs * 0.4,
-        );
-        self.emission_params[regime_idx::HIGH] = EmissionParams::new(
-            bv * 3.0,
-            bv * 1.5,
-            bs * 2.0,
-            bs * 1.0,
-        );
-        self.emission_params[regime_idx::EXTREME] = EmissionParams::new(
-            bv * 10.0,
-            bv * 5.0,
-            bs * 5.0,
-            bs * 3.0,
-        );
+        self.emission_params[regime_idx::LOW] =
+            EmissionParams::new(bv * 0.3, bv * 0.15, bs * 0.6, bs * 0.3);
+        self.emission_params[regime_idx::NORMAL] = EmissionParams::new(bv, bv * 0.4, bs, bs * 0.4);
+        self.emission_params[regime_idx::HIGH] =
+            EmissionParams::new(bv * 3.0, bv * 1.5, bs * 2.0, bs * 1.0);
+        self.emission_params[regime_idx::EXTREME] =
+            EmissionParams::new(bv * 10.0, bv * 5.0, bs * 5.0, bs * 3.0);
 
         // Mark as pre-calibrated so auto-calibration doesn't override
         self.initial_calibration_done = true;
@@ -532,30 +517,14 @@ impl RegimeHMM {
 
         // Set emissions using the same multiplier pattern as with_baseline_volatility:
         // Low: 0.3x, Normal: 1.0x, High: 3.0x, Extreme: 10.0x
-        self.emission_params[regime_idx::LOW] = EmissionParams::new(
-            vol * 0.3,
-            vol * 0.15,
-            spread * 0.6,
-            spread * 0.3,
-        );
-        self.emission_params[regime_idx::NORMAL] = EmissionParams::new(
-            vol,
-            vol * 0.4,
-            spread,
-            spread * 0.4,
-        );
-        self.emission_params[regime_idx::HIGH] = EmissionParams::new(
-            vol * 3.0,
-            vol * 1.5,
-            spread * 2.0,
-            spread * 1.0,
-        );
-        self.emission_params[regime_idx::EXTREME] = EmissionParams::new(
-            vol * 10.0,
-            vol * 5.0,
-            spread * 5.0,
-            spread * 3.0,
-        );
+        self.emission_params[regime_idx::LOW] =
+            EmissionParams::new(vol * 0.3, vol * 0.15, spread * 0.6, spread * 0.3);
+        self.emission_params[regime_idx::NORMAL] =
+            EmissionParams::new(vol, vol * 0.4, spread, spread * 0.4);
+        self.emission_params[regime_idx::HIGH] =
+            EmissionParams::new(vol * 3.0, vol * 1.5, spread * 2.0, spread * 1.0);
+        self.emission_params[regime_idx::EXTREME] =
+            EmissionParams::new(vol * 10.0, vol * 5.0, spread * 5.0, spread * 3.0);
 
         // Enforce regime separation: HIGH vol >= 2x NORMAL vol
         let normal_vol_mean = self.emission_params[regime_idx::NORMAL].mean_volatility;
@@ -990,7 +959,6 @@ impl RegimeHMM {
         }
     }
 
-
     /// Normalize belief state to sum to 1.
     fn normalize_belief(&mut self) {
         let sum: f64 = self.belief.iter().sum();
@@ -1020,7 +988,10 @@ impl RegimeHMM {
     }
 
     /// Restore learning state from a checkpoint.
-    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::RegimeHMMCheckpoint) {
+    pub fn restore_checkpoint(
+        &mut self,
+        cp: &crate::market_maker::checkpoint::RegimeHMMCheckpoint,
+    ) {
         self.belief = cp.belief;
         self.transition_counts = cp.transition_counts;
         self.observation_count = cp.observation_count;

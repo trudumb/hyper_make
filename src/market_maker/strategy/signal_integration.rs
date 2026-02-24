@@ -51,8 +51,8 @@ use crate::market_maker::calibration::{InformedFlowAdjustment, ModelGating, Mode
 use crate::market_maker::estimator::{
     BinanceFlowAnalyzer, BinanceFlowConfig, BuyPressureTracker, CrossVenueAnalyzer,
     CrossVenueConfig, CrossVenueFeatures, FlowDecomposition, FlowFeatureVec, InformedFlowConfig,
-    InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig, LeadLagStabilityGate,
-    RegimeKappaConfig, RegimeKappaEstimator, TimestampRange, TradeFeatures, VolatilityRegime,
+    InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig, LeadLagStabilityGate, RegimeKappaConfig,
+    RegimeKappaEstimator, TimestampRange, TradeFeatures, VolatilityRegime,
 };
 use crate::market_maker::infra::{BinanceTradeUpdate, LeadLagSignal};
 use std::cell::Cell;
@@ -183,7 +183,6 @@ pub struct SignalIntegratorConfig {
     pub flow_urgency_max_bps: f64,
 
     // === Inventory + Signal Skew ===
-
     /// Enable inventory-based skew (always active when position != 0).
     /// Lean quotes away from inventory to encourage mean reversion.
     pub use_inventory_skew: bool,
@@ -340,7 +339,7 @@ pub struct SignalContributionRecord {
 /// Unified skew — single source of truth for quote skewing.
 /// Two components only: GLFT q-term (inventory) + alpha_skew (signals).
 ///
-/// The GLFT q-term is computed inside `glft.rs::inventory_skew_with_flow()` 
+/// The GLFT q-term is computed inside `glft.rs::inventory_skew_with_flow()`
 /// and is the theoretically correct inventory skew from the GLFT paper.
 /// Alpha skew comes from `IntegratedSignals.combined_skew_bps` which contains
 /// cross-venue, buy pressure, and signal skew (but NOT inventory skew — that's GLFT's job).
@@ -649,7 +648,7 @@ impl SignalIntegrator {
             // A-S reservation price defaults
             as_sigma: 0.0002, // 2 bps/sec default
             as_gamma: 1.0,
-            as_tau_s: 60.0,   // 1 minute default
+            as_tau_s: 60.0, // 1 minute default
         }
     }
 
@@ -677,8 +676,7 @@ impl SignalIntegrator {
 
         // Phase 5: CUSUM detection for preemptive skew
         if self.latest_hl_mid > 0.0 {
-            let divergence_bps =
-                (mid_price - self.latest_hl_mid) / self.latest_hl_mid * 10_000.0;
+            let divergence_bps = (mid_price - self.latest_hl_mid) / self.latest_hl_mid * 10_000.0;
             if let Some(detected_bps) = self.cusum_detector.observe(divergence_bps) {
                 // CUSUM detected a significant divergence — apply preemptive skew
                 self.cusum_divergence_bps = detected_bps;
@@ -928,13 +926,11 @@ impl SignalIntegrator {
 
             signals.skew_direction = self.last_lead_lag_signal.skew_direction;
             let raw_magnitude = self.last_lead_lag_signal.skew_magnitude_bps;
-            signals.lead_lag_skew_bps = raw_magnitude
-                .min(self.config.max_lead_lag_skew_bps)
-                * ll_weight;
+            signals.lead_lag_skew_bps =
+                raw_magnitude.min(self.config.max_lead_lag_skew_bps) * ll_weight;
             // Uncapped drift: bounded only by ±95% GLFT half-spread clamp in reservation mid
-            signals.drift_signal_bps = raw_magnitude
-                * ll_weight
-                * self.last_lead_lag_signal.skew_direction as f64;
+            signals.drift_signal_bps =
+                raw_magnitude * ll_weight * self.last_lead_lag_signal.skew_direction as f64;
             signals.lead_lag_actionable = ll_weight > 0.0;
             signals.binance_hl_diff_bps = self.last_lead_lag_signal.diff_bps;
         } else if self.config.use_lead_lag
@@ -944,9 +940,8 @@ impl SignalIntegrator {
             // Phase 5: Preemptive skew from CUSUM detection (30% confidence)
             // CUSUM detected divergence but MI hasn't confirmed yet.
             let preemptive_skew = self.cusum_divergence_bps * 0.3;
-            signals.lead_lag_skew_bps = preemptive_skew
-                .abs()
-                .min(self.config.max_lead_lag_skew_bps);
+            signals.lead_lag_skew_bps =
+                preemptive_skew.abs().min(self.config.max_lead_lag_skew_bps);
             // Uncapped drift from CUSUM (preemptive, lower confidence)
             signals.drift_signal_bps = preemptive_skew;
             signals.skew_direction = if preemptive_skew > 0.0 { 1 } else { -1 };
@@ -1088,8 +1083,13 @@ impl SignalIntegrator {
         let cross_venue_skew_bps = if signals.cross_venue_valid {
             // Per-signal gating: scale by average model weight
             let cv_gate = if self.config.use_per_signal_gating && self.config.use_model_gating {
-                let avg_w = (signals.lead_lag_gating_weight + signals.informed_flow_gating_weight) / 2.0;
-                if avg_w < self.config.signal_gating_floor { 0.0 } else { avg_w }
+                let avg_w =
+                    (signals.lead_lag_gating_weight + signals.informed_flow_gating_weight) / 2.0;
+                if avg_w < self.config.signal_gating_floor {
+                    0.0
+                } else {
+                    avg_w
+                }
             } else {
                 1.0
             };
@@ -1107,13 +1107,16 @@ impl SignalIntegrator {
         // Skew scales proportionally to max_lead_lag_skew_bps so it adapts to asset spread.
         // In a 2 bps spread asset (max_skew=3), 0.1 fraction → 0.3 bps/z, cap 0.9 bps.
         // In a 10 bps spread asset (max_skew=5), 0.1 fraction → 0.5 bps/z, cap 1.5 bps.
-        let buy_pressure_skew_bps = if self.config.use_buy_pressure && self.buy_pressure.is_warmed_up() {
+        let buy_pressure_skew_bps = if self.config.use_buy_pressure
+            && self.buy_pressure.is_warmed_up()
+        {
             let z = self.buy_pressure.z_score();
             signals.buy_pressure_z = z;
             let threshold = self.config.buy_pressure_z_threshold;
             if z.abs() > threshold {
                 let excess = z.abs() - threshold;
-                let bps_per_z = self.config.buy_pressure_skew_fraction * self.config.max_lead_lag_skew_bps;
+                let bps_per_z =
+                    self.config.buy_pressure_skew_fraction * self.config.max_lead_lag_skew_bps;
                 let cap = self.config.buy_pressure_max_fraction * self.config.max_lead_lag_skew_bps;
                 let raw = excess * bps_per_z;
                 raw.min(cap) * z.signum()
@@ -1131,8 +1134,8 @@ impl SignalIntegrator {
         // Fallback to direct linear skew (position_fraction × 5 bps) when A-S < 0.5 bps,
         // ensuring meaningful inventory control at all times.
         let inventory_skew_bps = if self.config.use_inventory_skew && self.max_position > 0.0 {
-            let as_shift_frac = -self.position * self.as_gamma
-                * self.as_sigma * self.as_sigma * self.as_tau_s;
+            let as_shift_frac =
+                -self.position * self.as_gamma * self.as_sigma * self.as_sigma * self.as_tau_s;
             let as_shift_bps = as_shift_frac * 10_000.0;
             // Linear fallback: position_fraction × 5 bps (old proven formula)
             let linear_fallback_bps = -(self.position / self.max_position) * 5.0;
@@ -1166,11 +1169,15 @@ impl SignalIntegrator {
 
         // Skew sources: base (cross-exchange) + cross-venue + buy pressure + inventory + signal
         // Inventory skew re-enabled as fast-acting Avellaneda-Stoikov nudge (capped at 4 bps).
-        let raw_skew = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps
-            + inventory_skew_bps + signal_skew_bps;
+        let raw_skew = base_skew_bps
+            + cross_venue_skew_bps
+            + buy_pressure_skew_bps
+            + inventory_skew_bps
+            + signal_skew_bps;
 
         // Clamp combined skew to prevent quote crossing: max 80% of half-spread
-        let max_skew_bps = self.config.max_skew_half_spread_fraction * self.half_spread_estimate_bps;
+        let max_skew_bps =
+            self.config.max_skew_half_spread_fraction * self.half_spread_estimate_bps;
         signals.combined_skew_bps = raw_skew.clamp(-max_skew_bps, max_skew_bps);
 
         // === HL-Native Directional Skew Fallback ===
@@ -1179,10 +1186,11 @@ impl SignalIntegrator {
         // No guard on combined_skew_bps — this is HIP-3's primary directional signal.
         // Final clamp at line ~1194 prevents overflow.
         if !signals.lead_lag_actionable && !signals.cross_venue_valid {
-            let flow_dir = self.latest_hl_flow.imbalance_5s * 0.6
-                + self.latest_hl_flow.imbalance_30s * 0.4;
+            let flow_dir =
+                self.latest_hl_flow.imbalance_5s * 0.6 + self.latest_hl_flow.imbalance_30s * 0.4;
             let fallback_cap = self.config.max_lead_lag_skew_bps * 0.6;
-            signals.combined_skew_bps += (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
+            signals.combined_skew_bps +=
+                (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
         }
 
         // Update signal availability state machine
@@ -1232,8 +1240,10 @@ impl SignalIntegrator {
             let flow_imbalance = self.latest_hl_flow.imbalance_5s;
             const FLOW_URGENCY_THRESHOLD: f64 = 0.4;
             if flow_imbalance.abs() > FLOW_URGENCY_THRESHOLD {
-                let urgency = (flow_imbalance.abs() - FLOW_URGENCY_THRESHOLD) / (1.0 - FLOW_URGENCY_THRESHOLD);
-                let flow_skew_bps = urgency * self.config.flow_urgency_max_bps * flow_imbalance.signum();
+                let urgency = (flow_imbalance.abs() - FLOW_URGENCY_THRESHOLD)
+                    / (1.0 - FLOW_URGENCY_THRESHOLD);
+                let flow_skew_bps =
+                    urgency * self.config.flow_urgency_max_bps * flow_imbalance.signum();
                 signals.combined_skew_bps += flow_skew_bps;
             }
         }
@@ -1242,7 +1252,8 @@ impl SignalIntegrator {
         signals.combined_skew_bps = signals.combined_skew_bps.clamp(-max_skew_bps, max_skew_bps);
 
         // === Build per-signal contribution record for attribution ===
-        let vpin_active = self.config.use_vpin_toxicity && self.vpin_valid
+        let vpin_active = self.config.use_vpin_toxicity
+            && self.vpin_valid
             && self.latest_hl_vpin > self.config.vpin_widen_threshold;
         signals.signal_contributions = Some(SignalContributionRecord {
             lead_lag_skew_bps: signals.lead_lag_skew_bps,
@@ -1272,7 +1283,9 @@ impl SignalIntegrator {
             vpin_spread_mult: if vpin_active {
                 // Isolate VPIN contribution: ratio of blended to EM-only spread mult
                 // When VPIN is not active this is 1.0 (no adjustment)
-                let em_only_mult = self.config.informed_flow_adjustment
+                let em_only_mult = self
+                    .config
+                    .informed_flow_adjustment
                     .spread_multiplier(self.last_flow_decomp.p_informed);
                 if em_only_mult > 0.0 {
                     signals.informed_flow_spread_mult / em_only_mult
@@ -1346,9 +1359,10 @@ impl SignalIntegrator {
         implied_kappa: f64,
         _liquidity_class: crate::market_maker::estimator::market_profile::LiquidityClass,
     ) {
-        let config = crate::market_maker::estimator::regime_kappa::RegimeKappaConfig::from_base_kappa(
-            implied_kappa.clamp(50.0, 50000.0),
-        );
+        let config =
+            crate::market_maker::estimator::regime_kappa::RegimeKappaConfig::from_base_kappa(
+                implied_kappa.clamp(50.0, 50000.0),
+            );
         self.regime_kappa = RegimeKappaEstimator::new(config);
     }
 
@@ -1372,8 +1386,7 @@ impl SignalIntegrator {
         let lag_ready = !self.config.use_lead_lag || self.lag_analyzer.is_ready();
         let flow_ready = !self.config.use_informed_flow || self.informed_flow.is_warmed_up();
         let kappa_ready = !self.config.use_regime_kappa || self.regime_kappa.is_warmed_up();
-        let cross_venue_ready =
-            !self.config.use_cross_venue || self.binance_flow.is_warmed_up();
+        let cross_venue_ready = !self.config.use_cross_venue || self.binance_flow.is_warmed_up();
 
         lag_ready && flow_ready && kappa_ready && cross_venue_ready
     }
@@ -1424,7 +1437,8 @@ impl SignalIntegrator {
     pub fn disable_binance_signals(&mut self) {
         self.config.use_lead_lag = false;
         self.config.use_cross_venue = false;
-        self.signal_availability.set(SignalAvailability::NeverConfigured);
+        self.signal_availability
+            .set(SignalAvailability::NeverConfigured);
     }
 
     /// Disable only cross-venue trade flow signal, keeping lead-lag active.
@@ -1530,16 +1544,15 @@ impl SignalIntegrator {
         self.max_position = 0.0;
         self.predicted_alpha = 0.5;
         self.half_spread_estimate_bps = 5.0;
-        self.signal_availability.set(
-            if self.config.use_lead_lag || self.config.use_cross_venue {
+        self.signal_availability
+            .set(if self.config.use_lead_lag || self.config.use_cross_venue {
                 SignalAvailability::Degraded {
                     last_healthy_secs_ago: 0.0,
                     max_reduction_after_secs: 300.0,
                 }
             } else {
                 SignalAvailability::NeverConfigured
-            },
-        );
+            });
         self.logged_signal_state.set(false);
     }
 }
@@ -1733,7 +1746,10 @@ mod tests {
         for i in 0..20 {
             integrator.regime_kappa.on_fill(i * 1000, price, 1.0, mid);
         }
-        assert!(integrator.regime_kappa.is_warmed_up(), "should be warmed up after 20 fills");
+        assert!(
+            integrator.regime_kappa.is_warmed_up(),
+            "should be warmed up after 20 fills"
+        );
         assert!(integrator.regime_kappa.was_ever_warmed_up());
         assert!(
             (integrator.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON,
@@ -1741,9 +1757,17 @@ mod tests {
         );
 
         // Switch regime: now is_warmed_up()=false but was_ever_warmed_up()=true
-        integrator.regime_kappa.set_regime(VolatilityRegime::Extreme);
-        assert!(!integrator.regime_kappa.is_warmed_up(), "Extreme regime has no fills");
-        assert!(integrator.regime_kappa.was_ever_warmed_up(), "was warmed in Normal");
+        integrator
+            .regime_kappa
+            .set_regime(VolatilityRegime::Extreme);
+        assert!(
+            !integrator.regime_kappa.is_warmed_up(),
+            "Extreme regime has no fills"
+        );
+        assert!(
+            integrator.regime_kappa.was_ever_warmed_up(),
+            "was warmed in Normal"
+        );
 
         let mult = integrator.staleness_spread_multiplier();
         assert!(
@@ -1885,9 +1909,8 @@ mod tests {
         assert!(signals.cross_venue_adj_bps >= 0.0);
 
         // total_adj_bps should equal sum of components (before cap)
-        let expected_uncapped = signals.informed_flow_adj_bps
-            + signals.gating_adj_bps
-            + signals.cross_venue_adj_bps;
+        let expected_uncapped =
+            signals.informed_flow_adj_bps + signals.gating_adj_bps + signals.cross_venue_adj_bps;
         assert!(
             (signals.total_adj_bps_uncapped - expected_uncapped).abs() < 0.01,
             "uncapped total should equal sum of components: {} vs {}",
@@ -1897,7 +1920,9 @@ mod tests {
 
         // Contribution record should also have the additive fields
         let contrib = signals.signal_contributions.unwrap();
-        assert!((contrib.informed_flow_adj_bps - signals.informed_flow_adj_bps).abs() < f64::EPSILON);
+        assert!(
+            (contrib.informed_flow_adj_bps - signals.informed_flow_adj_bps).abs() < f64::EPSILON
+        );
         assert!((contrib.gating_adj_bps - signals.gating_adj_bps).abs() < f64::EPSILON);
         assert!((contrib.cross_venue_adj_bps - signals.cross_venue_adj_bps).abs() < f64::EPSILON);
         assert!((contrib.total_adj_bps - signals.total_adj_bps).abs() < f64::EPSILON);
@@ -1939,8 +1964,14 @@ mod tests {
         }
 
         assert!(!integrator.informed_flow.is_warmed_up());
-        assert!(integrator.informed_flow.observation_count() > 0, "has some data");
-        assert!(!integrator.informed_flow.was_ever_warmed_up(), "never reached warmup");
+        assert!(
+            integrator.informed_flow.observation_count() > 0,
+            "has some data"
+        );
+        assert!(
+            !integrator.informed_flow.was_ever_warmed_up(),
+            "never reached warmup"
+        );
 
         let mult = integrator.staleness_spread_multiplier();
         assert!(
@@ -1968,7 +1999,9 @@ mod tests {
         assert!((integrator.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON);
 
         // Switch regime => data loss
-        integrator.regime_kappa.set_regime(VolatilityRegime::Extreme);
+        integrator
+            .regime_kappa
+            .set_regime(VolatilityRegime::Extreme);
         assert!(!integrator.regime_kappa.is_warmed_up());
         assert!(integrator.regime_kappa.was_ever_warmed_up());
 

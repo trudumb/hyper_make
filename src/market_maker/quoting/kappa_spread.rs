@@ -174,7 +174,11 @@ impl KappaSpreadController {
     ///
     /// # Returns
     /// Adjusted spread in basis points
-    pub fn compute_spread(&mut self, base_spread_bps: f64, current_kappa: f64) -> KappaSpreadResult {
+    pub fn compute_spread(
+        &mut self,
+        base_spread_bps: f64,
+        current_kappa: f64,
+    ) -> KappaSpreadResult {
         self.compute_spread_with_regime(base_spread_bps, current_kappa, KappaRegime::Calm)
     }
 
@@ -210,8 +214,8 @@ impl KappaSpreadController {
         adjusted *= regime_multiplier;
 
         // Clamp to limits
-        let was_clamped = adjusted < self.config.min_spread_bps
-            || adjusted > self.config.max_spread_bps;
+        let was_clamped =
+            adjusted < self.config.min_spread_bps || adjusted > self.config.max_spread_bps;
         let final_spread = adjusted.clamp(self.config.min_spread_bps, self.config.max_spread_bps);
 
         self.last_spread = final_spread;
@@ -405,7 +409,8 @@ mod tests {
         controller.set_avg_kappa(1000.0);
 
         let calm_result = controller.compute_spread_with_regime(10.0, 1000.0, KappaRegime::Calm);
-        let volatile_result = controller.compute_spread_with_regime(10.0, 1000.0, KappaRegime::Volatile);
+        let volatile_result =
+            controller.compute_spread_with_regime(10.0, 1000.0, KappaRegime::Volatile);
 
         assert!(volatile_result.spread_bps > calm_result.spread_bps);
         assert_eq!(volatile_result.regime_multiplier, 1.5);
@@ -417,7 +422,8 @@ mod tests {
         controller.set_avg_kappa(1000.0);
 
         let calm_result = controller.compute_spread_with_regime(10.0, 1000.0, KappaRegime::Calm);
-        let cascade_result = controller.compute_spread_with_regime(10.0, 1000.0, KappaRegime::Cascade);
+        let cascade_result =
+            controller.compute_spread_with_regime(10.0, 1000.0, KappaRegime::Cascade);
 
         assert!(cascade_result.spread_bps > calm_result.spread_bps);
         assert_eq!(cascade_result.regime_multiplier, 2.5);

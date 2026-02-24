@@ -574,7 +574,10 @@ impl VolatilityFilter {
     ///
     /// Particles are centered on the saved sigma_mean with sigma_std spread.
     /// SmallRng reinitializes fresh (deterministic seed fine for particle filter).
-    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::VolFilterCheckpoint) {
+    pub fn restore_checkpoint(
+        &mut self,
+        cp: &crate::market_maker::checkpoint::VolFilterCheckpoint,
+    ) {
         // Reinitialize particles centered on saved posterior
         let log_vol_mean = if cp.sigma_mean > 0.0 {
             cp.sigma_mean.ln()
@@ -983,7 +986,10 @@ mod tests {
 
         // Not warmed up (no fills)
         assert!(!tracker.is_warmed_up());
-        assert!((tracker.sampling_bias_ratio() - 1.0).abs() < 1e-9, "Should return 1.0 when not warmed up");
+        assert!(
+            (tracker.sampling_bias_ratio() - 1.0).abs() < 1e-9,
+            "Should return 1.0 when not warmed up"
+        );
         assert!((tracker.fillable_fraction() - 0.0).abs() < 1e-9);
     }
 
@@ -1002,7 +1008,11 @@ mod tests {
 
         assert!(tracker.is_warmed_up());
         let ratio = tracker.sampling_bias_ratio();
-        assert!(ratio > 1.5, "Fills during high vol should show bias > 1.5. Got: {}", ratio);
+        assert!(
+            ratio > 1.5,
+            "Fills during high vol should show bias > 1.5. Got: {}",
+            ratio
+        );
     }
 
     #[test]
@@ -1026,6 +1036,10 @@ mod tests {
         }
 
         let frac = tracker.fillable_fraction();
-        assert!((frac - 0.3).abs() < 0.01, "Should be ~30% fillable. Got: {}", frac);
+        assert!(
+            (frac - 0.3).abs() < 0.01,
+            "Should be ~30% fillable. Got: {}",
+            frac
+        );
     }
 }

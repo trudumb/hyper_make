@@ -280,7 +280,14 @@ impl TrackedOrder {
     }
 
     /// Create a new tracked order with a client order ID.
-    pub fn with_cloid(oid: u64, cloid: String, side: Side, price: f64, size: f64, mid: f64) -> Self {
+    pub fn with_cloid(
+        oid: u64,
+        cloid: String,
+        side: Side,
+        price: f64,
+        size: f64,
+        mid: f64,
+    ) -> Self {
         let mut order = Self::new(oid, side, price, size, mid);
         order.cloid = Some(cloid);
         order

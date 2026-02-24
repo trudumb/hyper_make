@@ -9,29 +9,20 @@ use crate::market_maker::{
         EnhancedASClassifier, PreFillASClassifier, SweepDetector,
     },
     analytics::{EdgeTracker, MarketToxicityComposite, MarketToxicityConfig},
+    calibration::{LearnedParameters, SignalDecayTracker},
     config::{ImpulseControlConfig, MetricsRecorder},
     control::{
         CalibratedEdgeConfig, CalibratedEdgeSignal, PositionPnLConfig, PositionPnLTracker,
         QuotaShadowPricer, StochasticController, StochasticControllerConfig,
         TheoreticalEdgeEstimator,
     },
-    stochastic::{StochasticControlBuilder, StochasticControlConfig},
-    strategy::{PositionDecisionConfig, PositionDecisionEngine, SignalIntegrator, SignalIntegratorConfig,
-               regime_state::RegimeState},
     estimator::{
-        CalibrationController, CalibrationControllerConfig, RegimeHMM,
-        EnhancedFlowConfig, EnhancedFlowEstimator,
-        LiquidityEvaporationConfig, LiquidityEvaporationDetector,
+        BOCPDKappaConfig, BOCPDKappaPredictor, CalibrationController, CalibrationControllerConfig,
+        CumulativeOFI, CumulativeOFIConfig, EnhancedFlowConfig, EnhancedFlowEstimator,
+        LiquidityEvaporationConfig, LiquidityEvaporationDetector, RegimeHMM, ThresholdKappa,
+        ThresholdKappaConfig, TradeFlowTracker, TradeSizeDistribution, TradeSizeDistributionConfig,
         VpinConfig, VpinEstimator,
-        CumulativeOFI, CumulativeOFIConfig,
-        TradeSizeDistribution, TradeSizeDistributionConfig,
-        BOCPDKappaConfig, BOCPDKappaPredictor,
-        ThresholdKappa, ThresholdKappaConfig,
-        TradeFlowTracker,
     },
-    calibration::{LearnedParameters, SignalDecayTracker},
-    quoting::{KappaSpreadConfig, KappaSpreadController},
-    simulation::{QuickMCConfig, QuickMCSimulator},
     execution::{FillTracker, OrderLifecycleTracker},
     fills::{FillProcessor, FillSignalStore},
     infra::{
@@ -49,9 +40,16 @@ use crate::market_maker::{
         HawkesOrderFlowEstimator, LiquidationCascadeDetector, LiquidationConfig, SpreadConfig,
         SpreadProcessEstimator,
     },
+    quoting::{KappaSpreadConfig, KappaSpreadController},
     risk::{
         CircuitBreakerConfig, CircuitBreakerMonitor, DrawdownConfig, DrawdownTracker, KillSwitch,
         KillSwitchConfig, PositionGuard, RiskAggregator, RiskChecker, RiskLimits,
+    },
+    simulation::{QuickMCConfig, QuickMCSimulator},
+    stochastic::{StochasticControlBuilder, StochasticControlConfig},
+    strategy::{
+        regime_state::RegimeState, PositionDecisionConfig, PositionDecisionEngine,
+        SignalIntegrator, SignalIntegratorConfig,
     },
     tracking::{
         ImpulseFilter, ModelCalibrationOrchestrator, PnLConfig, PnLTracker, QueueConfig,
@@ -276,7 +274,8 @@ pub struct InfraComponents {
     /// Pending fill outcomes for 5-second adverse selection markout.
     /// Fills are pushed here; on each mid update, expired entries are drained
     /// and fed to the pre-fill classifier and model gating.
-    pub pending_fill_outcomes: std::collections::VecDeque<crate::market_maker::fills::PendingFillOutcome>,
+    pub pending_fill_outcomes:
+        std::collections::VecDeque<crate::market_maker::fills::PendingFillOutcome>,
     /// Budget pacer for EV-aware API budget allocation (L5: Churn Reduction).
     /// Filters low-value operations when API budget is tight.
     pub budget_pacer: BudgetPacer,
@@ -649,7 +648,7 @@ impl StochasticComponents {
         };
 
         // Create position ramp from stochastic config
-        use super::super::{RampCurve, SessionPositionRamp, PerformanceGatedCapacity};
+        use super::super::{PerformanceGatedCapacity, RampCurve, SessionPositionRamp};
         let ramp_curve = match stochastic_config.ramp_curve.as_str() {
             "linear" => RampCurve::Linear,
             "log" => RampCurve::Log,
@@ -716,7 +715,9 @@ impl StochasticComponents {
             position_decision: PositionDecisionEngine::new(PositionDecisionConfig::default()),
             // Microstructure Signals (Phase 1: Alpha-Generating Architecture)
             vpin: VpinEstimator::new(VpinConfig::default()),
-            liquidity_evaporation: LiquidityEvaporationDetector::new(LiquidityEvaporationConfig::default()),
+            liquidity_evaporation: LiquidityEvaporationDetector::new(
+                LiquidityEvaporationConfig::default(),
+            ),
             // Phase 1A Refinements: Toxic Volume Detection
             cofi: CumulativeOFI::new(CumulativeOFIConfig::default()),
             trade_size_dist: TradeSizeDistribution::new(TradeSizeDistributionConfig::default()),
@@ -748,7 +749,7 @@ impl StochasticComponents {
     pub fn sync_regime(&mut self, regime: usize) {
         self.theoretical_edge.set_regime(regime);
     }
-    
+
     /// Handle changepoint detection.
     ///
     /// Call this when `StochasticController.changepoint.should_reset_beliefs()` is true.
@@ -765,7 +766,6 @@ impl StochasticComponents {
             "Changepoint detected - decayed Bayesian alpha"
         );
     }
-
 
     // ==================== Learned Parameters Methods ====================
 
@@ -793,13 +793,20 @@ impl StochasticComponents {
     /// * `fills` - Number of fills observed
     /// * `exposure_seconds` - Time period in seconds
     /// * `avg_spread_bps` - Average spread during observation
-    pub fn update_kappa_from_fills(&mut self, fills: usize, exposure_seconds: f64, avg_spread_bps: f64) {
+    pub fn update_kappa_from_fills(
+        &mut self,
+        fills: usize,
+        exposure_seconds: f64,
+        avg_spread_bps: f64,
+    ) {
         if exposure_seconds > 0.0 && avg_spread_bps > 0.0 {
             let fill_rate = fills as f64 / exposure_seconds;
             let kappa_obs = fill_rate / (avg_spread_bps / 10_000.0);
             if kappa_obs > 100.0 && kappa_obs < 100_000.0 {
                 // Observe as Poisson count
-                self.learned_params.kappa.observe_gamma_poisson(fills, exposure_seconds * (avg_spread_bps / 10_000.0));
+                self.learned_params
+                    .kappa
+                    .observe_gamma_poisson(fills, exposure_seconds * (avg_spread_bps / 10_000.0));
             }
         }
     }
@@ -834,7 +841,6 @@ impl StochasticComponents {
         self.learned_params.summary()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -877,7 +883,8 @@ mod tests {
 
     #[test]
     fn test_safety_components_construction() {
-        let safety = SafetyComponents::new(KillSwitchConfig::default(), RiskAggregator::new(), 1.0, 0.1);
+        let safety =
+            SafetyComponents::new(KillSwitchConfig::default(), RiskAggregator::new(), 1.0, 0.1);
         // Kill switch should not be triggered initially
         assert!(!safety.kill_switch.is_triggered());
         // Risk checker should be created with defaults

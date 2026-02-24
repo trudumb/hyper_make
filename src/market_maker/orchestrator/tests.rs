@@ -429,12 +429,18 @@ mod tests {
         // 3 seconds (above 2s threshold): 2 ticks of buffer
         let staleness_ticks_3s = (3_u64 - 2 + 1) as f64;
         let buffer_3s = staleness_ticks_3s * tick_proxy;
-        assert!((buffer_3s - 20.0).abs() < 0.01, "Expected ~$20 buffer at 3s age");
+        assert!(
+            (buffer_3s - 20.0).abs() < 0.01,
+            "Expected ~$20 buffer at 3s age"
+        );
 
         // 4 seconds: 3 ticks of buffer
         let staleness_ticks_4s = (4_u64 - 2 + 1) as f64;
         let buffer_4s = staleness_ticks_4s * tick_proxy;
-        assert!((buffer_4s - 30.0).abs() < 0.01, "Expected ~$30 buffer at 4s age");
+        assert!(
+            (buffer_4s - 30.0).abs() < 0.01,
+            "Expected ~$30 buffer at 4s age"
+        );
     }
 
     /// The real-world bug: bid at 32.992 hit ask at 32.992.

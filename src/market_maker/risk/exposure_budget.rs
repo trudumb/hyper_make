@@ -77,7 +77,10 @@ impl ExposureSnapshot {
         if self.max_position <= 0.0 {
             return f64::INFINITY;
         }
-        let worst = self.worst_case_long().abs().max(self.worst_case_short().abs());
+        let worst = self
+            .worst_case_long()
+            .abs()
+            .max(self.worst_case_short().abs());
         worst / self.max_position
     }
 }

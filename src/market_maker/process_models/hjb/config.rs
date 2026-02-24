@@ -131,8 +131,8 @@ impl Default for HJBConfig {
             min_warmup_observations: 20,
             // OU drift model (preferred over EWMA)
             use_ou_drift: true,
-            ou_theta: 0.5,           // ~1.4s half-life
-            ou_reconcile_k: 2.0,     // 2σ threshold
+            ou_theta: 0.5,       // ~1.4s half-life
+            ou_reconcile_k: 2.0, // 2σ threshold
             // Funding horizon (enabled by default — perpetuals settle every 8h)
             use_funding_horizon: true,
             calibrate_terminal_penalty: true,

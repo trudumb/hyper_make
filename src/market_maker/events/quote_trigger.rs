@@ -111,7 +111,11 @@ impl QuoteUpdateEvent {
     pub fn priority(&self) -> u8 {
         match self {
             QuoteUpdateEvent::FillReceived { is_full_fill, .. } => {
-                if *is_full_fill { 100 } else { 90 }
+                if *is_full_fill {
+                    100
+                } else {
+                    90
+                }
             }
             QuoteUpdateEvent::VolatilitySpike { .. } => 85,
             QuoteUpdateEvent::RegimeChange { .. } => 80,
@@ -135,20 +139,13 @@ pub enum ReconcileScope {
     Full,
 
     /// Only reconcile one side.
-    SideOnly {
-        side: Side,
-    },
+    SideOnly { side: Side },
 
     /// Only reconcile specific orders.
-    LevelsOnly {
-        oids: Vec<u64>,
-    },
+    LevelsOnly { oids: Vec<u64> },
 
     /// One side, specific orders.
-    SideAndLevels {
-        side: Side,
-        oids: Vec<u64>,
-    },
+    SideAndLevels { side: Side, oids: Vec<u64> },
 
     /// No reconciliation needed (event was filtered).
     None,
@@ -330,17 +327,27 @@ mod tests {
         assert!(buy_only.clone().merge(sell_only).is_full());
 
         // Merging with none = other
-        assert!(matches!(none.clone().merge(buy_only.clone()), ReconcileScope::SideOnly { .. }));
+        assert!(matches!(
+            none.clone().merge(buy_only.clone()),
+            ReconcileScope::SideOnly { .. }
+        ));
 
         // Same side = same
-        let merged = buy_only.clone().merge(ReconcileScope::SideOnly { side: Side::Buy });
-        assert!(matches!(merged, ReconcileScope::SideOnly { side: Side::Buy }));
+        let merged = buy_only
+            .clone()
+            .merge(ReconcileScope::SideOnly { side: Side::Buy });
+        assert!(matches!(
+            merged,
+            ReconcileScope::SideOnly { side: Side::Buy }
+        ));
     }
 
     #[test]
     fn test_scope_includes() {
         let buy_only = ReconcileScope::SideOnly { side: Side::Buy };
-        let levels = ReconcileScope::LevelsOnly { oids: vec![1, 2, 3] };
+        let levels = ReconcileScope::LevelsOnly {
+            oids: vec![1, 2, 3],
+        };
 
         assert!(buy_only.includes_side(Side::Buy));
         assert!(!buy_only.includes_side(Side::Sell));

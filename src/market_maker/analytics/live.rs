@@ -15,7 +15,9 @@ use tracing::{info, warn};
 use super::attribution::{CycleContributions, SignalContribution, SignalPnLAttributor};
 use super::edge_metrics::EdgeSnapshot;
 use super::persistence::AnalyticsLogger;
-use super::sharpe::{EquityCurveSharpe, EquityCurveSummary, PerSignalSharpeTracker, SharpeSummary, SharpeTracker};
+use super::sharpe::{
+    EquityCurveSharpe, EquityCurveSummary, PerSignalSharpeTracker, SharpeSummary, SharpeTracker,
+};
 use crate::market_maker::strategy::SignalContributionRecord;
 
 /// Summary snapshot returned by `LiveAnalytics::summary()`.
@@ -107,8 +109,11 @@ impl LiveAnalytics {
         if let Some(ref contribs) = self.last_cycle_contributions {
             for contrib in &contribs.contributions {
                 if contrib.was_active {
-                    self.signal_sharpe
-                        .add_signal_return(&contrib.signal_name, fill_pnl_bps, timestamp_ns);
+                    self.signal_sharpe.add_signal_return(
+                        &contrib.signal_name,
+                        fill_pnl_bps,
+                        timestamp_ns,
+                    );
                 }
             }
             self.signal_attributor.record_cycle(contribs, fill_pnl_bps);
@@ -125,7 +130,10 @@ impl LiveAnalytics {
     /// Call this once per quote cycle with the output of
     /// `signal_integrator.get_signals()`. The contributions are retained
     /// so the next `record_fill` can attribute PnL to the active signals.
-    pub fn record_quote_cycle(&mut self, signals: &crate::market_maker::strategy::IntegratedSignals) {
+    pub fn record_quote_cycle(
+        &mut self,
+        signals: &crate::market_maker::strategy::IntegratedSignals,
+    ) {
         if let Some(ref record) = signals.signal_contributions {
             let timestamp_ns = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -173,7 +181,8 @@ impl LiveAnalytics {
             );
         } else if fill_count < 50 {
             // Preliminary: report Sharpe but flag as unreliable
-            let (sharpe_all, sharpe_lo, sharpe_hi) = self.sharpe_tracker.sharpe_with_confidence(0.90);
+            let (sharpe_all, sharpe_lo, sharpe_hi) =
+                self.sharpe_tracker.sharpe_with_confidence(0.90);
             info!(
                 "[ANALYTICS] PRELIMINARY Sharpe(1h)={:.2} Sharpe(all)={:.2} [{:.2}, {:.2}] Fills={} Edge={:.1}bps",
                 sharpe_summary.sharpe_1h,
@@ -185,7 +194,8 @@ impl LiveAnalytics {
             );
         } else {
             // Sufficient data: full output
-            let (sharpe_all, sharpe_lo, sharpe_hi) = self.sharpe_tracker.sharpe_with_confidence(0.90);
+            let (sharpe_all, sharpe_lo, sharpe_hi) =
+                self.sharpe_tracker.sharpe_with_confidence(0.90);
             info!(
                 "[ANALYTICS] Sharpe(1h)={:.2} Sharpe(24h)={:.2} Sharpe(all)={:.2} [{:.2}, {:.2}] Fills={} Edge={:.1}bps",
                 sharpe_summary.sharpe_1h,

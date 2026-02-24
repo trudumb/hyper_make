@@ -470,7 +470,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_pure_buy_flow_nonzero_imbalance_30s() {
         // P0-5 regression test: after one-sided buy trades, imbalance_30s must be > 0.
@@ -551,8 +550,14 @@ mod tests {
         // So bid_mult should be > 1 (more fills on bid side) and ask_mult < 1
         // With imb < 0: bid_mult = 1 - sensitivity * imb = 1 - 0.5 * (-0.5) = 1.25 ✓
         // ask_mult = 1 + sensitivity * imb = 1 + 0.5 * (-0.5) = 0.75 ✓
-        assert!(bid_mult > 1.0, "Sell pressure: bid_mult should be > 1.0 (bids fill faster): {bid_mult}");
-        assert!(ask_mult < 1.0, "Sell pressure: ask_mult should be < 1.0 (asks fill slower): {ask_mult}");
+        assert!(
+            bid_mult > 1.0,
+            "Sell pressure: bid_mult should be > 1.0 (bids fill faster): {bid_mult}"
+        );
+        assert!(
+            ask_mult < 1.0,
+            "Sell pressure: ask_mult should be < 1.0 (asks fill slower): {ask_mult}"
+        );
     }
 
     #[test]
@@ -563,8 +568,14 @@ mod tests {
             tracker.on_trade(1.0, true);
         }
         let (bid_mult, ask_mult) = tracker.directional_kappa_multipliers(0.5);
-        assert!(bid_mult >= 0.5 && bid_mult <= 2.0, "bid_mult bounded: {bid_mult}");
-        assert!(ask_mult >= 0.5 && ask_mult <= 2.0, "ask_mult bounded: {ask_mult}");
+        assert!(
+            bid_mult >= 0.5 && bid_mult <= 2.0,
+            "bid_mult bounded: {bid_mult}"
+        );
+        assert!(
+            ask_mult >= 0.5 && ask_mult <= 2.0,
+            "ask_mult bounded: {ask_mult}"
+        );
     }
 
     #[test]
@@ -582,7 +593,10 @@ mod tests {
         assert!(obs.is_some(), "Should produce observation when warmed up");
         let (z, r) = obs.unwrap();
         // Sell pressure → negative imbalance → z = imb * 0.5 → negative z (bearish)
-        assert!(z < 0.0, "Sell pressure should produce negative (bearish) z: {z}");
+        assert!(
+            z < 0.0,
+            "Sell pressure should produce negative (bearish) z: {z}"
+        );
         assert!(r > 0.0, "Positive variance");
     }
 

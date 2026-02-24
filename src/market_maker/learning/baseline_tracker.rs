@@ -134,7 +134,10 @@ mod tests {
 
         // Counterfactual of 0.5 should be ~2.0 (0.5 - (-1.5))
         let cf_positive = tracker.counterfactual_reward(0.5);
-        assert!((cf_positive - 2.0).abs() < 0.1, "expected ~2.0, got {cf_positive}");
+        assert!(
+            (cf_positive - 2.0).abs() < 0.1,
+            "expected ~2.0, got {cf_positive}"
+        );
     }
 
     #[test]

@@ -292,8 +292,8 @@ impl EnhancedFlowEstimator {
 
         // 6. Spread-based sensitivity scaling
         // Tighter spread = higher sensitivity (we're more confident)
-        let sensitivity_factor = self.config.sensitivity_scale
-            / ctx.spread_bps.max(self.config.min_spread_bps);
+        let sensitivity_factor =
+            self.config.sensitivity_scale / ctx.spread_bps.max(self.config.min_spread_bps);
 
         // 7. Non-linear scaling with tanh to bound output
         let scaled_flow = (composite * sensitivity_factor).tanh();
@@ -321,19 +321,9 @@ impl EnhancedFlowEstimator {
     fn compute_depth_imbalance(&self, ctx: &EnhancedFlowContext) -> f64 {
         let n_levels = self.config.depth_levels;
 
-        let bid_depth: f64 = ctx
-            .bid_levels
-            .iter()
-            .take(n_levels)
-            .map(|l| l.size)
-            .sum();
+        let bid_depth: f64 = ctx.bid_levels.iter().take(n_levels).map(|l| l.size).sum();
 
-        let ask_depth: f64 = ctx
-            .ask_levels
-            .iter()
-            .take(n_levels)
-            .map(|l| l.size)
-            .sum();
+        let ask_depth: f64 = ctx.ask_levels.iter().take(n_levels).map(|l| l.size).sum();
 
         let total = bid_depth + ask_depth;
         if total > 0.0 {
@@ -481,7 +471,11 @@ impl EnhancedFlowEstimator {
     ///
     /// This is the depth-weighted version of simple book imbalance.
     /// Useful when you don't have previous book state.
-    pub fn depth_weighted_imbalance(&self, bid_levels: &[BookLevel], ask_levels: &[BookLevel]) -> f64 {
+    pub fn depth_weighted_imbalance(
+        &self,
+        bid_levels: &[BookLevel],
+        ask_levels: &[BookLevel],
+    ) -> f64 {
         let n_levels = self.config.depth_levels;
 
         let mut weighted_bid_depth = 0.0;
@@ -629,7 +623,8 @@ impl LiquidityEvaporationDetector {
             .fold(near_touch_depth, f64::max);
 
         // Add current observation
-        self.depth_history.push_back((timestamp_ms, near_touch_depth));
+        self.depth_history
+            .push_back((timestamp_ms, near_touch_depth));
         self.observation_count += 1;
 
         // Compute instantaneous evaporation score
@@ -664,11 +659,7 @@ impl LiquidityEvaporationDetector {
     ///
     /// Returns (current_depth, peak_depth, drop_fraction).
     pub fn depth_drop(&self) -> (f64, f64, f64) {
-        let current = self
-            .depth_history
-            .back()
-            .map(|(_, d)| *d)
-            .unwrap_or(0.0);
+        let current = self.depth_history.back().map(|(_, d)| *d).unwrap_or(0.0);
 
         let drop_frac = if self.peak_depth > 1e-12 {
             1.0 - (current / self.peak_depth)
@@ -1076,9 +1067,12 @@ impl TradeSizeDistribution {
         self.cached_mean = sum / self.sizes.len() as f64;
 
         // Compute std
-        let variance: f64 = self.sizes.iter()
+        let variance: f64 = self
+            .sizes
+            .iter()
             .map(|&x| (x - self.cached_mean).powi(2))
-            .sum::<f64>() / self.sizes.len() as f64;
+            .sum::<f64>()
+            / self.sizes.len() as f64;
         self.cached_std = variance.sqrt().max(1e-12);
 
         // Compute median
@@ -1480,7 +1474,11 @@ mod tests {
 
         // Should have non-zero variance
         let variance = estimator.flow_variance();
-        assert!(variance > 0.0, "Expected positive variance, got {}", variance);
+        assert!(
+            variance > 0.0,
+            "Expected positive variance, got {}",
+            variance
+        );
     }
 
     #[test]
@@ -1498,9 +1496,11 @@ mod tests {
 
         // Smoothed flow should be less extreme than raw flow
         assert!(
-            result2.smoothed_flow.abs() < result2.enhanced_flow.abs() || result2.smoothed_flow.abs() < 0.8,
+            result2.smoothed_flow.abs() < result2.enhanced_flow.abs()
+                || result2.smoothed_flow.abs() < 0.8,
             "Smoothed flow {} should be closer to zero than raw {}",
-            result2.smoothed_flow, result2.enhanced_flow
+            result2.smoothed_flow,
+            result2.enhanced_flow
         );
     }
 
@@ -1523,7 +1523,8 @@ mod tests {
         assert!(
             result_tight.sensitivity_factor > result_wide.sensitivity_factor,
             "Tight spread {} should have higher sensitivity than wide {}",
-            result_tight.sensitivity_factor, result_wide.sensitivity_factor
+            result_tight.sensitivity_factor,
+            result_wide.sensitivity_factor
         );
     }
 
@@ -1583,24 +1584,12 @@ mod tests {
         let estimator = EnhancedFlowEstimator::default_config();
 
         // Previous state: balanced
-        let prev_bids = vec![
-            BookLevel { size: 100.0 },
-            BookLevel { size: 100.0 },
-        ];
-        let prev_asks = vec![
-            BookLevel { size: 100.0 },
-            BookLevel { size: 100.0 },
-        ];
+        let prev_bids = vec![BookLevel { size: 100.0 }, BookLevel { size: 100.0 }];
+        let prev_asks = vec![BookLevel { size: 100.0 }, BookLevel { size: 100.0 }];
 
         // Current state: bids increased, asks decreased
-        let curr_bids = vec![
-            BookLevel { size: 150.0 },
-            BookLevel { size: 120.0 },
-        ];
-        let curr_asks = vec![
-            BookLevel { size: 80.0 },
-            BookLevel { size: 70.0 },
-        ];
+        let curr_bids = vec![BookLevel { size: 150.0 }, BookLevel { size: 120.0 }];
+        let curr_asks = vec![BookLevel { size: 80.0 }, BookLevel { size: 70.0 }];
 
         let ofi = estimator.depth_weighted_ofi(&curr_bids, &curr_asks, &prev_bids, &prev_asks);
 
@@ -1714,7 +1703,10 @@ mod tests {
         }
 
         // Should show positive imbalance (buying pressure)
-        assert!(cofi.cofi() > 0.0, "Should have positive COFI with bid pressure");
+        assert!(
+            cofi.cofi() > 0.0,
+            "Should have positive COFI with bid pressure"
+        );
         assert!(cofi.is_valid(), "Should be valid after 20 updates");
     }
 
@@ -1763,7 +1755,10 @@ mod tests {
         for i in 0..15 {
             cofi.on_book_update(10.0, 10.0, i * 100);
         }
-        assert!(!cofi.is_sustained_shift(), "Should not detect shift with balanced flow");
+        assert!(
+            !cofi.is_sustained_shift(),
+            "Should not detect shift with balanced flow"
+        );
 
         cofi.reset();
 
@@ -1771,7 +1766,10 @@ mod tests {
         for i in 0..15 {
             cofi.on_book_update(20.0, 2.0, i * 100); // 10:1 ratio
         }
-        assert!(cofi.is_sustained_shift(), "Should detect sustained shift with directional flow");
+        assert!(
+            cofi.is_sustained_shift(),
+            "Should detect sustained shift with directional flow"
+        );
     }
 
     #[test]
@@ -1784,7 +1782,10 @@ mod tests {
         }
 
         // Velocity should be positive (imbalance growing toward buys)
-        assert!(cofi.cofi_velocity() >= 0.0, "Velocity should be non-negative during buying");
+        assert!(
+            cofi.cofi_velocity() >= 0.0,
+            "Velocity should be non-negative during buying"
+        );
 
         // Now reverse
         for i in 10..20 {
@@ -1792,7 +1793,10 @@ mod tests {
         }
 
         // Velocity should be negative (imbalance shifting toward sells)
-        assert!(cofi.cofi_velocity() <= 0.0, "Velocity should be non-positive during selling");
+        assert!(
+            cofi.cofi_velocity() <= 0.0,
+            "Velocity should be non-positive during selling"
+        );
     }
 
     // === Trade Size Distribution tests ===
@@ -1826,12 +1830,15 @@ mod tests {
         for _ in 0..60 {
             tracker.on_trade(10.0);
         }
-        assert!(!tracker.is_size_anomaly(2.0), "No anomaly with stable sizes");
+        assert!(
+            !tracker.is_size_anomaly(2.0),
+            "No anomaly with stable sizes"
+        );
 
         // Now inject MANY large trades to shift the median
         // Need > 50% of window to shift median
         for _ in 0..60 {
-            tracker.on_trade(100.0);  // 10x normal
+            tracker.on_trade(100.0); // 10x normal
         }
 
         // With 60 small (10.0) + 60 large (100.0) in 100-trade window,
@@ -1888,8 +1895,14 @@ mod tests {
         }
 
         let stats = tracker.stats();
-        assert!(stats.mean > 10.0 && stats.mean < 15.0, "Mean in expected range");
+        assert!(
+            stats.mean > 10.0 && stats.mean < 15.0,
+            "Mean in expected range"
+        );
         assert!(stats.std > 0.0, "Should have non-zero std");
-        assert!(stats.median > 10.0 && stats.median < 15.0, "Median in expected range");
+        assert!(
+            stats.median > 10.0 && stats.median < 15.0,
+            "Median in expected range"
+        );
     }
 }

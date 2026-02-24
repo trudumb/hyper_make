@@ -82,7 +82,7 @@ impl Default for DecisionEngineConfig {
             // NOTE: min_size_fraction removed - size is controlled by GLFT inventory_scalar
 
             // Reservation shift
-            baseline_sigma: 0.0001, // ~10 bps per second as baseline
+            baseline_sigma: 0.0001,    // ~10 bps per second as baseline
             tau_horizon_seconds: 60.0, // 1 minute horizon for A-S formula
 
             // Uncertainty (for reservation shift confidence weighting only)
@@ -142,7 +142,7 @@ impl DecisionEngine {
             let size = (0.2 - 0.15 * ((ratio - 0.7) / 0.3).clamp(0.0, 1.0)).max(0.05);
             return QuoteDecision::Quote {
                 size_fraction: size,
-                confidence: 0.0,       // Zero confidence → max defensive widening downstream
+                confidence: 0.0, // Zero confidence → max defensive widening downstream
                 expected_edge: 0.0,
                 reservation_shift: 0.0,
             };
@@ -188,7 +188,9 @@ impl DecisionEngine {
         // incorporated. If EdgeTracker shows persistent negative realized edge,
         // the posterior P(edge > 0) should shift below 0.5, increasing information
         // asymmetry and reducing size — all within the A-S framework.
-        let p_positive_realized = if self.config.realized_edge_n >= self.config.min_edge_observations {
+        let p_positive_realized = if self.config.realized_edge_n
+            >= self.config.min_edge_observations
+        {
             // Floor SE at 0.5 bps to prevent unreasonably sharp posteriors on small
             // samples with tight clustering (e.g., narrow spread regime with consistent
             // small negative marks that may reverse). Without this floor, n=25 fills
@@ -213,8 +215,8 @@ impl DecisionEngine {
             0.0 // Pure prediction before threshold
         };
 
-        let p_positive_edge = (1.0 - realized_trust) * p_positive_predicted
-            + realized_trust * p_positive_realized;
+        let p_positive_edge =
+            (1.0 - realized_trust) * p_positive_predicted + realized_trust * p_positive_realized;
 
         // Information asymmetry: 0 at p=0.5 (neutral), 1 at p=0 or p=1 (informed)
         let information_asymmetry = (2.0 * (p_positive_edge - 0.5)).abs();
@@ -575,8 +577,14 @@ mod tests {
 
         match (decision_mild, decision_severe) {
             (
-                QuoteDecision::Quote { size_fraction: s_mild, .. },
-                QuoteDecision::Quote { size_fraction: s_severe, .. },
+                QuoteDecision::Quote {
+                    size_fraction: s_mild,
+                    ..
+                },
+                QuoteDecision::Quote {
+                    size_fraction: s_severe,
+                    ..
+                },
             ) => {
                 assert!(
                     s_mild > s_severe,
@@ -584,8 +592,16 @@ mod tests {
                     s_mild,
                     s_severe
                 );
-                assert!((s_mild - 0.2).abs() < 0.01, "Mild should be ~0.2, got {}", s_mild);
-                assert!((s_severe - 0.05).abs() < 0.01, "Severe should be ~0.05, got {}", s_severe);
+                assert!(
+                    (s_mild - 0.2).abs() < 0.01,
+                    "Mild should be ~0.2, got {}",
+                    s_mild
+                );
+                assert!(
+                    (s_severe - 0.05).abs() < 0.01,
+                    "Severe should be ~0.05, got {}",
+                    s_severe
+                );
             }
             _ => panic!("Expected both to be defensive Quote decisions"),
         }
@@ -779,9 +795,9 @@ mod tests {
     fn test_p_positive_blends_with_realized_negative_edge() {
         // Negative realized edge should reduce p_blended below 0.5
         let config = DecisionEngineConfig {
-            realized_edge_mean: -2.0,  // Persistently negative
+            realized_edge_mean: -2.0, // Persistently negative
             realized_edge_std: 4.0,
-            realized_edge_n: 30,       // Above threshold (20)
+            realized_edge_n: 30, // Above threshold (20)
             min_edge_observations: 20,
             ..Default::default()
         };
@@ -798,7 +814,11 @@ mod tests {
         let decision = engine.should_quote(&neutral, &health, 0.0, TEST_SIGMA);
 
         match decision {
-            QuoteDecision::Quote { size_fraction, confidence, .. } => {
+            QuoteDecision::Quote {
+                size_fraction,
+                confidence,
+                ..
+            } => {
                 // With negative realized edge, information asymmetry should increase
                 // → size_fraction should decrease and confidence should decrease
                 // vs. pure prediction (where neutral → size ≈ 1.0, confidence ≈ 1.0)
@@ -821,9 +841,9 @@ mod tests {
     fn test_p_positive_no_blend_below_threshold() {
         // Below min observations → pure prediction, realized edge ignored
         let config = DecisionEngineConfig {
-            realized_edge_mean: -10.0,  // Very negative, but insufficient data
+            realized_edge_mean: -10.0, // Very negative, but insufficient data
             realized_edge_std: 1.0,
-            realized_edge_n: 5,        // Below threshold (20)
+            realized_edge_n: 5, // Below threshold (20)
             min_edge_observations: 20,
             ..Default::default()
         };
@@ -840,24 +860,35 @@ mod tests {
             model_contributions: vec![],
         };
 
-        let decision_insufficient = engine_insufficient.should_quote(&prediction, &health, 0.0, TEST_SIGMA);
+        let decision_insufficient =
+            engine_insufficient.should_quote(&prediction, &health, 0.0, TEST_SIGMA);
         let decision_default = engine_default.should_quote(&prediction, &health, 0.0, TEST_SIGMA);
 
         match (decision_insufficient, decision_default) {
             (
-                QuoteDecision::Quote { size_fraction: s1, confidence: c1, .. },
-                QuoteDecision::Quote { size_fraction: s2, confidence: c2, .. },
+                QuoteDecision::Quote {
+                    size_fraction: s1,
+                    confidence: c1,
+                    ..
+                },
+                QuoteDecision::Quote {
+                    size_fraction: s2,
+                    confidence: c2,
+                    ..
+                },
             ) => {
                 // Should be identical: insufficient data → pure prediction
                 assert!(
                     (s1 - s2).abs() < 0.001,
                     "Below threshold should match default: {} vs {}",
-                    s1, s2
+                    s1,
+                    s2
                 );
                 assert!(
                     (c1 - c2).abs() < 0.001,
                     "Confidence should match: {} vs {}",
-                    c1, c2
+                    c1,
+                    c2
                 );
             }
             _ => panic!("Expected both to be Quote"),
@@ -869,9 +900,9 @@ mod tests {
         // Positive realized edge → p_blended > 0.5 → higher asymmetry → smaller size
         // (This is the A-S framework: knowing direction reduces quoting size)
         let config = DecisionEngineConfig {
-            realized_edge_mean: 3.0,   // Positive realized edge
+            realized_edge_mean: 3.0, // Positive realized edge
             realized_edge_std: 2.0,
-            realized_edge_n: 40,       // Well above threshold
+            realized_edge_n: 40, // Well above threshold
             min_edge_observations: 20,
             ..Default::default()
         };
@@ -904,16 +935,16 @@ mod tests {
     fn test_realized_trust_caps_at_80_percent() {
         // Even with many fills, 20% prediction weight retained
         let config = DecisionEngineConfig {
-            realized_edge_mean: -5.0,  // Very negative
+            realized_edge_mean: -5.0, // Very negative
             realized_edge_std: 1.0,
-            realized_edge_n: 1000,     // Way above threshold
+            realized_edge_n: 1000, // Way above threshold
             min_edge_observations: 20,
             ..Default::default()
         };
         let engine_many = DecisionEngine::new(config.clone());
 
         let config_2x = DecisionEngineConfig {
-            realized_edge_n: 40,  // Exactly 2x threshold
+            realized_edge_n: 40, // Exactly 2x threshold
             ..config
         };
         let engine_2x = DecisionEngine::new(config_2x);
@@ -931,8 +962,14 @@ mod tests {
 
         match (decision_many, decision_2x) {
             (
-                QuoteDecision::Quote { size_fraction: s_many, .. },
-                QuoteDecision::Quote { size_fraction: s_2x, .. },
+                QuoteDecision::Quote {
+                    size_fraction: s_many,
+                    ..
+                },
+                QuoteDecision::Quote {
+                    size_fraction: s_2x,
+                    ..
+                },
             ) => {
                 // At n=1000 and n=40 (2x threshold), trust is capped at 0.8
                 // so 1000 fills should give same result as 40 fills
@@ -940,7 +977,8 @@ mod tests {
                 assert!(
                     (s_many - s_2x).abs() < 0.01,
                     "Cap at 80%: n=1000 and n=40 should give similar size: {} vs {}",
-                    s_many, s_2x
+                    s_many,
+                    s_2x
                 );
             }
             _ => panic!("Expected both to be Quote"),
@@ -967,7 +1005,11 @@ mod tests {
         let decision = engine.should_quote(&neutral, &health, 0.0, TEST_SIGMA);
 
         match decision {
-            QuoteDecision::Quote { size_fraction, confidence, .. } => {
+            QuoteDecision::Quote {
+                size_fraction,
+                confidence,
+                ..
+            } => {
                 // Neutral prediction → high size, high confidence (inverse of Kelly)
                 assert!(
                     size_fraction > 0.9,

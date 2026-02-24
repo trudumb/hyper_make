@@ -11,7 +11,8 @@ use crate::prelude::Result;
 use crate::{Message, Subscription};
 
 use super::super::{
-    CancelResult, ConnectionState, MarketMaker, TradingEnvironment, QuotingStrategy, Side, TrackedOrder,
+    CancelResult, ConnectionState, MarketMaker, QuotingStrategy, Side, TrackedOrder,
+    TradingEnvironment,
 };
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -450,7 +451,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 dump.cascade_severity = self.tier1.liquidation_detector.cascade_severity();
                 dump.risk_state = crate::market_maker::monitoring::RiskSnapshot {
                     drawdown_pct: if pnl_summary.peak_pnl > 0.0 {
-                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl * 100.0
+                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
+                            * 100.0
                     } else {
                         0.0
                     },
@@ -632,6 +634,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // Updates model calibration metrics and logs Brier scores / IR
                     self.periodic_component_update();
 
+                    // === Shadow Tuner: Update shared estimators + check for new params ===
+                    self.update_shadow_tuner_estimators();
+                    self.check_dynamic_params();
+
                     // === Periodic Checkpoint Save (every 5 minutes) ===
                     if self.last_checkpoint_save.elapsed() >= Duration::from_secs(300) {
                         if let Some(ref manager) = self.checkpoint_manager {
@@ -641,6 +647,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                 crate::market_maker::calibration::gate::CalibrationGateConfig::default(),
                             );
                             bundle.readiness = gate.assess(&bundle);
+                            // Signal Shadow Tuner gate if calibration is Ready or Marginal
+                            if matches!(
+                                bundle.readiness.verdict,
+                                crate::market_maker::checkpoint::PriorVerdict::Ready
+                                | crate::market_maker::checkpoint::PriorVerdict::Marginal
+                            ) {
+                                self.signal_shadow_tuner_gate();
+                            }
                             if let Err(e) = manager.save_all(&bundle) {
                                 warn!("Checkpoint save failed: {e}");
                             }
@@ -902,7 +916,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 dump.cascade_severity = self.tier1.liquidation_detector.cascade_severity();
                 dump.risk_state = crate::market_maker::monitoring::RiskSnapshot {
                     drawdown_pct: if pnl_summary.peak_pnl > 0.0 {
-                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl * 100.0
+                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
+                            * 100.0
                     } else {
                         0.0
                     },
@@ -1043,6 +1058,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     );
 
                     self.periodic_component_update();
+
+                    // === Shadow Tuner: Update shared estimators + check for new params ===
+                    self.update_shadow_tuner_estimators();
+                    self.check_dynamic_params();
 
                     // Periodic checkpoint save (every 5 minutes).
                     if self.last_checkpoint_save.elapsed() >= Duration::from_secs(300) {

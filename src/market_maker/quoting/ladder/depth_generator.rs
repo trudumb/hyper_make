@@ -173,8 +173,8 @@ impl Default for DynamicDepthConfig {
             max_depth_multiple: 5.0, // Up to 5x optimal spread
             max_depth_bps: 200.0,    // Hard cap at 200bp
             spacing: DepthSpacing::Geometric,
-            geometric_ratio: 1.2,    // Each level 20% further than previous (tighter clustering near touch)
-            linear_step_bps: 3.0,    // Or 3bp steps for linear
+            geometric_ratio: 1.2, // Each level 20% further than previous (tighter clustering near touch)
+            linear_step_bps: 3.0, // Or 3bp steps for linear
             maker_fee_rate: 0.00015, // 1.5bp maker fee (Hyperliquid actual)
             // FIRST PRINCIPLES: This is a safety floor, not the primary floor.
             // The adaptive floor from AdaptiveBayesianConfig is the effective floor.

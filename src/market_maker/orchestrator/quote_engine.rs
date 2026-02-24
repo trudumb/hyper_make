@@ -6,26 +6,25 @@ use tracing::{debug, error, info, trace, warn};
 use crate::prelude::Result;
 
 use super::super::{
-    quoting, MarketMaker, Quote, TradingEnvironment, ParameterAggregator, ParameterSources,
-    QuoteConfig, QuotingStrategy, Side,
+    quoting, MarketMaker, ParameterAggregator, ParameterSources, Quote, QuoteConfig,
+    QuotingStrategy, Side, TradingEnvironment,
 };
 use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
 // QuoteGate removed (A4) — replaced by ExecutionMode state machine + E[PnL] filter
+use crate::market_maker::analytics::ToxicityInput;
+use crate::market_maker::config::{CapacityBudget, Viability};
 use crate::market_maker::estimator::EnhancedFlowContext;
 use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
-use crate::market_maker::analytics::ToxicityInput;
-use crate::market_maker::config::{CapacityBudget, Viability};
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
 use crate::market_maker::strategy::action_to_inventory_ratio;
 use crate::market_maker::strategy::drift_estimator::{
-    SignalObservation, BASE_MOMENTUM_VAR, BASE_LL_VAR, BASE_FLOW_VAR,
+    SignalObservation, BASE_FLOW_VAR, BASE_LL_VAR, BASE_MOMENTUM_VAR,
 };
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;
-
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Update quotes based on current market state.
@@ -37,7 +36,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // === Data Quality Gate ===
         // Block quoting when data is stale, absent, or crossed.
         // This fills the gap between logging (immediate) and the 30s kill switch.
-        if let Some(gate_reason) = self.infra.data_quality.should_gate_quotes(&self.config.asset) {
+        if let Some(gate_reason) = self
+            .infra
+            .data_quality
+            .should_gate_quotes(&self.config.asset)
+        {
             warn!(%gate_reason, "Gating quotes due to data quality issue");
             // Cancel all existing orders when gated — holding stale quotes is dangerous
             let bid_orders = self.orders.get_all_by_side(Side::Buy);
@@ -78,8 +81,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let max_warmup = if self.effective_max_position > 0.0 && self.latest_mid > 0.0 {
                 // Quick tier estimate from position limits
                 let min_order_size = (MIN_ORDER_NOTIONAL / self.latest_mid).max(0.01);
-                let approx_levels = (self.effective_max_position / min_order_size)
-                    .floor() as usize / 2;
+                let approx_levels =
+                    (self.effective_max_position / min_order_size).floor() as usize / 2;
                 match approx_levels {
                     0..=2 => base_warmup.min(10), // Micro: 10s max
                     3..=5 => base_warmup.min(15), // Small: 15s max
@@ -141,7 +144,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .as_ref()
             .map(|c| c.headroom_pct())
             .unwrap_or(1.0);
-        
+
         // Adaptive cycle interval from market conditions and information gain (Fix 14).
         // Uses the AdaptiveCycleTimer to measure both time staleness and state changes.
         let sigma_for_cycle = self.estimator.sigma();
@@ -153,7 +156,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 (half_spread * 0.3).clamp(1.0, 10.0)
             })
             .unwrap_or(3.0);
-            
+
         let should_trigger = self.cycle_timer.should_trigger(
             &self.cycle_state_changes,
             sigma_for_cycle,
@@ -168,7 +171,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
             return Ok(());
         }
-        
+
         // Cycle triggered: reset timer and state changes
         self.cycle_timer.reset_timer();
         self.cycle_state_changes.reset();
@@ -194,7 +197,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.orders.get_all_by_side(Side::Buy)
             } else {
                 self.orders.get_all_by_side(Side::Sell)
-            }.iter().map(|o| o.oid).collect();
+            }
+            .iter()
+            .map(|o| o.oid)
+            .collect();
 
             if !cancel_oids.is_empty() {
                 self.environment
@@ -244,10 +250,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             risk_reduce_only = true;
             if current_position > 0.0 {
                 governor_bid_addon_bps = position_assessment.increasing_side_addon_bps;
-                governor_ask_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
+                governor_ask_addon_bps = position_assessment.reducing_side_addon_bps;
+            // negative = tighten
             } else if current_position < 0.0 {
                 governor_ask_addon_bps = position_assessment.increasing_side_addon_bps;
-                governor_bid_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
+                governor_bid_addon_bps = position_assessment.reducing_side_addon_bps;
+                // negative = tighten
             }
             info!(
                 zone = "Red",
@@ -260,10 +268,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         if position_assessment.zone == crate::market_maker::risk::PositionZone::Kill {
             if current_position > 0.0 {
                 governor_bid_addon_bps = position_assessment.increasing_side_addon_bps;
-                governor_ask_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
+                governor_ask_addon_bps = position_assessment.reducing_side_addon_bps;
+            // negative = tighten
             } else if current_position < 0.0 {
                 governor_ask_addon_bps = position_assessment.increasing_side_addon_bps;
-                governor_bid_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
+                governor_bid_addon_bps = position_assessment.reducing_side_addon_bps;
+                // negative = tighten
             }
         }
 
@@ -331,11 +341,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let can_observe = self.latest_mid > 0.0 && self.prev_mid_for_beliefs > 0.0;
 
         if can_observe {
-            let price_return = (self.latest_mid - self.prev_mid_for_beliefs) / self.prev_mid_for_beliefs;
-            let dt = self.last_beliefs_update
+            let price_return =
+                (self.latest_mid - self.prev_mid_for_beliefs) / self.prev_mid_for_beliefs;
+            let dt = self
+                .last_beliefs_update
                 .map(|t| t.elapsed().as_secs_f64())
-                .unwrap_or(1.0)  // Default to 1 second on first observation
-                .max(0.001);     // Floor to avoid division issues
+                .unwrap_or(1.0) // Default to 1 second on first observation
+                .max(0.001); // Floor to avoid division issues
 
             // Phase 7: Primary write to centralized belief state (removed old beliefs_builder.observe_price)
             let timestamp_ms = std::time::SystemTime::now()
@@ -351,8 +363,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Log belief updates periodically (every 10 observations during warmup, then every 100)
             // Phase 7: Use centralized belief snapshot for logging
             let beliefs = self.central_beliefs.snapshot();
-            let log_interval = if beliefs.drift_vol.n_observations < 100 { 10 } else { 100 };
-            if beliefs.drift_vol.n_observations.is_multiple_of(log_interval) || beliefs.drift_vol.expected_drift.abs() > 0.0005 {
+            let log_interval = if beliefs.drift_vol.n_observations < 100 {
+                10
+            } else {
+                100
+            };
+            if beliefs
+                .drift_vol
+                .n_observations
+                .is_multiple_of(log_interval)
+                || beliefs.drift_vol.expected_drift.abs() > 0.0005
+            {
                 info!(
                     price_return_bps = %format!("{:.2}", price_return * 10000.0),
                     dt_secs = %format!("{:.3}", dt),
@@ -393,12 +414,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.quote_outcome_tracker.expire_old_quotes(now_ms);
 
             // No-fill feedback for SpreadBandit: if pending selection is >2s old, treat as no-fill
-            let pending_expired = self.stochastic.spread_bandit.pending()
+            let pending_expired = self
+                .stochastic
+                .spread_bandit
+                .pending()
                 .map(|p| now_ms.saturating_sub(p.timestamp_ms) > 2000)
                 .unwrap_or(false);
             if pending_expired {
                 let no_fill_reward = self.stochastic.baseline_tracker.counterfactual_reward(0.0);
-                self.stochastic.spread_bandit.update_from_pending(no_fill_reward);
+                self.stochastic
+                    .spread_bandit
+                    .update_from_pending(no_fill_reward);
             }
         }
 
@@ -495,7 +521,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let rates = self.quote_outcome_tracker.fill_rate().all_rates();
             for (spread_mid, fill_rate, count) in &rates {
                 if *count >= 5 {
-                    self.strategy.record_elasticity_observation(*spread_mid, *fill_rate);
+                    self.strategy
+                        .record_elasticity_observation(*spread_mid, *fill_rate);
                 }
             }
 
@@ -543,8 +570,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Compute centralized exposure budget: worst-case position if all orders fill.
         // available_bid/ask_budget accounts for resting orders to prevent aggregate overexposure.
         let position_now = self.position.position();
-        let available_bid_budget = (self.effective_max_position - position_now - pending_bid_exposure).max(0.0);
-        let available_ask_budget = (self.effective_max_position + position_now - pending_ask_exposure).max(0.0);
+        let available_bid_budget =
+            (self.effective_max_position - position_now - pending_bid_exposure).max(0.0);
+        let available_ask_budget =
+            (self.effective_max_position + position_now - pending_ask_exposure).max(0.0);
 
         // DEBUG: Log open order details for diagnosing skew issues
         let (bid_count, ask_count) = self.orders.order_counts();
@@ -605,7 +634,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
         let _p_stress = regime_probs[2] + regime_probs[3]; // P(Volatile) + P(Extreme)
         let sigma_effective = self.estimator.sigma_effective();
-        let vol_ratio = sigma_effective / self.stochastic.stochastic_config.sigma_baseline.max(1e-9);
+        let vol_ratio =
+            sigma_effective / self.stochastic.stochastic_config.sigma_baseline.max(1e-9);
 
         let mut drift_signals: Vec<SignalObservation> = Vec::with_capacity(5);
 
@@ -626,7 +656,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // 3. Lead-lag (reference perp)
         if self.reference_perp_drift_ema.abs() > 1e-12 {
-            let ll_conf = self.stochastic.signal_integrator.lead_lag_signal().stability_confidence.max(0.01);
+            let ll_conf = self
+                .stochastic
+                .signal_integrator
+                .lead_lag_signal()
+                .stability_confidence
+                .max(0.01);
             drift_signals.push(SignalObservation {
                 value_bps_per_sec: self.reference_perp_drift_ema * 10_000.0,
                 variance: BASE_LL_VAR / ll_conf,
@@ -666,7 +701,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             if gate && trend_signal.is_warmed_up && trend_signal.trend_confidence > 0.2 {
                 // Lambda-adaptive R: low fill rate → inflate R (less precise observations)
                 let kappa_prior = self.estimator.adapted_kappa_prior();
-                let recent_kappa = self.estimator.kappa_orchestrator().kappa_effective().max(1.0);
+                let recent_kappa = self
+                    .estimator
+                    .kappa_orchestrator()
+                    .kappa_effective()
+                    .max(1.0);
                 let lambda_ratio = (recent_kappa / kappa_prior.max(1.0)).clamp(0.1, 3.0);
 
                 // Echo R multiplier: high self-echo → heavily distrust trend
@@ -769,22 +808,30 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Assume normalized volumes: total = 1, then buy = (1 + imb) / 2
             let buy_volume = (1.0 + flow_imb) / 2.0;
             let sell_volume = 1.0 - buy_volume;
-            self.tier1.pre_fill_classifier.update_trade_flow(buy_volume, sell_volume);
+            self.tier1
+                .pre_fill_classifier
+                .update_trade_flow(buy_volume, sell_volume);
 
             // Regime update: use HMM confidence and changepoint probability from beliefs
             let hmm_confidence = belief_snapshot.regime.confidence;
             // Use prob_5 as a smoothed changepoint indicator (recent window)
             let changepoint_prob = belief_snapshot.changepoint.prob_5;
-            self.tier1.pre_fill_classifier.update_regime(hmm_confidence, changepoint_prob);
+            self.tier1
+                .pre_fill_classifier
+                .update_regime(hmm_confidence, changepoint_prob);
 
             // Funding rate update
             let funding_rate_8h = self.tier2.funding.current_rate();
-            self.tier1.pre_fill_classifier.update_funding(funding_rate_8h);
+            self.tier1
+                .pre_fill_classifier
+                .update_funding(funding_rate_8h);
 
             // Trend signal update: feed 5-min EWMA momentum to classifier
             // Kyle (1985) drift conditioning — fills against strong trends are more toxic
             if trend_signal.is_warmed_up {
-                self.tier1.pre_fill_classifier.update_trend(trend_signal.long_momentum_bps);
+                self.tier1
+                    .pre_fill_classifier
+                    .update_trend(trend_signal.long_momentum_bps);
             }
 
             // Enhanced microstructure classifier blend: inject 10-feature toxicity
@@ -794,7 +841,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let enhanced_bid = self.tier1.enhanced_classifier.predict_toxicity(true);
             let enhanced_ask = self.tier1.enhanced_classifier.predict_toxicity(false);
             let enhanced_avg = (enhanced_bid + enhanced_ask) / 2.0;
-            self.tier1.pre_fill_classifier.set_blended_toxicity(enhanced_avg);
+            self.tier1
+                .pre_fill_classifier
+                .set_blended_toxicity(enhanced_avg);
             // 30% weight to enhanced classifier, 70% to internal 6-signal classifier
             self.tier1.pre_fill_classifier.set_blend_weight(0.3);
         }
@@ -805,7 +854,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let ofi_1s = self.stochastic.trade_flow_tracker.imbalance_at_1s();
         let ofi_5s = self.stochastic.trade_flow_tracker.imbalance_at_5s();
         self.tier1.pre_fill_classifier.update_ofi(ofi_1s);
-        let current_toxicity_regime = self.tier1.pre_fill_classifier.toxicity_regime(ofi_1s, ofi_5s);
+        let current_toxicity_regime = self
+            .tier1
+            .pre_fill_classifier
+            .toxicity_regime(ofi_1s, ofi_5s);
 
         let sources = ParameterSources {
             estimator: &self.estimator,
@@ -933,23 +985,29 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let (z_sweep, r_sweep) = self.tier1.sweep_detector.drift_observation(now_ms)
+            let (z_sweep, r_sweep) = self
+                .tier1
+                .sweep_detector
+                .drift_observation(now_ms)
                 .unwrap_or((0.0, 100.0)); // High R = no observation effect
 
             // Combine into single composite: precision-weighted average
             // z_composite = Σ(z_i / R_i) / Σ(1/R_i), R_composite = 1 / Σ(1/R_i)
             let signals: [(f64, f64); 4] = [
-                (z_bim, r_bim), (z_dbim, r_dbim), (z_bpg, r_bpg), (z_sweep, r_sweep),
+                (z_bim, r_bim),
+                (z_dbim, r_dbim),
+                (z_bpg, r_bpg),
+                (z_sweep, r_sweep),
             ];
             let precision_sum: f64 = signals.iter().map(|(_, r)| 1.0 / r.max(1e-6)).sum();
             if precision_sum > 1e-10 {
-                let z_composite: f64 = signals.iter()
-                    .map(|(z, r)| z / r.max(1e-6))
-                    .sum::<f64>() / precision_sum;
+                let z_composite: f64 =
+                    signals.iter().map(|(z, r)| z / r.max(1e-6)).sum::<f64>() / precision_sum;
                 let r_composite = 1.0 / precision_sum;
 
                 // Single Kalman update per cycle — P shrinks once, not 4 times
-                self.drift_estimator.update_single_observation(z_composite, r_composite);
+                self.drift_estimator
+                    .update_single_observation(z_composite, r_composite);
             }
         }
 
@@ -1035,8 +1093,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.config.spread_profile.profile_min_half_spread_bps();
 
         // === Fix 3: Wire ghost liquidity gamma mult from kappa orchestrator ===
-        market_params.ghost_liquidity_gamma_mult =
-            self.estimator.kappa_orchestrator().ghost_liquidity_gamma_mult();
+        market_params.ghost_liquidity_gamma_mult = self
+            .estimator
+            .kappa_orchestrator()
+            .ghost_liquidity_gamma_mult();
 
         // === Construct FeatureSnapshot for downstream models ===
         // Compact projection of market state for toxicity classification,
@@ -1059,21 +1119,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // with ~0.2 confidence still starts more aggressively than cold-start.
         let warmup_size_mult = {
             let fill_count = self.tier1.adverse_selection.fills_measured();
-            let warmup_gamma_discount = crate::market_maker::calibration::gate::warmup_spread_discount(fill_count);
-            let warmup_sz = crate::market_maker::calibration::gate::warmup_size_multiplier(fill_count);
+            let warmup_gamma_discount =
+                crate::market_maker::calibration::gate::warmup_spread_discount(fill_count);
+            let warmup_sz =
+                crate::market_maker::calibration::gate::warmup_size_multiplier(fill_count);
 
             // Blend fill-count warmup with prior confidence (take the better of the two).
             let prior_conf = self.prior_confidence;
             let (effective_gamma, effective_sz) = if prior_conf > 0.0 {
                 use crate::market_maker::calibration::gate::{
-                    spread_multiplier_from_confidence, size_multiplier_from_confidence,
+                    size_multiplier_from_confidence, spread_multiplier_from_confidence,
                 };
                 // Prior confidence gives a spread multiplier (>= 1.0).
                 // Convert to gamma discount: gamma_discount = 1/spread_mult.
                 let prior_gamma = 1.0 / spread_multiplier_from_confidence(prior_conf);
                 let prior_sz = size_multiplier_from_confidence(prior_conf);
                 // Take the LESS conservative of fill-based and prior-based
-                (warmup_gamma_discount.max(prior_gamma), warmup_sz.max(prior_sz))
+                (
+                    warmup_gamma_discount.max(prior_gamma),
+                    warmup_sz.max(prior_sz),
+                )
             } else {
                 (warmup_gamma_discount, warmup_sz)
             };
@@ -1094,9 +1159,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             #[allow(clippy::manual_is_multiple_of)]
             if fill_count > 0 && fill_count % 10 == 0 {
                 use crate::market_maker::calibration::gate::{
-                    ConvergenceSnapshot,
-                    spread_multiplier_from_confidence as spread_mult_fn,
                     size_multiplier_from_confidence as size_mult_fn,
+                    spread_multiplier_from_confidence as spread_mult_fn, ConvergenceSnapshot,
                 };
                 let snapshot = ConvergenceSnapshot {
                     fill_count,
@@ -1105,7 +1169,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     spread_multiplier: spread_mult_fn(prior_conf),
                     size_multiplier: size_mult_fn(prior_conf),
                     cumulative_pnl_bps: self.tier2.pnl_tracker.summary(anticipated_mid).total_pnl
-                        / anticipated_mid.max(1e-9) * 10_000.0,
+                        / anticipated_mid.max(1e-9)
+                        * 10_000.0,
                     mean_realized_edge_bps: self.tier2.edge_tracker.mean_gross_edge(),
                     has_prior: prior_conf > 0.0,
                     prior_source_mode: self.prior_source_mode.clone(),
@@ -1140,18 +1205,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let book_depth_velocity = 0.0; // TODO: wire from book depth changes
             let oi_velocity = 0.0; // TODO: wire from OI changes
             let momentum_normalized = (market_params.momentum_bps / 10.0).clamp(-1.0, 1.0);
-            
+
             let bocpd_features = [
                 funding_magnitude,
                 book_depth_velocity,
                 oi_velocity,
                 momentum_normalized,
             ];
-            
+
             // Get BOCPD prediction and state
             let p_new_regime = self.stochastic.bocpd_kappa.p_new_regime();
             let bocpd_warmed = self.stochastic.bocpd_kappa.is_warmed_up();
-            
+
             // If BOCPD detects new regime, reduce kappa confidence
             // This causes wider spreads when relationships are unstable
             if bocpd_warmed && p_new_regime > 0.3 {
@@ -1159,7 +1224,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let kappa_discount = 1.0 - (p_new_regime * 0.5); // Max 50% reduction
                 let old_kappa = market_params.kappa;
                 market_params.kappa *= kappa_discount;
-                
+
                 debug!(
                     p_new_regime = %format!("{:.3}", p_new_regime),
                     kappa_discount = %format!("{:.2}", kappa_discount),
@@ -1169,7 +1234,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     "BOCPD: Kappa relationship unstable, widening spreads"
                 );
             }
-            
+
             // Store features for BOCPD update after fill (in fill handler)
             // This allows us to update BOCPD with realized kappa from actual fills
             self.stochastic.bocpd_kappa_features = Some(bocpd_features);
@@ -1181,7 +1246,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         if belief_snapshot.drift_vol.sigma_skewness > 0.5 {
             let skew = belief_snapshot.drift_vol.sigma_skewness;
             let tail_risk = belief_snapshot.drift_vol.tail_risk_score();
-            
+
             // Adjust spread widening based on skewness
             // High positive skewness = risk of upward vol spike
             if tail_risk > 0.3 {
@@ -1208,7 +1273,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let effective_bias_bps = raw_bias_bps * confidence;
 
             // Log every 20 observations or when bias is meaningful
-            if effective_bias_bps.abs() > 0.1 || belief_snapshot.drift_vol.n_observations.is_multiple_of(20) {
+            if effective_bias_bps.abs() > 0.1
+                || belief_snapshot.drift_vol.n_observations.is_multiple_of(20)
+            {
                 info!(
                     raw_belief_bias_bps = %format!("{:.2}", raw_bias_bps),
                     effective_bias_bps = %format!("{:.2}", effective_bias_bps),
@@ -1305,17 +1372,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 + 0.2 * trend_signal.long_momentum_bps;
 
             // Decide position action using the engine
-            let position_action = self.stochastic.position_decision.decide(
-                &super::super::PositionDecisionInput {
-                    position,
-                    max_position,
-                    belief_drift,
-                    belief_confidence,
-                    edge_bps,
-                    trend_momentum_bps,
-                    unrealized_pnl_bps: market_params.unrealized_pnl_bps,
-                },
-            );
+            let position_action =
+                self.stochastic
+                    .position_decision
+                    .decide(&super::super::PositionDecisionInput {
+                        position,
+                        max_position,
+                        belief_drift,
+                        belief_confidence,
+                        edge_bps,
+                        trend_momentum_bps,
+                        unrealized_pnl_bps: market_params.unrealized_pnl_bps,
+                    });
 
             // Compute raw inventory ratio
             let raw_inventory_ratio = if max_position > 1e-9 {
@@ -1325,7 +1393,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             };
 
             // Transform inventory_ratio based on position action
-            let effective_inventory_ratio = action_to_inventory_ratio(position_action, raw_inventory_ratio);
+            let effective_inventory_ratio =
+                action_to_inventory_ratio(position_action, raw_inventory_ratio);
 
             // Update market_params with position continuation values
             market_params.position_action = position_action;
@@ -1508,16 +1577,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Blend cross-asset skew into combined_skew_bps (additive, confidence-gated)
             // Regime-dependent clamp: cross-asset signal is most valuable during cascades
             if cross_signal.confidence > 0.3 {
-                let cross_asset_skew_bps = cross_signal.expected_move_bps
-                    * cross_signal.confidence
-                    * 0.5; // 50% weight — conservative blending
+                let cross_asset_skew_bps =
+                    cross_signal.expected_move_bps * cross_signal.confidence * 0.5; // 50% weight — conservative blending
                 let cross_asset_clamp = match self.stochastic.regime_state.regime {
                     crate::market_maker::strategy::regime_state::MarketRegime::Calm
                     | crate::market_maker::strategy::regime_state::MarketRegime::Normal => 3.0,
                     crate::market_maker::strategy::regime_state::MarketRegime::Volatile => 5.0,
                     crate::market_maker::strategy::regime_state::MarketRegime::Extreme => 6.0,
                 };
-                signals.combined_skew_bps += cross_asset_skew_bps.clamp(-cross_asset_clamp, cross_asset_clamp);
+                signals.combined_skew_bps +=
+                    cross_asset_skew_bps.clamp(-cross_asset_clamp, cross_asset_clamp);
             }
 
             // OI-based vol multiplier flows into additive risk premium
@@ -1560,7 +1629,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Cancel-race excess AS → additive risk premium (Sprint 6.3)
         // If fills arriving after cancel requests show higher AS than normal fills,
         // widen spreads by the excess amount to compensate for cancel-race toxicity.
-        self.cancel_race_tracker.update_momentum(signals.combined_skew_bps);
+        self.cancel_race_tracker
+            .update_momentum(signals.combined_skew_bps);
         let cancel_race_excess = self.cancel_race_tracker.excess_race_as_bps();
         if cancel_race_excess > 0.5 {
             // Direct additive: excess AS bps → risk premium, capped at 5 bps
@@ -1604,7 +1674,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 if lag_ms < 0 && confidence > 0.3 {
                     // Negative lag = signal leads target
                     // Amplify momentum signal by confidence (fallback mode)
-                    market_params.lead_lag_signal_bps = market_params.momentum_bps * confidence * 0.5;
+                    market_params.lead_lag_signal_bps =
+                        market_params.momentum_bps * confidence * 0.5;
                     // Fallback drift = same as skew (no separate uncapped source)
                     market_params.drift_signal_bps = market_params.lead_lag_signal_bps;
 
@@ -1643,9 +1714,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // Add cross-venue skew to lead-lag signal (directional boost from agreement)
             // Scale by agreement: high agreement = strong signal, disagreement = muted
-            let cv_skew_contribution = signals.cross_venue_skew
-                * signals.cross_venue_confidence
-                * 5.0; // Convert [-1,1] direction to bps (max ±5 bps contribution)
+            let cv_skew_contribution =
+                signals.cross_venue_skew * signals.cross_venue_confidence * 5.0; // Convert [-1,1] direction to bps (max ±5 bps contribution)
 
             if signals.cross_venue_agreement > 0.5 {
                 // Venues agree - boost directional signal
@@ -1730,11 +1800,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let toxicity_input = ToxicityInput {
             vpin: {
                 let v = signals.hl_vpin;
-                if v > 0.0 && v <= 1.0 { Some(v) } else { None }
+                if v > 0.0 && v <= 1.0 {
+                    Some(v)
+                } else {
+                    None
+                }
             },
             vpin_velocity: {
                 let v = signals.hl_vpin_velocity;
-                if v.is_finite() { Some(v) } else { None }
+                if v.is_finite() {
+                    Some(v)
+                } else {
+                    None
+                }
             },
             p_informed: signals.p_informed,
             trend_long_bps: if trend_signal.is_warmed_up {
@@ -1855,9 +1933,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Default ladder has 25 levels - this constant is used for sizing only
         const DEFAULT_NUM_LEVELS: usize = 25;
         market_params.compute_derived_target_liquidity(
-            self.config.risk_aversion, // User preference (γ)
-            DEFAULT_NUM_LEVELS,        // Ladder config (default 25 levels)
-            MIN_ORDER_NOTIONAL,        // Exchange minimum ($10)
+            self.config.risk_aversion,    // User preference (γ)
+            DEFAULT_NUM_LEVELS,           // Ladder config (default 25 levels)
+            MIN_ORDER_NOTIONAL,           // Exchange minimum ($10)
             self.config.target_liquidity, // Fix 6: config target for geometric blend
         );
 
@@ -1888,18 +1966,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             if let Some(raw_kelly) = self.learning.kelly_recommendation() {
                 // Scale: full Kelly of 0.25 → mult 1.0, Kelly of 0.05 → mult 0.2
                 // Floor at 0.1 to always keep some market presence
-                (raw_kelly / self.stochastic.stochastic_config.kelly_fraction)
-                    .clamp(0.1, 1.0)
+                (raw_kelly / self.stochastic.stochastic_config.kelly_fraction).clamp(0.1, 1.0)
             } else {
                 1.0 // Not warmed up yet
             }
         } else {
             1.0
         };
-        let new_effective = margin_effective
-            .min(self.config.max_position)
-            * regime_fraction
-            * kelly_position_mult;
+        let new_effective =
+            margin_effective.min(self.config.max_position) * regime_fraction * kelly_position_mult;
         if (new_effective - self.effective_max_position).abs() > 0.001 {
             debug!(
                 old = %format!("{:.6}", self.effective_max_position),
@@ -1933,12 +2008,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Adjusts max position based on realized P&L (earn the right to size up)
         let performance_fraction = if self.stochastic.stochastic_config.enable_performance_gating {
             // Update performance gating with current state
-            self.stochastic.performance_gating.update_reference_price(self.latest_mid);
-            self.stochastic.performance_gating.update_base_max_position(ramped_max_position);
+            self.stochastic
+                .performance_gating
+                .update_reference_price(self.latest_mid);
+            self.stochastic
+                .performance_gating
+                .update_base_max_position(ramped_max_position);
 
             // Get realized P&L from tracker
             let realized_pnl = self.tier2.pnl_tracker.summary(self.latest_mid).realized_pnl;
-            self.stochastic.performance_gating.capacity_fraction(realized_pnl)
+            self.stochastic
+                .performance_gating
+                .capacity_fraction(realized_pnl)
         } else {
             1.0 // Disabled: full capacity
         };
@@ -1948,7 +2029,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Scale quote size by model confidence
         let confidence_size_mult = if self.stochastic.stochastic_config.enable_confidence_sizing {
             // Build aggregate confidence from component confidences
-            let (vol_ticks, min_vol_ticks, trade_obs, min_trades) = self.estimator.warmup_progress();
+            let (vol_ticks, min_vol_ticks, trade_obs, min_trades) =
+                self.estimator.warmup_progress();
             let warmup_progress = if min_vol_ticks > 0 && min_trades > 0 {
                 let vol_progress = (vol_ticks as f64 / min_vol_ticks as f64).min(1.0);
                 let trade_progress = (trade_obs as f64 / min_trades as f64).min(1.0);
@@ -1959,7 +2041,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             let kappa_confidence = self.estimator.kappa_confidence();
             let vol_confidence = if market_params.sigma > 0.0 { 0.8 } else { 0.3 }; // Vol estimate confidence
-            let as_confidence = if self.tier1.adverse_selection.is_warmed_up() { 0.7 } else { 0.3 };
+            let as_confidence = if self.tier1.adverse_selection.is_warmed_up() {
+                0.7
+            } else {
+                0.3
+            };
             let momentum_confidence = p_continuation; // Use momentum continuation probability
 
             let aggregate_confidence = crate::market_maker::learning::AggregateConfidence::new(
@@ -2000,7 +2086,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         // No-signal safety mode: reduce position limits when no cross-venue feed available
-        let signal_limit_mult = self.stochastic.signal_integrator.signal_position_limit_mult();
+        let signal_limit_mult = self
+            .stochastic
+            .signal_integrator
+            .signal_position_limit_mult();
         if signal_limit_mult < 1.0 {
             self.effective_max_position *= signal_limit_mult;
             tracing::debug!(
@@ -2034,16 +2123,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Fix 6: GLFT-derived liquidity is already geometrically blended
             // with config target in market_params derivation. No double-cap here.
             // Config is INPUT to geometric blend, not a post-cap.
-            (market_params
-                .derived_target_liquidity
-                * combined_size_mult)  // Scale by controller trust + warmup
+            (market_params.derived_target_liquidity * combined_size_mult) // Scale by controller trust + warmup
                 .max(min_viable_liquidity) // Exchange minimum
                 .min(self.effective_max_position) // Position limit
         } else {
             // Fallback: use config (warmup or zero account_value)
-            (self.config
-                .target_liquidity
-                * combined_size_mult)  // Scale by controller trust + warmup
+            (self.config.target_liquidity * combined_size_mult) // Scale by controller trust + warmup
                 .max(min_viable_liquidity)
                 .min(self.effective_max_position)
         };
@@ -2183,7 +2268,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Get changepoint info from centralized belief snapshot
             // PHASE 4: Now using centralized belief snapshot instead of scattered reads
             let cp_prob_5 = belief_snapshot.changepoint.prob_5;
-            let cp_detected = belief_snapshot.changepoint.result != crate::market_maker::belief::ChangepointResult::None;
+            let cp_detected = belief_snapshot.changepoint.result
+                != crate::market_maker::belief::ChangepointResult::None;
 
             let signal_snapshot = SignalSnapshot {
                 timestamp_ms: now.timestamp_millis(),
@@ -2332,9 +2418,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         };
 
         // Apply decision sizing AND proactive confidence to effective target liquidity
-        let decision_adjusted_liquidity = self.effective_target_liquidity
-            * decision_size_fraction
-            * proactive_size_mult;
+        let decision_adjusted_liquidity =
+            self.effective_target_liquidity * decision_size_fraction * proactive_size_mult;
 
         // === KELLY CRITERION SIZING ===
         // Kelly is applied once to effective_max_position (line ~1540) which governs
@@ -2504,7 +2589,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let enhanced_flow_result = self.stochastic.enhanced_flow.compute(&enhanced_flow_ctx);
         let enhanced_flow = enhanced_flow_result.enhanced_flow;
         // Update kappa EMA for future computations
-        self.stochastic.enhanced_flow.update_kappa(market_params.kappa);
+        self.stochastic
+            .enhanced_flow
+            .update_kappa(market_params.kappa);
 
         // Log enhanced flow diagnostics when depth or momentum contribute
         // This helps verify the L2/trade wiring is working
@@ -2527,21 +2614,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === Phase 3: Compute MC EV for kappa-driven override ===
         // Only compute when IR not calibrated and kappa is strong
-        let _mc_ev_bps = if market_params.kappa > 1500.0 && !self.stochastic.calibrated_edge.is_useful() {
-            let mc_result = self.stochastic.mc_simulator.simulate_ev(
-                market_params.kappa,
-                enhanced_flow,
-                market_params.market_spread_bps.max(1.0),
-                1.0, // 1 second horizon
-            );
-            Some(mc_result.expected_ev_bps)
-        } else {
-            None
-        };
+        let _mc_ev_bps =
+            if market_params.kappa > 1500.0 && !self.stochastic.calibrated_edge.is_useful() {
+                let mc_result = self.stochastic.mc_simulator.simulate_ev(
+                    market_params.kappa,
+                    enhanced_flow,
+                    market_params.market_spread_bps.max(1.0),
+                    1.0, // 1 second horizon
+                );
+                Some(mc_result.expected_ev_bps)
+            } else {
+                None
+            };
 
         // Kappa-driven spread cap removed — circular with GLFT (which already uses kappa).
         // GLFT delta = (1/gamma) * ln(1 + gamma/kappa) is the self-consistent spread.
-        self.stochastic.kappa_spread.update_avg_kappa(market_params.kappa);
+        self.stochastic
+            .kappa_spread
+            .update_avg_kappa(market_params.kappa);
 
         // === Phase 8: Contextual Bandit Spread Selection ===
         // Replaces RL MDP with contextual bandit (i.i.d. rewards, correct statistics).
@@ -2558,7 +2648,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Select arm via Thompson Sampling (cold start defaults to mult=1.0 = pure GLFT)
         let bandit_selection = self.stochastic.spread_bandit.select_arm(bandit_context);
-        market_params.bandit_spread_additive_bps = (bandit_selection.multiplier - 1.0) * market_params.market_spread_bps;
+        market_params.bandit_spread_additive_bps =
+            (bandit_selection.multiplier - 1.0) * market_params.market_spread_bps;
         market_params.bandit_is_exploration = bandit_selection.is_exploration;
 
         // Legacy RL fields — kept at defaults for backward-compatible logging
@@ -2591,11 +2682,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             } else {
                 0.0
             };
-            Some(self.learning.output(
-                &market_params,
-                self.position.position(),
-                current_drawdown,
-            ))
+            Some(
+                self.learning
+                    .output(&market_params, self.position.position(), current_drawdown),
+            )
         } else {
             None
         };
@@ -2632,7 +2722,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Log L2 wiring status periodically (every 100 cycles or when p_positive is significant)
         if let Some(l2_p) = l2_p_positive {
-            if (l2_p - 0.5).abs() > 0.05 || self.learning.pending_predictions_count().is_multiple_of(100) {
+            if (l2_p - 0.5).abs() > 0.05
+                || self
+                    .learning
+                    .pending_predictions_count()
+                    .is_multiple_of(100)
+            {
                 debug!(
                     l2_p_positive_edge = %format!("{:.3}", l2_p),
                     l2_model_health = %format!("{:.2}", l2_health_score),
@@ -2649,7 +2744,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             belief_snapshot.changepoint.prob_5
         } else {
             // Log during warmup so we can verify the fix is working
-            if belief_snapshot.changepoint.observation_count.is_multiple_of(10)
+            if belief_snapshot
+                .changepoint
+                .observation_count
+                .is_multiple_of(10)
                 || belief_snapshot.changepoint.observation_count < 5
             {
                 debug!(
@@ -2670,7 +2768,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This naturally widens spreads as quota depletes, reducing order churn.
         {
             let headroom = market_params.rate_limit_headroom_pct;
-            let shadow_bps = self.stochastic.quota_shadow.continuous_shadow_spread_bps(headroom);
+            let shadow_bps = self
+                .stochastic
+                .quota_shadow
+                .continuous_shadow_spread_bps(headroom);
             market_params.quota_shadow_spread_bps = shadow_bps;
             if shadow_bps > 1.0 {
                 tracing::info!(
@@ -2736,7 +2837,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let fills = self.tier1.adverse_selection.fills_measured() as f64;
 
             // Phase 1: Book-based progress (from estimator's volume ticks)
-            let (vol_ticks, min_vol_ticks, _trade_obs, _min_trades) = self.estimator.warmup_progress();
+            let (vol_ticks, min_vol_ticks, _trade_obs, _min_trades) =
+                self.estimator.warmup_progress();
             let book_progress = if min_vol_ticks > 0 {
                 (vol_ticks as f64 / min_vol_ticks as f64).min(1.0)
             } else {
@@ -2785,7 +2887,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         if !capacity_budget.should_quote() {
-            if let Viability::NotViable { ref reason, min_capital_needed_usd } = capacity_budget.viability {
+            if let Viability::NotViable {
+                ref reason,
+                min_capital_needed_usd,
+            } = capacity_budget.viability
+            {
                 // Throttle log to avoid spam: log on first occurrence then every ~30s
                 // (using seconds-based check since there's no cycle counter on MarketMaker)
                 let now_sec = chrono::Utc::now().timestamp();
@@ -2806,7 +2912,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // When data sources go stale, widen spreads proportionally instead of just logging.
         // This converts staleness from a warning into an automatic defensive response.
         {
-            let book_age_ms = self.infra.connection_health.time_since_last_data().as_millis() as u64;
+            let book_age_ms = self
+                .infra
+                .connection_health
+                .time_since_last_data()
+                .as_millis() as u64;
             let exchange_limits_age_ms = self.infra.exchange_limits.age_ms();
             let stale_mult = compute_staleness_spread_penalty(book_age_ms, exchange_limits_age_ms);
 
@@ -2845,10 +2955,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Compute options-theoretic volatility floor (σ × √τ × √(2/π) × safety_mult)
         // Using expected holding time 1/kappa as tau, consistent with GLFT.
         let tau_for_floor = 1.0 / market_params.kappa.max(100.0);
-        market_params.option_floor_bps = self.option_floor.compute_floor_bps(
-            market_params.sigma_effective,
-            tau_for_floor,
-        );
+        market_params.option_floor_bps = self
+            .option_floor
+            .compute_floor_bps(market_params.sigma_effective, tau_for_floor);
 
         // Self-impact: additive spread widening based on our book dominance.
         // Coefficient × fraction² (square-root impact law).
@@ -2856,8 +2965,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === KEPT INFRASTRUCTURE ADDONS (not protection) ===
         // Fill cascade tracker per-side addons (still useful for echo detection).
-        market_params.cascade_bid_addon_bps =
-            self.fill_cascade_tracker.spread_addon_bps(Side::Buy);
+        market_params.cascade_bid_addon_bps = self.fill_cascade_tracker.spread_addon_bps(Side::Buy);
         market_params.cascade_ask_addon_bps =
             self.fill_cascade_tracker.spread_addon_bps(Side::Sell);
 
@@ -2873,7 +2981,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             &quote_config,
             self.position.position(),
             self.effective_max_position, // First-principles limit
-            kelly_adjusted_liquidity, // Decision + Kelly-adjusted viable size
+            kelly_adjusted_liquidity,    // Decision + Kelly-adjusted viable size
             &market_params,
         );
 
@@ -2911,7 +3019,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let mid = quote_config.mid_price;
 
         if market_params.pre_fill_toxicity_bid > TOXICITY_WIDEN_THRESHOLD
-            && self.last_toxicity_cancel_bid
+            && self
+                .last_toxicity_cancel_bid
                 .is_none_or(|t| now.duration_since(t) > TOXICITY_WIDEN_COOLDOWN)
         {
             let widen_price = TOXICITY_EXTREME_WIDEN_BPS * mid / 10_000.0;
@@ -2927,7 +3036,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
         }
         if market_params.pre_fill_toxicity_ask > TOXICITY_WIDEN_THRESHOLD
-            && self.last_toxicity_cancel_ask
+            && self
+                .last_toxicity_cancel_ask
                 .is_none_or(|t| now.duration_since(t) > TOXICITY_WIDEN_COOLDOWN)
         {
             let widen_price = TOXICITY_EXTREME_WIDEN_BPS * mid / 10_000.0;
@@ -2975,7 +3085,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // not BBO half-spread. With $100 HYPE, BBO spread ≈ 4 bps → half = 2 bps,
             // but QueueValue(2.0, Normal, 0.0) = 2 - 3 - 0 - 1.5 = -2.5 → false.
             // At GLFT depth (5 bps): QueueValue(5.0, Normal, 0.0) = 5 - 3 - 0 - 1.5 = 0.5 → true.
-            let evaluation_depth_bps = capacity_budget.min_viable_depth_bps
+            let evaluation_depth_bps = capacity_budget
+                .min_viable_depth_bps
                 .max(feature_snapshot.spread_bps / 2.0);
             let input = ModeSelectionInput {
                 position_zone: position_assessment.zone,
@@ -3109,7 +3220,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Regime-dependent clearing threshold: use max_position_fraction
                 // from blended regime params. Extreme regime clears at 50%,
                 // Normal at 80%, Calm at 90%. Clamped to [0.40, 0.90] for safety.
-                let regime_clear_threshold = self.stochastic.regime_state.params
+                let regime_clear_threshold = self
+                    .stochastic
+                    .regime_state
+                    .params
                     .max_position_fraction
                     .clamp(0.40, 0.90);
 
@@ -3142,7 +3256,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 } else {
                     // Moderate position or near-zero: size reduction preserves two-sided quoting.
                     // WS4: sigma_cascade_mult removed. γ(q) handles continuous risk aversion.
-                    let size_mult = if position_ratio.abs() > 0.01 { 0.5 } else { 0.3 };
+                    let size_mult = if position_ratio.abs() > 0.01 {
+                        0.5
+                    } else {
+                        0.3
+                    };
                     viable.bids.reduce_sizes(size_mult, &vq);
                     viable.asks.reduce_sizes(size_mult, &vq);
                     info!(
@@ -3293,8 +3411,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Only track best level (most likely to fill) to keep overhead minimal.
             // Done BEFORE finalize() so tracking uses pre-widening prices.
             {
-                use crate::market_maker::learning::quote_outcome::{CompactMarketState, PendingQuote};
-                use crate::market_maker::{EPnLParams, expected_pnl_bps_enhanced};
+                use crate::market_maker::learning::quote_outcome::{
+                    CompactMarketState, PendingQuote,
+                };
+                use crate::market_maker::{expected_pnl_bps_enhanced, EPnLParams};
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -3485,7 +3605,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 &quote_config,
                 self.position.position(),
                 self.effective_max_position, // First-principles limit
-                kelly_adjusted_liquidity, // Decision + Kelly-adjusted viable size
+                kelly_adjusted_liquidity,    // Decision + Kelly-adjusted viable size
                 &market_params,
             );
 
@@ -3497,9 +3617,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         bid = None;
                         ask = None;
                     }
-                    ExecutionMode::Maker { bid: bid_ok, ask: ask_ok } => {
-                        if !bid_ok { bid = None; }
-                        if !ask_ok { ask = None; }
+                    ExecutionMode::Maker {
+                        bid: bid_ok,
+                        ask: ask_ok,
+                    } => {
+                        if !bid_ok {
+                            bid = None;
+                        }
+                        if !ask_ok {
+                            ask = None;
+                        }
                     }
                     ExecutionMode::InventoryReduce { urgency } => {
                         let pos = self.position.position();
@@ -3583,8 +3710,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Underwater position protection - prevents forcing sales at a loss
                 unrealized_pnl,
             };
-            let reduce_only_result =
-                quoting::QuoteFilter::apply_reduce_only_single(&mut bid, &mut ask, &reduce_only_config);
+            let reduce_only_result = quoting::QuoteFilter::apply_reduce_only_single(
+                &mut bid,
+                &mut ask,
+                &reduce_only_config,
+            );
             diag_reduce_only = reduce_only_result.was_filtered;
 
             // Close bias REMOVED (2026-02-23): Avellaneda-Stoikov reservation price
@@ -3732,10 +3862,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     }
 
     /// WS7: Build and log estimator diagnostics.
-    fn log_estimator_diagnostics(
-        &self,
-        market_params: &super::super::strategy::MarketParams,
-    ) {
+    fn log_estimator_diagnostics(&self, market_params: &super::super::strategy::MarketParams) {
         let drift_mean_bps = self.drift_estimator.drift_bps_per_sec();
         let drift_uncertainty = self.drift_estimator.drift_uncertainty_bps();
         let fill_autocorr = self.drift_estimator.fill_quote_autocorrelation();
@@ -3769,7 +3896,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // GM/Arrow-Pratt diagnostics from AS estimator
         let gm_spread_adj_bps = self.tier1.adverse_selection.spread_adjustment_bps();
         let p_informed = self.tier1.adverse_selection.predicted_alpha();
-        let variance_premium_bps = self.tier1.adverse_selection.as_variance_risk_premium_bps(market_params.adaptive_gamma);
+        let variance_premium_bps = self
+            .tier1
+            .adverse_selection
+            .as_variance_risk_premium_bps(market_params.adaptive_gamma);
         let gmm_signal = self.tier1.adverse_selection.has_gmm_signal();
 
         // Q18: Vol sampling bias diagnostics
@@ -3939,9 +4069,7 @@ fn compute_continuous_inventory_pressure(
     let inv = ((inventory_frac - 0.3) / 0.7).clamp(0.0, 1.0);
 
     // Momentum component: normalized by our spread (momentum relative to our exposure)
-    let mom = (momentum_abs_bps / quoted_half_spread_bps.max(1.0))
-        .clamp(0.0, 3.0)
-        / 3.0;
+    let mom = (momentum_abs_bps / quoted_half_spread_bps.max(1.0)).clamp(0.0, 3.0) / 3.0;
 
     // Product: both conditions must be present. sqrt smooths the surface.
     (inv * mom).sqrt().clamp(0.0, 1.0)
@@ -4003,7 +4131,10 @@ fn compute_tick_size_bps(mid_price: f64) -> f64 {
 /// at pressure=1 all sizes go to zero and are removed. This replaces the discrete
 /// tier system (halve / keep-one / clear) that caused death spirals.
 #[cfg(test)]
-fn apply_inventory_pressure(pressure: f64, increasing_quotes: &mut Vec<crate::market_maker::config::Quote>) {
+fn apply_inventory_pressure(
+    pressure: f64,
+    increasing_quotes: &mut Vec<crate::market_maker::config::Quote>,
+) {
     if pressure < 0.01 {
         return;
     }
@@ -4080,8 +4211,14 @@ mod tests {
         // Should be near-zero at low inventory, significant at high
         let p_low = compute_continuous_inventory_pressure(true, 0.1, momentum, spread);
         let p_high = compute_continuous_inventory_pressure(true, 0.9, momentum, spread);
-        assert!(p_low < 0.1, "Low inventory should yield low pressure, got {p_low}");
-        assert!(p_high > 0.3, "High inventory should yield high pressure, got {p_high}");
+        assert!(
+            p_low < 0.1,
+            "Low inventory should yield low pressure, got {p_low}"
+        );
+        assert!(
+            p_high > 0.3,
+            "High inventory should yield high pressure, got {p_high}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -4164,7 +4301,11 @@ mod tests {
             Quote::new(98.0, 3.0),
         ];
         apply_inventory_pressure(0.4, &mut quotes);
-        assert_eq!(quotes.len(), 3, "All levels should remain at moderate pressure");
+        assert_eq!(
+            quotes.len(),
+            3,
+            "All levels should remain at moderate pressure"
+        );
         assert!((quotes[0].size - 0.6).abs() < 1e-10, "Size should be * 0.6");
         assert!((quotes[1].size - 1.2).abs() < 1e-10, "Size should be * 0.6");
         assert!((quotes[2].size - 1.8).abs() < 1e-10, "Size should be * 0.6");
@@ -4175,10 +4316,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn test_apply_inventory_pressure_full_clears() {
-        let mut quotes = vec![
-            Quote::new(100.0, 1.0),
-            Quote::new(99.0, 2.0),
-        ];
+        let mut quotes = vec![Quote::new(100.0, 1.0), Quote::new(99.0, 2.0)];
         apply_inventory_pressure(1.0, &mut quotes);
         assert!(quotes.is_empty(), "Pressure=1.0 should clear all quotes");
     }
@@ -4245,10 +4383,19 @@ mod tests {
         // Long position: position=5.0, max=10.0
         apply_risk_emergency_filter(&mut bids, &mut asks, 5.0, 10.0);
 
-        assert!(bids.is_empty(), "Bids (increasing) should be cleared when long");
+        assert!(
+            bids.is_empty(),
+            "Bids (increasing) should be cleared when long"
+        );
         assert_eq!(asks.len(), 2, "Asks (reducing) should be preserved");
-        assert!((asks[0].size - 0.5).abs() < 1e-10, "Ask size should be halved");
-        assert!((asks[1].size - 1.0).abs() < 1e-10, "Ask size should be halved");
+        assert!(
+            (asks[0].size - 0.5).abs() < 1e-10,
+            "Ask size should be halved"
+        );
+        assert!(
+            (asks[1].size - 1.0).abs() < 1e-10,
+            "Ask size should be halved"
+        );
     }
 
     #[test]
@@ -4258,10 +4405,19 @@ mod tests {
         // Short position: position=-5.0, max=10.0
         apply_risk_emergency_filter(&mut bids, &mut asks, -5.0, 10.0);
 
-        assert!(asks.is_empty(), "Asks (increasing) should be cleared when short");
+        assert!(
+            asks.is_empty(),
+            "Asks (increasing) should be cleared when short"
+        );
         assert_eq!(bids.len(), 2, "Bids (reducing) should be preserved");
-        assert!((bids[0].size - 0.5).abs() < 1e-10, "Bid size should be halved");
-        assert!((bids[1].size - 1.0).abs() < 1e-10, "Bid size should be halved");
+        assert!(
+            (bids[0].size - 0.5).abs() < 1e-10,
+            "Bid size should be halved"
+        );
+        assert!(
+            (bids[1].size - 1.0).abs() < 1e-10,
+            "Bid size should be halved"
+        );
     }
 
     #[test]
@@ -4288,7 +4444,10 @@ mod tests {
 
         // position_ratio = 12/3 = 4.0 > 0.01 -> long path
         assert!(bids.is_empty(), "Bids cleared");
-        assert!(!asks.is_empty(), "Asks (reducing) MUST survive emergency pull");
+        assert!(
+            !asks.is_empty(),
+            "Asks (reducing) MUST survive emergency pull"
+        );
         assert!(asks[0].size > 0.0, "Reducing side must have positive size");
     }
 
@@ -4301,7 +4460,10 @@ mod tests {
         // HYPE @ $31: 5 sig figs → 3 decimal places → tick = $0.001
         // tick_bps = 0.001 / 31 * 10000 ≈ 0.323 bps
         let tick = compute_tick_size_bps(31.0);
-        assert!(tick > 0.3 && tick < 0.35, "HYPE tick_bps={tick}, expected ~0.32");
+        assert!(
+            tick > 0.3 && tick < 0.35,
+            "HYPE tick_bps={tick}, expected ~0.32"
+        );
     }
 
     #[test]
@@ -4309,7 +4471,10 @@ mod tests {
         // ETH @ $3000: 5 sig figs → 1 decimal place → tick = $0.1
         // tick_bps = 0.1 / 3000 * 10000 ≈ 0.333 bps
         let tick = compute_tick_size_bps(3000.0);
-        assert!(tick > 0.3 && tick < 0.4, "ETH tick_bps={tick}, expected ~0.33");
+        assert!(
+            tick > 0.3 && tick < 0.4,
+            "ETH tick_bps={tick}, expected ~0.33"
+        );
     }
 
     #[test]
@@ -4317,7 +4482,10 @@ mod tests {
         // BTC @ $97000: 5 sig figs → 0 decimal places → tick = $1.0
         // tick_bps = 1.0 / 97000 * 10000 ≈ 0.103 bps
         let tick = compute_tick_size_bps(97000.0);
-        assert!(tick > 0.09 && tick < 0.15, "BTC tick_bps={tick}, expected ~0.10");
+        assert!(
+            tick > 0.09 && tick < 0.15,
+            "BTC tick_bps={tick}, expected ~0.10"
+        );
     }
 
     #[test]
@@ -4325,7 +4493,10 @@ mod tests {
         // SOL @ $200: 5 sig figs → 2 decimal places → tick = $0.01
         // tick_bps = 0.01 / 200 * 10000 = 0.5 bps
         let tick = compute_tick_size_bps(200.0);
-        assert!((tick - 0.5).abs() < 0.05, "SOL tick_bps={tick}, expected 0.5");
+        assert!(
+            (tick - 0.5).abs() < 0.05,
+            "SOL tick_bps={tick}, expected 0.5"
+        );
     }
 
     #[test]
@@ -4410,7 +4581,10 @@ mod tests {
         let mid = compute_anticipated_mid(100.0, drift, 50.0);
         // Expected shift: 0.001 * 0.05 = 0.00005 → mid * 1.00005 = 100.005
         assert!(mid > 100.0, "Positive drift should shift mid up: {mid}");
-        assert!((mid - 100.005).abs() < 0.001, "Expected ~100.005, got {mid}");
+        assert!(
+            (mid - 100.005).abs() < 0.001,
+            "Expected ~100.005, got {mid}"
+        );
     }
 
     #[test]

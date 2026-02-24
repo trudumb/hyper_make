@@ -185,7 +185,10 @@ mod tests {
         let t = tracker.get("kappa").unwrap();
         // EWMA with decay=0.995 starting at 0.95 converges toward 1.0;
         // after 200 observations: ~0.982
-        assert!(t.coverage() > 0.97, "Coverage should be near 1.0 with all hits");
+        assert!(
+            t.coverage() > 0.97,
+            "Coverage should be near 1.0 with all hits"
+        );
         assert!(t.raw_coverage() == 1.0);
         assert!(!t.is_overconfident());
     }
@@ -284,10 +287,7 @@ mod tests {
         let b = tracker.get("model_b").unwrap();
 
         assert!(a.is_overconfident(), "Model A should be overconfident");
-        assert!(
-            !b.is_overconfident(),
-            "Model B should not be overconfident"
-        );
+        assert!(!b.is_overconfident(), "Model B should not be overconfident");
         assert!(
             !b.is_underconfident(),
             "Model B should not be underconfident"

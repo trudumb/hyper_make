@@ -206,6 +206,7 @@ pub fn cleanup_orders(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::market_maker::adverse_selection::{EnhancedASClassifier, PreFillASClassifier};
     use crate::market_maker::config::MetricsRecorder;
     use crate::market_maker::control::{PositionPnLTracker, StochasticController};
     use crate::market_maker::fills::FillSignalStore;
@@ -214,7 +215,6 @@ mod tests {
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EstimatorConfig,
         ParameterEstimator, PnLConfig, PnLTracker, PositionTracker, PrometheusMetrics, QueueConfig,
     };
-    use crate::market_maker::adverse_selection::{EnhancedASClassifier, PreFillASClassifier};
     use std::sync::Arc;
 
     #[test]

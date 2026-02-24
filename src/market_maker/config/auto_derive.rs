@@ -122,10 +122,8 @@ pub fn auto_derive(
     // - max_from_capital: how much the user's capital_usd can support at leverage
     // - max_from_margin: how much the account's available_margin can support
     // safety_factor (0.5) provides a 2x buffer for adverse price moves.
-    let max_from_capital =
-        (capital_usd * ctx.max_leverage * safety_factor) / ctx.mark_px;
-    let max_from_margin =
-        (ctx.available_margin * ctx.max_leverage * safety_factor) / ctx.mark_px;
+    let max_from_capital = (capital_usd * ctx.max_leverage * safety_factor) / ctx.mark_px;
+    let max_from_margin = (ctx.available_margin * ctx.max_leverage * safety_factor) / ctx.mark_px;
     let max_position = max_from_capital.min(max_from_margin).max(0.0);
 
     // === MINIMUM ORDER: from exchange min notional with safety margin ===
@@ -244,16 +242,23 @@ mod tests {
         // max_from_capital = 50*3*0.5/20 = 3.75
         // max_from_margin  = 100*3*0.5/20 = 7.5
         // max_position = min(3.75, 7.5) = 3.75
-        assert!((d.max_position - 3.75).abs() < 0.01, "max_pos={}", d.max_position);
+        assert!(
+            (d.max_position - 3.75).abs() < 0.01,
+            "max_pos={}",
+            d.max_position
+        );
         assert!(d.viable, "Should be viable with $50 for HYPE at $20");
         assert!(d.diagnostic.is_none());
 
         // target_liquidity = max(3.75 * 0.30, min_order * 5) = max(1.125, 2.875)
         // min_order = (10 * 1.15) / 20 = 0.575
         // 0.575 * 5 = 2.875 > 1.125, so target_liquidity = 2.875
-        assert!(d.target_liquidity <= d.max_position + 0.01,
+        assert!(
+            d.target_liquidity <= d.max_position + 0.01,
             "target_liquidity ({}) should not exceed max_position ({})",
-            d.target_liquidity, d.max_position);
+            d.target_liquidity,
+            d.max_position
+        );
 
         // Hip3 gamma
         assert!((d.risk_aversion - 0.15).abs() < 0.01);
@@ -269,7 +274,11 @@ mod tests {
         // max_from_capital = 10000*50*0.5/100000 = 2.5
         // max_from_margin  = 50000*50*0.5/100000 = 12.5
         // max_position = min(2.5, 12.5) = 2.5
-        assert!((d.max_position - 2.5).abs() < 0.001, "max_pos={}", d.max_position);
+        assert!(
+            (d.max_position - 2.5).abs() < 0.001,
+            "max_pos={}",
+            d.max_position
+        );
         assert!(d.viable);
 
         // Default gamma
@@ -321,10 +330,18 @@ mod tests {
         // Default: 37.5 * 0.20 = 7.5
         // Hip3: 37.5 * 0.30 = 11.25
         // Aggressive: 37.5 * 0.40 = 15.0
-        assert!(d_aggressive.target_liquidity > d_hip3.target_liquidity,
-            "aggressive {} > hip3 {}", d_aggressive.target_liquidity, d_hip3.target_liquidity);
-        assert!(d_hip3.target_liquidity > d_default.target_liquidity,
-            "hip3 {} > default {}", d_hip3.target_liquidity, d_default.target_liquidity);
+        assert!(
+            d_aggressive.target_liquidity > d_hip3.target_liquidity,
+            "aggressive {} > hip3 {}",
+            d_aggressive.target_liquidity,
+            d_hip3.target_liquidity
+        );
+        assert!(
+            d_hip3.target_liquidity > d_default.target_liquidity,
+            "hip3 {} > default {}",
+            d_hip3.target_liquidity,
+            d_default.target_liquidity
+        );
     }
 
     #[test]
@@ -344,7 +361,11 @@ mod tests {
         // max_from_capital = 1000*3*0.5/20 = 75
         // max_from_margin  = 10*3*0.5/20 = 0.75
         // max_position = min(75, 0.75) = 0.75 (margin is the binding constraint)
-        assert!((d.max_position - 0.75).abs() < 0.01, "max_pos={}", d.max_position);
+        assert!(
+            (d.max_position - 0.75).abs() < 0.01,
+            "max_pos={}",
+            d.max_position
+        );
     }
 
     #[test]
@@ -399,8 +420,13 @@ mod tests {
         // min_viable_notional = 10 * 1.15 = 11.5
         // viable_levels = floor(12.5 / 11.5) = 1
         let d = auto_derive(5.0, SpreadProfile::Hip3, &ctx);
-        assert_eq!(d.capital_profile.tier, CapitalTier::Micro,
-            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert_eq!(
+            d.capital_profile.tier,
+            CapitalTier::Micro,
+            "tier={:?} levels={}",
+            d.capital_profile.tier,
+            d.capital_profile.viable_levels_per_side
+        );
         assert_eq!(d.capital_profile.viable_levels_per_side, 1);
         assert!(d.viable);
     }
@@ -412,8 +438,13 @@ mod tests {
         // notional_per_side = 1.667 * 30 / 2 = 25.0
         // viable_levels = floor(25.0 / 11.5) = 2
         let d = auto_derive(10.0, SpreadProfile::Hip3, &ctx);
-        assert_eq!(d.capital_profile.tier, CapitalTier::Micro,
-            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert_eq!(
+            d.capital_profile.tier,
+            CapitalTier::Micro,
+            "tier={:?} levels={}",
+            d.capital_profile.tier,
+            d.capital_profile.viable_levels_per_side
+        );
         assert_eq!(d.capital_profile.viable_levels_per_side, 2);
     }
 
@@ -424,8 +455,13 @@ mod tests {
         // notional_per_side = 3.333 * 30 / 2 = 50.0
         // viable_levels = floor(50.0 / 11.5) = 4
         let d = auto_derive(20.0, SpreadProfile::Hip3, &ctx);
-        assert_eq!(d.capital_profile.tier, CapitalTier::Small,
-            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert_eq!(
+            d.capital_profile.tier,
+            CapitalTier::Small,
+            "tier={:?} levels={}",
+            d.capital_profile.tier,
+            d.capital_profile.viable_levels_per_side
+        );
         assert_eq!(d.capital_profile.viable_levels_per_side, 4);
     }
 
@@ -436,8 +472,13 @@ mod tests {
         // notional_per_side = 8.333 * 30 / 2 = 125.0
         // viable_levels = floor(125.0 / 11.5) = 10
         let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
-        assert_eq!(d.capital_profile.tier, CapitalTier::Medium,
-            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert_eq!(
+            d.capital_profile.tier,
+            CapitalTier::Medium,
+            "tier={:?} levels={}",
+            d.capital_profile.tier,
+            d.capital_profile.viable_levels_per_side
+        );
         assert_eq!(d.capital_profile.viable_levels_per_side, 10);
     }
 
@@ -448,8 +489,13 @@ mod tests {
         // notional_per_side = 16.667 * 30 / 2 = 250.0
         // viable_levels = floor(250.0 / 11.5) = 21
         let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
-        assert_eq!(d.capital_profile.tier, CapitalTier::Large,
-            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert_eq!(
+            d.capital_profile.tier,
+            CapitalTier::Large,
+            "tier={:?} levels={}",
+            d.capital_profile.tier,
+            d.capital_profile.viable_levels_per_side
+        );
         assert!(d.capital_profile.viable_levels_per_side >= 16);
     }
 
@@ -459,8 +505,12 @@ mod tests {
         let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
         // min_viable_position = (10 * 1.15) / 30 = 0.383 (independent of leverage)
         let expected = (10.0 * 1.15) / 30.0;
-        assert!((d.capital_profile.min_viable_position - expected).abs() < 0.001,
-            "min_viable={}, expected={}", d.capital_profile.min_viable_position, expected);
+        assert!(
+            (d.capital_profile.min_viable_position - expected).abs() < 0.001,
+            "min_viable={}, expected={}",
+            d.capital_profile.min_viable_position,
+            expected
+        );
     }
 
     #[test]
@@ -507,10 +557,22 @@ mod tests {
         // max_from_capital = 100*10*0.5/29.63 = 16.87
         // max_from_margin  = 100*10*0.5/29.63 = 16.87 (same when capital == margin)
         let expected = (100.0 * 10.0 * 0.5) / 29.63;
-        assert!((d.max_position - expected).abs() < 0.01,
-            "max_pos={} expected={}", d.max_position, expected);
-        assert!(d.max_position > 15.0, "Should have >15 HYPE max position with leverage");
-        assert_eq!(d.capital_profile.tier, CapitalTier::Large,
-            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert!(
+            (d.max_position - expected).abs() < 0.01,
+            "max_pos={} expected={}",
+            d.max_position,
+            expected
+        );
+        assert!(
+            d.max_position > 15.0,
+            "Should have >15 HYPE max position with leverage"
+        );
+        assert_eq!(
+            d.capital_profile.tier,
+            CapitalTier::Large,
+            "tier={:?} levels={}",
+            d.capital_profile.tier,
+            d.capital_profile.viable_levels_per_side
+        );
     }
 }

@@ -17,8 +17,8 @@
 use std::collections::{HashMap, VecDeque};
 use tracing::debug;
 
-use serde::{Deserialize, Serialize};
 use super::baseline_tracker::BaselineTracker;
+use serde::{Deserialize, Serialize};
 
 /// RL agent Q-table entry for checkpoint persistence (deprecated — local to rl_agent).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1061,11 +1061,20 @@ impl Reward {
     pub fn compute(
         config: &RewardConfig,
         realized_edge_bps: f64,
-        inventory_risk: f64,  // |position| / max_position (current)
+        inventory_risk: f64, // |position| / max_position (current)
         vol_ratio: f64,
-        prev_inventory_risk: f64,  // |prev_position| / max_position
+        prev_inventory_risk: f64, // |prev_position| / max_position
     ) -> Self {
-        Self::compute_with_drift(config, realized_edge_bps, inventory_risk, vol_ratio, prev_inventory_risk, 0.0, 0.0, 0.0)
+        Self::compute_with_drift(
+            config,
+            realized_edge_bps,
+            inventory_risk,
+            vol_ratio,
+            prev_inventory_risk,
+            0.0,
+            0.0,
+            0.0,
+        )
     }
 
     /// Compute reward with drift opposition penalty.
@@ -1077,18 +1086,17 @@ impl Reward {
     pub fn compute_with_drift(
         config: &RewardConfig,
         realized_edge_bps: f64,
-        inventory_risk: f64,  // |position| / max_position (current)
+        inventory_risk: f64, // |position| / max_position (current)
         vol_ratio: f64,
-        prev_inventory_risk: f64,  // |prev_position| / max_position
-        position: f64,  // signed inventory
+        prev_inventory_risk: f64, // |prev_position| / max_position
+        position: f64,            // signed inventory
         momentum_bps: f64,
         drift_penalty_weight: f64,
     ) -> Self {
         let edge_component = config.edge_weight * realized_edge_bps;
 
         // Quadratic inventory penalty (penalizes level)
-        let inventory_penalty =
-            -config.inventory_penalty_weight * inventory_risk.powi(2) * 10.0;
+        let inventory_penalty = -config.inventory_penalty_weight * inventory_risk.powi(2) * 10.0;
 
         // Volatility penalty (penalize holding in high vol)
         let vol_penalty_factor = (vol_ratio - 1.0).max(0.0);
@@ -1110,8 +1118,11 @@ impl Reward {
             0.0
         };
 
-        let total = edge_component + inventory_penalty + volatility_penalty
-            + inventory_change_penalty + drift_penalty;
+        let total = edge_component
+            + inventory_penalty
+            + volatility_penalty
+            + inventory_change_penalty
+            + drift_penalty;
 
         Self {
             total,
@@ -1157,10 +1168,10 @@ impl BayesianQValue {
     pub fn new() -> Self {
         Self {
             mu_0: 0.0,
-            kappa_0: 0.01,  // Weak prior on mean
+            kappa_0: 0.01, // Weak prior on mean
             mu_n: 0.0,
             kappa_n: 0.01,
-            alpha: 1.0,     // Weak prior on precision
+            alpha: 1.0, // Weak prior on precision
             beta: 1.0,
             n: 0,
         }
@@ -1189,8 +1200,7 @@ impl BayesianQValue {
 
         // Update Gamma parameters
         let alpha_new = self.alpha + 0.5;
-        let beta_new = self.beta
-            + 0.5 * (reward - self.mu_n).powi(2) * self.kappa_n / kappa_new;
+        let beta_new = self.beta + 0.5 * (reward - self.mu_n).powi(2) * self.kappa_n / kappa_new;
 
         self.mu_n = mu_new;
         self.kappa_n = kappa_new;
@@ -1273,7 +1283,7 @@ impl BayesianQValue {
     /// so that learning continues from where it left off.
     pub fn from_checkpoint(mu_n: f64, kappa_n: f64, alpha: f64, beta: f64, n: u64) -> Self {
         Self {
-            mu_0: mu_n,    // Use posterior as prior for continued learning
+            mu_0: mu_n, // Use posterior as prior for continued learning
             kappa_0: kappa_n,
             mu_n,
             kappa_n,
@@ -1480,9 +1490,9 @@ impl QLearningAgent {
 
     /// Get Q-values for a state index (initialize if needed).
     fn get_q_values_by_idx(&mut self, state_idx: usize) -> &mut Vec<BayesianQValue> {
-        self.q_table.entry(state_idx).or_insert_with(|| {
-            vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT]
-        })
+        self.q_table
+            .entry(state_idx)
+            .or_insert_with(|| vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT])
     }
 
     /// Select action index using the configured exploration strategy.
@@ -1540,24 +1550,20 @@ impl QLearningAgent {
         }
 
         let action_idx = match exploration {
-            ExplorationStrategy::ThompsonSampling => {
-                q_values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, q)| (i, q.sample()))
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            }
-            ExplorationStrategy::UCB => {
-                q_values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, q)| (i, q.ucb(ucb_c)))
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            }
+            ExplorationStrategy::ThompsonSampling => q_values
+                .iter()
+                .enumerate()
+                .map(|(i, q)| (i, q.sample()))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(0),
+            ExplorationStrategy::UCB => q_values
+                .iter()
+                .enumerate()
+                .map(|(i, q)| (i, q.ucb(ucb_c)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(0),
             ExplorationStrategy::EpsilonGreedy { epsilon, decay } => {
                 let effective_epsilon = epsilon * decay.powf(episodes as f64);
                 if sample_uniform() < effective_epsilon {
@@ -1592,12 +1598,10 @@ impl QLearningAgent {
                     let high = (center as f64 + action_bound_sigma).round().min(4.0) as usize;
                     idx.clamp(low, high)
                 };
-                let clamped_gamma = GammaAction::from_index(
-                    clamp(selected.gamma.index(), neutral.gamma.index()),
-                );
-                let clamped_omega = OmegaAction::from_index(
-                    clamp(selected.omega.index(), neutral.omega.index()),
-                );
+                let clamped_gamma =
+                    GammaAction::from_index(clamp(selected.gamma.index(), neutral.gamma.index()));
+                let clamped_omega =
+                    OmegaAction::from_index(clamp(selected.omega.index(), neutral.omega.index()));
                 return ParameterAction::new(clamped_gamma, clamped_omega).to_index();
             }
         }
@@ -1673,7 +1677,13 @@ impl QLearningAgent {
         next_state: MDPState,
         done: bool,
     ) {
-        self.update_idx(state.to_index(), action.to_index(), reward, next_state.to_index(), done);
+        self.update_idx(
+            state.to_index(),
+            action.to_index(),
+            reward,
+            next_state.to_index(),
+            done,
+        );
     }
 
     /// Record start of a new episode.
@@ -1760,7 +1770,8 @@ impl QLearningAgent {
             self.pending_state_actions.pop_front();
             self.pending_inventory_risks.pop_front();
         }
-        self.pending_state_actions.push_back((state_idx, action_idx));
+        self.pending_state_actions
+            .push_back((state_idx, action_idx));
         // Default to 0.0; callers should use push_state_action_with_risk for accurate prev_inventory_risk
         self.pending_inventory_risks.push_back(0.0);
     }
@@ -1780,7 +1791,8 @@ impl QLearningAgent {
             self.pending_state_actions.pop_front();
             self.pending_inventory_risks.pop_front();
         }
-        self.pending_state_actions.push_back((state_idx, action_idx));
+        self.pending_state_actions
+            .push_back((state_idx, action_idx));
         self.pending_inventory_risks.push_back(inventory_risk);
     }
 
@@ -1897,7 +1909,11 @@ impl QLearningAgent {
             episodes: self.episodes,
             total_reward: self.total_reward,
             total_observations,
-            action_space_version: if self.config.use_parameter_actions { 2 } else { 1 },
+            action_space_version: if self.config.use_parameter_actions {
+                2
+            } else {
+                1
+            },
             use_compact_state: self.config.use_compact_state,
             reward_config_hash: self.config.reward_config.config_hash(),
             use_drift_bucket: self.config.use_drift_bucket,
@@ -1907,7 +1923,11 @@ impl QLearningAgent {
     /// Restore Q-table and agent state from checkpoint.
     pub fn restore_from_checkpoint(&mut self, ckpt: &RLCheckpoint) {
         // Check action space version compatibility
-        let expected_version = if self.config.use_parameter_actions { 2 } else { 1 };
+        let expected_version = if self.config.use_parameter_actions {
+            2
+        } else {
+            1
+        };
         if ckpt.action_space_version != 0 && ckpt.action_space_version != expected_version {
             debug!(
                 checkpoint_version = ckpt.action_space_version,
@@ -2071,11 +2091,7 @@ impl RLPolicyRecommendation {
     /// Always uses Thompson sampling (explore=true) per P1-1. The `explore`
     /// parameter is kept for API compat but ignored — Thompson sampling
     /// self-regulates exploration via posterior width.
-    pub fn from_agent(
-        agent: &mut QLearningAgent,
-        state_idx: StateIndex,
-        _explore: bool,
-    ) -> Self {
+    pub fn from_agent(agent: &mut QLearningAgent, state_idx: StateIndex, _explore: bool) -> Self {
         // Always explore via Thompson sampling (P1-1)
         let action_idx = agent.select_action_idx(state_idx);
         let stats = agent.get_q_stats_idx(state_idx);
@@ -2160,8 +2176,8 @@ fn sample_gamma(alpha: f64, beta: f64) -> f64 {
 
 /// Sample from uniform distribution [0, 1).
 fn sample_uniform() -> f64 {
-    use rand::Rng;
     use rand::rngs::SmallRng;
+    use rand::Rng;
     use rand::SeedableRng;
 
     thread_local! {
@@ -2215,10 +2231,7 @@ mod tests {
 
     #[test]
     fn test_imbalance_bucket_from_imbalance() {
-        assert_eq!(
-            ImbalanceBucket::from_imbalance(-0.5),
-            ImbalanceBucket::Sell
-        );
+        assert_eq!(ImbalanceBucket::from_imbalance(-0.5), ImbalanceBucket::Sell);
         assert_eq!(
             ImbalanceBucket::from_imbalance(-0.25),
             ImbalanceBucket::Sell
@@ -2227,14 +2240,8 @@ mod tests {
             ImbalanceBucket::from_imbalance(0.0),
             ImbalanceBucket::Neutral
         );
-        assert_eq!(
-            ImbalanceBucket::from_imbalance(0.25),
-            ImbalanceBucket::Buy
-        );
-        assert_eq!(
-            ImbalanceBucket::from_imbalance(0.5),
-            ImbalanceBucket::Buy
-        );
+        assert_eq!(ImbalanceBucket::from_imbalance(0.25), ImbalanceBucket::Buy);
+        assert_eq!(ImbalanceBucket::from_imbalance(0.5), ImbalanceBucket::Buy);
     }
 
     #[test]
@@ -2343,8 +2350,10 @@ mod tests {
         assert!(reward.edge_component < 0.0);
         // No separate adverse penalty — AS cost is embedded in realized_edge_bps
         // Total should be edge + inventory penalty + vol penalty + inv change
-        let expected = reward.edge_component + reward.inventory_penalty
-            + reward.volatility_penalty + reward.inventory_change_penalty;
+        let expected = reward.edge_component
+            + reward.inventory_penalty
+            + reward.volatility_penalty
+            + reward.inventory_change_penalty;
         assert!((reward.total - expected).abs() < 1e-10);
     }
 
@@ -2367,13 +2376,18 @@ mod tests {
         let reward_inflated = Reward::compute(&config, realized_edge_without_as, 0.3, 1.0, 0.3);
 
         // The correct reward (with AS) should be lower than the inflated one
-        assert!(reward_correct.total < reward_inflated.total,
+        assert!(
+            reward_correct.total < reward_inflated.total,
             "Reward with AS subtracted ({:.4}) should be less than without ({:.4})",
-            reward_correct.total, reward_inflated.total);
+            reward_correct.total,
+            reward_inflated.total
+        );
 
         // With AS, the edge is still positive (1.5 bps)
-        assert!(reward_correct.edge_component > 0.0,
-            "Edge should be positive when depth > AS + fee");
+        assert!(
+            reward_correct.edge_component > 0.0,
+            "Edge should be positive when depth > AS + fee"
+        );
     }
 
     #[test]
@@ -2388,8 +2402,10 @@ mod tests {
         let realized_edge = depth_bps - as_realized_bps - fee_bps; // -4.5
 
         let reward = Reward::compute(&config, realized_edge, 0.3, 1.0, 0.3);
-        assert!(reward.edge_component < 0.0,
-            "Edge should be negative when AS > depth + fee");
+        assert!(
+            reward.edge_component < 0.0,
+            "Edge should be negative when AS > depth + fee"
+        );
     }
 
     #[test]
@@ -2400,8 +2416,10 @@ mod tests {
         // Inventory stayed at 50% → no change penalty
         let reward_stable = Reward::compute(&config, 1.0, 0.5, 1.0, 0.5);
 
-        assert!(reward_increase.inventory_change_penalty < reward_stable.inventory_change_penalty,
-            "Increasing inventory should be penalized more than stable inventory");
+        assert!(
+            reward_increase.inventory_change_penalty < reward_stable.inventory_change_penalty,
+            "Increasing inventory should be penalized more than stable inventory"
+        );
     }
 
     #[test]
@@ -2574,8 +2592,14 @@ mod tests {
     #[test]
     fn test_parameter_action_defensive() {
         let defensive = ParameterAction::defensive();
-        assert!(defensive.gamma_multiplier() > 1.0, "Defensive should have higher γ");
-        assert!(defensive.omega_multiplier() > 1.0, "Defensive should have higher skew");
+        assert!(
+            defensive.gamma_multiplier() > 1.0,
+            "Defensive should have higher γ"
+        );
+        assert!(
+            defensive.omega_multiplier() > 1.0,
+            "Defensive should have higher skew"
+        );
     }
 
     #[test]
@@ -2583,7 +2607,8 @@ mod tests {
         for idx in 0..MDPStateCompact::STATE_COUNT {
             let state = MDPStateCompact::from_index(idx);
             assert_eq!(
-                state.to_index(), idx,
+                state.to_index(),
+                idx,
                 "Compact state round-trip failed for index {idx}"
             );
         }
@@ -2627,7 +2652,10 @@ mod tests {
         // Cold state should receive the paper prior
         let q_vals = agent.get_q_values_by_idx(state_idx);
         // The paper prior should be applied — mu_n should reflect paper's posterior mean
-        assert!(q_vals[5].mean() > 0.5, "Cold state should get paper prior mean");
+        assert!(
+            q_vals[5].mean() > 0.5,
+            "Cold state should get paper prior mean"
+        );
         // n should be 0 (discounted prior, no real observations)
         assert_eq!(q_vals[5].count(), 0, "Discounted prior should have n=0");
     }
@@ -2663,7 +2691,11 @@ mod tests {
         agent.import_q_table_as_prior(&paper_q, 0.3);
 
         let q_vals = agent.get_q_values_by_idx(state_idx);
-        assert_eq!(q_vals[3].count(), live_count_before, "Live count must be preserved");
+        assert_eq!(
+            q_vals[3].count(),
+            live_count_before,
+            "Live count must be preserved"
+        );
         assert!(
             (q_vals[3].mean() - live_mean_before).abs() < 1e-10,
             "Live mean must be preserved"
@@ -2743,7 +2775,11 @@ mod tests {
         );
         // Action 7 (cold) should get paper prior
         let q7 = &agent.get_q_values_by_idx(state_idx)[7];
-        assert_eq!(q7.count(), 0, "Cold action should get discounted prior (n=0)");
+        assert_eq!(
+            q7.count(),
+            0,
+            "Cold action should get discounted prior (n=0)"
+        );
         assert!(q7.mean() > 1.0, "Cold action should have paper mean");
     }
 
@@ -2760,10 +2796,7 @@ mod tests {
             auto_disable_after_fills: 100,
             ..Default::default()
         };
-        let mut agent = QLearningAgent::with_sim_to_real(
-            QLearningConfig::default(),
-            sim_config,
-        );
+        let mut agent = QLearningAgent::with_sim_to_real(QLearningConfig::default(), sim_config);
         let state_idx = MDPStateCompact::default().to_index();
         let neutral_idx = ParameterAction::neutral().to_index();
 
@@ -2788,9 +2821,12 @@ mod tests {
             ..Default::default()
         };
         let config = QLearningConfig {
-            min_observations: 0, // allow immediate exploitation
+            min_observations: 0,       // allow immediate exploitation
             min_exploration_rate: 0.0, // no random exploration
-            exploration: ExplorationStrategy::EpsilonGreedy { epsilon: 0.0, decay: 1.0 },
+            exploration: ExplorationStrategy::EpsilonGreedy {
+                epsilon: 0.0,
+                decay: 1.0,
+            },
             use_parameter_actions: true,
             ..Default::default()
         };
@@ -2799,10 +2835,8 @@ mod tests {
 
         // Make action at index for VeryAggressive gamma (idx=4) + MinimalSkew omega (idx=4)
         // extremely attractive so the agent wants to pick it
-        let extreme_action_idx = ParameterAction::new(
-            GammaAction::VeryAggressive,
-            OmegaAction::MinimalSkew,
-        ).to_index();
+        let extreme_action_idx =
+            ParameterAction::new(GammaAction::VeryAggressive, OmegaAction::MinimalSkew).to_index();
         // Need some observations first
         for _ in 0..50 {
             let reward = Reward {
@@ -2844,10 +2878,7 @@ mod tests {
             auto_disable_after_fills: 5,
             ..Default::default()
         };
-        let mut agent = QLearningAgent::with_sim_to_real(
-            QLearningConfig::default(),
-            sim_config,
-        );
+        let mut agent = QLearningAgent::with_sim_to_real(QLearningConfig::default(), sim_config);
         let state_idx = 0usize;
         let neutral_idx = ParameterAction::neutral().to_index();
 
@@ -2861,7 +2892,13 @@ mod tests {
                 inventory_change_penalty: 0.0,
                 drift_penalty: 0.0,
             };
-            agent.update_idx(state_idx, i % UNIFIED_ACTION_COUNT, reward, state_idx, false);
+            agent.update_idx(
+                state_idx,
+                i % UNIFIED_ACTION_COUNT,
+                reward,
+                state_idx,
+                false,
+            );
         }
 
         // total_updates > 5 and mean_reward < 0 => should return neutral
@@ -2885,7 +2922,10 @@ mod tests {
         let config = QLearningConfig {
             min_observations: 0,
             min_exploration_rate: 0.0,
-            exploration: ExplorationStrategy::EpsilonGreedy { epsilon: 0.0, decay: 1.0 },
+            exploration: ExplorationStrategy::EpsilonGreedy {
+                epsilon: 0.0,
+                decay: 1.0,
+            },
             ..Default::default()
         };
         let mut agent = QLearningAgent::with_sim_to_real(config, sim_config);
@@ -2912,8 +2952,14 @@ mod tests {
         let action = agent.select_action_idx(state_idx);
         let neutral_action = ParameterAction::neutral().to_index();
         // The agent should be able to pick action 0 (not forced to neutral=12)
-        assert_ne!(action, neutral_action, "Agent should NOT be forced to neutral after sufficient positive fills");
-        assert_eq!(action, 0, "Agent should exploit best action after sufficient fills");
+        assert_ne!(
+            action, neutral_action,
+            "Agent should NOT be forced to neutral after sufficient positive fills"
+        );
+        assert_eq!(
+            action, 0,
+            "Agent should exploit best action after sufficient fills"
+        );
     }
 
     #[test]
@@ -2929,7 +2975,10 @@ mod tests {
         let config = QLearningConfig {
             min_observations: 0,
             min_exploration_rate: 0.0,
-            exploration: ExplorationStrategy::EpsilonGreedy { epsilon: 0.0, decay: 1.0 },
+            exploration: ExplorationStrategy::EpsilonGreedy {
+                epsilon: 0.0,
+                decay: 1.0,
+            },
             ..Default::default()
         };
         let mut agent = QLearningAgent::with_sim_to_real(config, sim_config);
@@ -2971,10 +3020,7 @@ mod tests {
             auto_disable_threshold_bps: -1.5,
             ..Default::default()
         };
-        let mut agent = QLearningAgent::with_sim_to_real(
-            QLearningConfig::default(),
-            sim_config,
-        );
+        let mut agent = QLearningAgent::with_sim_to_real(QLearningConfig::default(), sim_config);
         let state_idx = 0usize;
         let neutral_idx = ParameterAction::neutral().to_index();
 
@@ -2988,7 +3034,13 @@ mod tests {
                 inventory_change_penalty: 0.0,
                 drift_penalty: 0.0,
             };
-            agent.update_idx(state_idx, i % UNIFIED_ACTION_COUNT, reward, state_idx, false);
+            agent.update_idx(
+                state_idx,
+                i % UNIFIED_ACTION_COUNT,
+                reward,
+                state_idx,
+                false,
+            );
         }
 
         assert!(agent.total_updates() > 5);
@@ -3087,8 +3139,14 @@ mod tests {
             excitation: ExcitationBucket::Normal,
             drift: DriftBucket::Bearish,
         };
-        let neutral = MDPState { drift: DriftBucket::Neutral, ..base };
-        let bullish = MDPState { drift: DriftBucket::Bullish, ..base };
+        let neutral = MDPState {
+            drift: DriftBucket::Neutral,
+            ..base
+        };
+        let bullish = MDPState {
+            drift: DriftBucket::Bullish,
+            ..base
+        };
 
         let idx_bear = base.to_index();
         let idx_neut = neutral.to_index();
@@ -3112,8 +3170,7 @@ mod tests {
         let config = RewardConfig::default();
         // Position is long (+5), drift is bearish (-10 bps): opposing
         let reward = Reward::compute_with_drift(
-            &config,
-            2.0,   // realized_edge_bps
+            &config, 2.0,   // realized_edge_bps
             0.5,   // inventory_risk
             1.0,   // vol_ratio
             0.5,   // prev_inventory_risk
@@ -3121,14 +3178,19 @@ mod tests {
             -10.0, // momentum_bps (bearish)
             0.3,   // drift_penalty_weight
         );
-        assert!(reward.drift_penalty < 0.0, "Drift penalty should be negative when position opposes drift");
-        // Also verify total includes the penalty
-        let reward_no_drift = Reward::compute_with_drift(
-            &config, 2.0, 0.5, 1.0, 0.5, 5.0, -10.0, 0.0,
+        assert!(
+            reward.drift_penalty < 0.0,
+            "Drift penalty should be negative when position opposes drift"
         );
-        assert!(reward.total < reward_no_drift.total,
+        // Also verify total includes the penalty
+        let reward_no_drift =
+            Reward::compute_with_drift(&config, 2.0, 0.5, 1.0, 0.5, 5.0, -10.0, 0.0);
+        assert!(
+            reward.total < reward_no_drift.total,
             "Total reward with drift penalty ({:.4}) should be less than without ({:.4})",
-            reward.total, reward_no_drift.total);
+            reward.total,
+            reward_no_drift.total
+        );
     }
 
     #[test]
@@ -3136,8 +3198,7 @@ mod tests {
         let config = RewardConfig::default();
         // Position is long (+5), drift is bullish (+10 bps): aligned
         let reward = Reward::compute_with_drift(
-            &config,
-            2.0,  // realized_edge_bps
+            &config, 2.0,  // realized_edge_bps
             0.5,  // inventory_risk
             1.0,  // vol_ratio
             0.5,  // prev_inventory_risk
@@ -3145,18 +3206,23 @@ mod tests {
             10.0, // momentum_bps (bullish)
             0.3,  // drift_penalty_weight
         );
-        assert_eq!(reward.drift_penalty, 0.0, "No drift penalty when position aligned with drift");
+        assert_eq!(
+            reward.drift_penalty, 0.0,
+            "No drift penalty when position aligned with drift"
+        );
 
         // Also test: zero momentum means no penalty
-        let reward_zero = Reward::compute_with_drift(
-            &config, 2.0, 0.5, 1.0, 0.5, 5.0, 0.0, 0.3,
+        let reward_zero = Reward::compute_with_drift(&config, 2.0, 0.5, 1.0, 0.5, 5.0, 0.0, 0.3);
+        assert_eq!(
+            reward_zero.drift_penalty, 0.0,
+            "No drift penalty when momentum is zero"
         );
-        assert_eq!(reward_zero.drift_penalty, 0.0, "No drift penalty when momentum is zero");
 
         // Also test: zero position means no penalty (position * momentum_bps = 0)
-        let reward_flat = Reward::compute_with_drift(
-            &config, 2.0, 0.0, 1.0, 0.0, 0.0, -10.0, 0.3,
+        let reward_flat = Reward::compute_with_drift(&config, 2.0, 0.0, 1.0, 0.0, 0.0, -10.0, 0.3);
+        assert_eq!(
+            reward_flat.drift_penalty, 0.0,
+            "No drift penalty when flat position"
         );
-        assert_eq!(reward_flat.drift_penalty, 0.0, "No drift penalty when flat position");
     }
 }

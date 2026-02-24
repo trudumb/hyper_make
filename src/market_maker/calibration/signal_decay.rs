@@ -65,8 +65,8 @@ pub struct SignalDecayConfig {
 impl Default for SignalDecayConfig {
     fn default() -> Self {
         Self {
-            half_life_ms: 50.0,    // 50ms default
-            floor: 0.1,           // 10% residual value
+            half_life_ms: 50.0,        // 50ms default
+            floor: 0.1,                // 10% residual value
             freshness_multiplier: 2.0, // Fresh if age < 100ms
         }
     }
@@ -322,15 +322,24 @@ impl SignalDecayTracker {
         self.configs.insert(name.to_string(), config);
         self.emissions.insert(name.to_string(), VecDeque::new());
         self.outcomes.insert(name.to_string(), VecDeque::new());
-        self.fresh_ir.insert(name.to_string(), InformationRatioTracker::new(10));
-        self.all_ir.insert(name.to_string(), InformationRatioTracker::new(10));
-        self.latency_stats.insert(name.to_string(), LatencyAccumulator::default());
+        self.fresh_ir
+            .insert(name.to_string(), InformationRatioTracker::new(10));
+        self.all_ir
+            .insert(name.to_string(), InformationRatioTracker::new(10));
+        self.latency_stats
+            .insert(name.to_string(), LatencyAccumulator::default());
     }
 
     /// Emit a signal observation.
     ///
     /// Returns the emission ID for later linking to outcomes.
-    pub fn emit(&mut self, signal_name: &str, value: f64, direction: f64, timestamp_ms: u64) -> Option<u64> {
+    pub fn emit(
+        &mut self,
+        signal_name: &str,
+        value: f64,
+        direction: f64,
+        timestamp_ms: u64,
+    ) -> Option<u64> {
         // Get or create config (use default if not registered)
         if !self.configs.contains_key(signal_name) {
             self.register_signal(signal_name, SignalDecayConfig::default());
@@ -480,8 +489,8 @@ impl SignalDecayTracker {
             return None;
         }
 
-        let mean_value: f64 = emissions.iter().map(|e| e.value.abs()).sum::<f64>()
-            / emissions.len() as f64;
+        let mean_value: f64 =
+            emissions.iter().map(|e| e.value.abs()).sum::<f64>() / emissions.len() as f64;
 
         Some(config.time_to_threshold(mean_value, threshold))
     }
@@ -489,14 +498,22 @@ impl SignalDecayTracker {
     /// Get latency statistics for a signal.
     pub fn latency_stats(&self, signal_name: &str) -> Option<LatencyStats> {
         let stats = self.latency_stats.get(signal_name)?;
-        let n_emissions = self.emissions.get(signal_name).map(|e| e.len()).unwrap_or(0);
+        let n_emissions = self
+            .emissions
+            .get(signal_name)
+            .map(|e| e.len())
+            .unwrap_or(0);
         Some(stats.stats(n_emissions))
     }
 
     /// Check if the system is latency-constrained for a signal.
     ///
     /// Returns true if our processing latency exceeds the signal's alpha duration.
-    pub fn is_latency_constrained(&self, signal_name: &str, processing_latency_ms: f64) -> Option<bool> {
+    pub fn is_latency_constrained(
+        &self,
+        signal_name: &str,
+        processing_latency_ms: f64,
+    ) -> Option<bool> {
         let config = self.configs.get(signal_name)?;
         let alpha_duration = self.alpha_duration_ms(signal_name, 0.5)?;
         Some(processing_latency_ms > alpha_duration || !config.is_fresh(processing_latency_ms))
@@ -596,7 +613,11 @@ mod tests {
 
         // At large t, should approach floor
         let value = config.decayed_value(1.0, 1000.0);
-        assert!((value - 0.2).abs() < 0.01, "Value should approach floor: {}", value);
+        assert!(
+            (value - 0.2).abs() < 0.01,
+            "Value should approach floor: {}",
+            value
+        );
     }
 
     #[test]
@@ -609,7 +630,7 @@ mod tests {
 
         assert!(config.is_fresh(0.0));
         assert!(config.is_fresh(15.0));
-        assert!(!config.is_fresh(25.0));  // > 2 * half_life
+        assert!(!config.is_fresh(25.0)); // > 2 * half_life
     }
 
     #[test]
@@ -622,11 +643,19 @@ mod tests {
 
         // Time to reach 0.5 from 1.0 should be half_life
         let t = config.time_to_threshold(1.0, 0.5);
-        assert!((t - 10.0).abs() < 1e-10, "Time to 0.5 should be half_life: {}", t);
+        assert!(
+            (t - 10.0).abs() < 1e-10,
+            "Time to 0.5 should be half_life: {}",
+            t
+        );
 
         // Time to reach 0.25 from 1.0 should be 2*half_life
         let t2 = config.time_to_threshold(1.0, 0.25);
-        assert!((t2 - 20.0).abs() < 1e-10, "Time to 0.25 should be 2*half_life: {}", t2);
+        assert!(
+            (t2 - 20.0).abs() < 1e-10,
+            "Time to 0.25 should be 2*half_life: {}",
+            t2
+        );
     }
 
     #[test]
@@ -656,18 +685,21 @@ mod tests {
         // Record outcome after 5ms
         let outcome = tracker.record_outcome("vpin", 10.0, 1005).unwrap();
         assert_eq!(outcome.delay_ms, 5);
-        assert!(outcome.was_fresh);  // 5ms < 2 * 10ms
-        assert!(outcome.direction_correct);  // direction=1.0, move=10.0 (both positive)
+        assert!(outcome.was_fresh); // 5ms < 2 * 10ms
+        assert!(outcome.direction_correct); // direction=1.0, move=10.0 (both positive)
     }
 
     #[test]
     fn test_tracker_fresh_vs_stale() {
         let mut tracker = SignalDecayTracker::new();
-        tracker.register_signal("vpin", SignalDecayConfig {
-            half_life_ms: 10.0,
-            floor: 0.1,
-            freshness_multiplier: 2.0,
-        });
+        tracker.register_signal(
+            "vpin",
+            SignalDecayConfig {
+                half_life_ms: 10.0,
+                floor: 0.1,
+                freshness_multiplier: 2.0,
+            },
+        );
 
         // Fresh emission (resolved quickly)
         tracker.emit("vpin", 0.9, 1.0, 1000);
@@ -677,7 +709,7 @@ mod tests {
         // Stale emission (resolved slowly)
         tracker.emit("vpin", 0.9, 1.0, 2000);
         let outcome2 = tracker.record_outcome("vpin", 10.0, 2050).unwrap();
-        assert!(!outcome2.was_fresh);  // 50ms > 2 * 10ms
+        assert!(!outcome2.was_fresh); // 50ms > 2 * 10ms
     }
 
     #[test]
@@ -694,7 +726,7 @@ mod tests {
         let stats = tracker.latency_stats("vpin").unwrap();
         assert!(stats.mean_latency_ms > 20.0);
         assert!(stats.mean_latency_ms < 60.0);
-        assert!(stats.fresh_ratio > 0.9);  // Most should be fresh
+        assert!(stats.fresh_ratio > 0.9); // Most should be fresh
         assert_eq!(stats.n_outcomes, 100);
     }
 
@@ -706,7 +738,7 @@ mod tests {
         // Add predictions with consistent direction correctness
         for i in 0..200 {
             let direction = if i % 3 == 0 { -1.0 } else { 1.0 };
-            let move_bps = if i % 3 == 0 { -5.0 } else { 5.0 };  // Mostly correct
+            let move_bps = if i % 3 == 0 { -5.0 } else { 5.0 }; // Mostly correct
 
             tracker.emit("vpin", 0.8, direction, i * 100);
             tracker.record_outcome("vpin", move_bps, i * 100 + 30);
@@ -723,11 +755,14 @@ mod tests {
     #[test]
     fn test_alpha_duration() {
         let mut tracker = SignalDecayTracker::new();
-        tracker.register_signal("vpin", SignalDecayConfig {
-            half_life_ms: 10.0,
-            floor: 0.0,
-            freshness_multiplier: 2.0,
-        });
+        tracker.register_signal(
+            "vpin",
+            SignalDecayConfig {
+                half_life_ms: 10.0,
+                floor: 0.0,
+                freshness_multiplier: 2.0,
+            },
+        );
 
         // Emit some signals to establish mean value
         for i in 0..10 {
@@ -736,7 +771,11 @@ mod tests {
 
         let alpha_ms = tracker.alpha_duration_ms("vpin", 0.4).unwrap();
         // Should be about 10ms (half-life) since 0.8 -> 0.4 is one half-life
-        assert!((alpha_ms - 10.0).abs() < 2.0, "Alpha duration: {}", alpha_ms);
+        assert!(
+            (alpha_ms - 10.0).abs() < 2.0,
+            "Alpha duration: {}",
+            alpha_ms
+        );
     }
 
     #[test]
@@ -760,11 +799,14 @@ mod tests {
     #[test]
     fn test_current_value() {
         let mut tracker = SignalDecayTracker::new();
-        tracker.register_signal("vpin", SignalDecayConfig {
-            half_life_ms: 10.0,
-            floor: 0.0,
-            freshness_multiplier: 2.0,
-        });
+        tracker.register_signal(
+            "vpin",
+            SignalDecayConfig {
+                half_life_ms: 10.0,
+                floor: 0.0,
+                freshness_multiplier: 2.0,
+            },
+        );
 
         tracker.emit("vpin", 1.0, 1.0, 1000);
 

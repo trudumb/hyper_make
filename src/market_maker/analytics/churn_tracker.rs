@@ -80,11 +80,7 @@ impl ChurnTracker {
         if self.window.is_empty() || cycle_interval_secs <= 0.0 {
             return 0.0;
         }
-        let total_churn: u32 = self
-            .window
-            .iter()
-            .map(|s| s.cancelled + s.placed)
-            .sum();
+        let total_churn: u32 = self.window.iter().map(|s| s.cancelled + s.placed).sum();
         let window_duration_secs = self.window.len() as f64 * cycle_interval_secs;
         total_churn as f64 / window_duration_secs * 60.0
     }

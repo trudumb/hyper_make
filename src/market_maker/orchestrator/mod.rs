@@ -11,8 +11,8 @@
 
 pub(crate) mod budget_allocator;
 pub(crate) mod diagnosis;
-mod event_loop;
 pub(crate) mod event_accumulator;
+mod event_loop;
 mod handlers;
 mod order_ops;
 mod quote_engine;

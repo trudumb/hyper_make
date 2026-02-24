@@ -466,7 +466,8 @@ impl RiskConfig {
         let gamma_raw = kappa * (exp_term - 1.0) / exp_term;
 
         // Volatility adjustment: higher vol → higher risk aversion
-        let vol_adjustment = 1.0 + (sigma / self.sigma_baseline - 1.0).max(0.0) * self.volatility_weight;
+        let vol_adjustment =
+            1.0 + (sigma / self.sigma_baseline - 1.0).max(0.0) * self.volatility_weight;
 
         // Time horizon adjustment: longer horizon → more time to offset losses
         let time_adjustment = (time_horizon / 60.0).sqrt().clamp(0.5, 2.0);
@@ -518,8 +519,8 @@ impl Default for RiskConfig {
             // MAINNET OPTIMIZED: Lower gamma for liquid markets with deep books
             gamma_base: 0.15, // Reduced from 0.3 - liquid markets need less risk aversion
             sigma_baseline: 0.0002, // 2 bps per-√second (0.02% instantaneous volatility)
-                                    // Equivalent to ~32 bps daily vol in 252-day year
-                                    // Or ~12 bps per minute for short horizons
+            // Equivalent to ~32 bps daily vol in 252-day year
+            // Or ~12 bps per minute for short horizons
             volatility_weight: 0.5,
             // MAINNET OPTIMIZED: Cap vol scaling for liquid markets
             max_volatility_multiplier: 2.0, // Reduced from 3.0 - less extreme scaling
@@ -535,9 +536,9 @@ impl Default for RiskConfig {
             // Regime risk is now routed through gamma_multiplier, not floor.
             // Floor only prevents quoting below fee (guaranteed loss).
             min_spread_floor: 0.00015, // 1.5 bps = Hyperliquid maker fee
-            max_holding_time: 120.0,  // 2 minutes
-            flow_sensitivity: 0.5,    // exp(-0.5) ≈ 0.61 at perfect alignment
-            maker_fee_rate: 0.00015,  // 1.5 bps Hyperliquid maker fee
+            max_holding_time: 120.0,   // 2 minutes
+            flow_sensitivity: 0.5,     // exp(-0.5) ≈ 0.61 at perfect alignment
+            maker_fee_rate: 0.00015,   // 1.5 bps Hyperliquid maker fee
             // Time-of-day scaling: ENABLED by default for profitability
             // Trade history showed -13 to -15 bps edge during toxic hours
             enable_time_of_day_scaling: true,

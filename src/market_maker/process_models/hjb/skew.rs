@@ -446,15 +446,12 @@ impl HJBInventoryController {
                 // Also consider medium-term for faster response
                 let med_drift = (trend.medium_momentum_bps / 10000.0) / 30.0;
                 // Confidence-weighted blend: long is anchor, medium only trusted when aligned
-                let long_confidence =
-                    (trend.long_momentum_bps.abs() / 10.0).min(1.0);
+                let long_confidence = (trend.long_momentum_bps.abs() / 10.0).min(1.0);
                 let med_confidence =
-                    (trend.medium_momentum_bps.abs() / 5.0).min(1.0)
-                        * trend.timeframe_agreement;
+                    (trend.medium_momentum_bps.abs() / 5.0).min(1.0) * trend.timeframe_agreement;
                 let total_confidence = long_confidence + med_confidence;
                 if total_confidence > 0.001 {
-                    (long_confidence * long_drift + med_confidence * med_drift)
-                        / total_confidence
+                    (long_confidence * long_drift + med_confidence * med_drift) / total_confidence
                 } else {
                     long_drift
                 }
@@ -831,7 +828,10 @@ mod tests {
         // long_drift = (-20/10000)/300 = -6.67e-6
         // med_drift = (-3/10000)/30 = -1.0e-5
         // blend = (1.0 * -6.67e-6 + 0.6 * -1.0e-5) / 1.6 = -7.92e-6
-        assert!(result.drift_urgency != 0.0, "drift urgency should be nonzero");
+        assert!(
+            result.drift_urgency != 0.0,
+            "drift urgency should be nonzero"
+        );
         assert!(result.is_opposed, "should detect opposition");
     }
 
@@ -844,8 +844,7 @@ mod tests {
 
         // Now test with zero agreement => medium ignored
         let trend_disagree = make_trend(-8.0, -10.0, 0.0);
-        let result_long_only =
-            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
+        let result_long_only = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
 
         // Blended urgency should be larger because medium pulls drift faster
         assert!(
@@ -860,13 +859,11 @@ mod tests {
         let ctrl = make_controller();
         // Long = -15 bps, medium = +8 bps (opposite direction), zero agreement
         let trend_disagree = make_trend(-15.0, 8.0, 0.0);
-        let result_disagree =
-            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
+        let result_disagree = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
 
         // Same scenario but with full agreement — medium gets weight and dilutes long
         let trend_agree = make_trend(-15.0, 8.0, 1.0);
-        let _result_agree =
-            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_agree);
+        let _result_agree = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_agree);
 
         // When disagreeing (agreement=0), med_confidence=0, blend = pure long_drift
         // long_drift = (-15/10000)/300 = -5e-6
@@ -894,7 +891,8 @@ mod tests {
         assert!(
             (result_disagree.drift_urgency - result_long_only.drift_urgency).abs() < 1e-10,
             "disagreeing medium (urgency={}) should equal long-only (urgency={})",
-            result_disagree.drift_urgency, result_long_only.drift_urgency,
+            result_disagree.drift_urgency,
+            result_long_only.drift_urgency,
         );
     }
 }

@@ -54,26 +54,26 @@ pub use bayesian_bootstrap::{
 pub use belief::BeliefState;
 pub use calibrated_edge::{CalibratedEdgeConfig, CalibratedEdgeSignal, EdgeSignalDiagnostics};
 pub use changepoint::{
-    ChangepointConfig, ChangepointDetector, ChangepointSummary, ChangePointResult, MarketRegime,
+    ChangePointResult, ChangepointConfig, ChangepointDetector, ChangepointSummary, MarketRegime,
 };
-pub use position_pnl_tracker::{PositionPnLConfig, PositionPnLDiagnostics, PositionPnLTracker};
-pub use quota_shadow::{QuotaShadowConfig, QuotaShadowPricer};
-pub use theoretical_edge::{
-    AdverseSummary, BayesianAdverseTracker, CrossAssetSignal, EnhancedEdgeInput,
-    RegimeAwareBayesianAdverse, TheoreticalEdgeConfig, TheoreticalEdgeEstimator,
-    TheoreticalEdgeResult,
-};
+pub use controller::{ControllerConfig, OptimalController};
 pub use hybrid_ev::{
     DecisionSource, HybridEVConfig, HybridEVEstimator, HybridEVInput, HybridEVResult,
 };
-pub use controller::{ControllerConfig, OptimalController};
 pub use information::{InformationConfig, InformationValue};
 pub use interface::{GaussianEstimate, LearningModuleOutput, ModelPrediction, TradingState};
+pub use position_pnl_tracker::{PositionPnLConfig, PositionPnLDiagnostics, PositionPnLTracker};
+pub use quota_shadow::{QuotaShadowConfig, QuotaShadowPricer};
 pub use simulation::{
     CascadeScenario, HistoricalReplay, MarketScenario, MeanRevertingScenario, MonteCarloResult,
     SimulationConfig, SimulationEngine, SimulationResult, TrendingScenario,
 };
 pub use state::{ControlState, StateConfig};
+pub use theoretical_edge::{
+    AdverseSummary, BayesianAdverseTracker, CrossAssetSignal, EnhancedEdgeInput,
+    RegimeAwareBayesianAdverse, TheoreticalEdgeConfig, TheoreticalEdgeEstimator,
+    TheoreticalEdgeResult,
+};
 pub use traits::{
     BeliefProvider, ControlOutput, ControlReason, ControlSolver, ControlStateProvider,
     MarketMicrostructure, ObservableState, StateSnapshot, ValueFunctionSolver,
@@ -342,8 +342,8 @@ impl StochasticController {
                 rate_limit_headroom: prev_state.rate_limit_headroom,
                 last_realized_edge_bps: realized_edge, // Fresh from this fill
                 market_spread_bps: prev_state.market_spread_bps, // Carry forward
-                drift_rate: prev_state.drift_rate,               // Carry forward
-                ou_uncertainty: prev_state.ou_uncertainty,       // Carry forward
+                drift_rate: prev_state.drift_rate,     // Carry forward
+                ou_uncertainty: prev_state.ou_uncertainty, // Carry forward
             };
 
             // Create state transition for TD learning
@@ -588,18 +588,19 @@ impl StochasticController {
         const EMERGENCY_THRESHOLD: f64 = 0.95;
         const ELEVATED_THRESHOLD: f64 = 0.70;
         const EMERGENCY_COOLDOWN_CYCLES: usize = 200;
-        let cycles_since_last = self.cycle_count.saturating_sub(self.last_emergency_pull_cycle);
+        let cycles_since_last = self
+            .cycle_count
+            .saturating_sub(self.last_emergency_pull_cycle);
 
-        let risk_level = if cp_prob > EMERGENCY_THRESHOLD
-            && cycles_since_last >= EMERGENCY_COOLDOWN_CYCLES
-        {
-            self.last_emergency_pull_cycle = self.cycle_count;
-            RiskLevel::Emergency
-        } else if cp_prob > ELEVATED_THRESHOLD {
-            RiskLevel::Elevated
-        } else {
-            RiskLevel::Normal
-        };
+        let risk_level =
+            if cp_prob > EMERGENCY_THRESHOLD && cycles_since_last >= EMERGENCY_COOLDOWN_CYCLES {
+                self.last_emergency_pull_cycle = self.cycle_count;
+                RiskLevel::Emergency
+            } else if cp_prob > ELEVATED_THRESHOLD {
+                RiskLevel::Elevated
+            } else {
+                RiskLevel::Normal
+            };
 
         // Derive emergency_pull from risk_level for backward compatibility
         let emergency_pull = matches!(risk_level, RiskLevel::Emergency);
@@ -646,7 +647,10 @@ impl StochasticController {
     }
 
     /// Set the changepoint detector's regime profile (includes adaptive hazard thresholds).
-    pub fn set_changepoint_regime_profile(&mut self, profile: &crate::market_maker::config::RegimeProfile) {
+    pub fn set_changepoint_regime_profile(
+        &mut self,
+        profile: &crate::market_maker::config::RegimeProfile,
+    ) {
         self.changepoint.update_from_profile(profile);
     }
 
@@ -1108,7 +1112,7 @@ mod tests {
         let mut controller = StochasticController::default();
         controller.cycle_count = 500;
         controller.learning_trust = 0.0; // Worst case trust
-        // Extreme changepoint data
+                                         // Extreme changepoint data
         for i in 0..100 {
             let val = if i < 50 { 1.0 } else { 10000.0 };
             controller.changepoint.update(val);

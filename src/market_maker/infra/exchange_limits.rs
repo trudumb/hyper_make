@@ -111,9 +111,7 @@ impl ExchangePositionLimits {
         self.inner.effective_bid_limit.store(max_position);
         self.inner.effective_ask_limit.store(max_position);
         self.inner.local_max_position.store(max_position);
-        self.inner
-            .paper_mode
-            .store(true, Ordering::Relaxed);
+        self.inner.paper_mode.store(true, Ordering::Relaxed);
         self.inner
             .has_full_exchange_data
             .store(true, Ordering::Relaxed);
@@ -434,9 +432,7 @@ impl ExchangePositionLimits {
     /// where `available_to_trade` or `mark_px` come back empty), and limits
     /// fell back to `local_max_position`.
     pub fn has_full_exchange_data(&self) -> bool {
-        self.inner
-            .has_full_exchange_data
-            .load(Ordering::Relaxed)
+        self.inner.has_full_exchange_data.load(Ordering::Relaxed)
     }
 
     /// Calculate safe order size that won't exceed exchange limits.
@@ -1030,9 +1026,9 @@ mod tests {
                 value: 5,
                 raw_usd: None,
             },
-            max_trade_szs: vec![],        // empty array
-            available_to_trade: vec![],    // empty array
-            mark_px: "".to_string(),       // empty mark price
+            max_trade_szs: vec![],      // empty array
+            available_to_trade: vec![], // empty array
+            mark_px: "".to_string(),    // empty mark price
         };
 
         let local_max = 10.0;

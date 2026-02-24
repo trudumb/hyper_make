@@ -386,7 +386,7 @@ impl InformationRatioTracker {
         // But also penalize for using few bins (less resolution)
         let log_sum: f64 = non_empty.iter().map(|c| c.ln()).sum();
         let geom_mean = (log_sum / num_bins_used as f64).exp();
-        
+
         // Scale by bin coverage: using more bins = better resolution
         let bin_coverage = (num_bins_used as f64 / self.n_bins as f64).sqrt();
         let n_eff = geom_mean * num_bins_used as f64 * bin_coverage;
@@ -1115,7 +1115,11 @@ mod tests {
 
         // With sparse distribution, n_eff should be much less than total
         let n_eff = tracker.effective_sample_size();
-        assert!(n_eff < 50.0, "n_eff should be reduced for sparse: {}", n_eff);
+        assert!(
+            n_eff < 50.0,
+            "n_eff should be reduced for sparse: {}",
+            n_eff
+        );
     }
 
     #[test]
@@ -1125,11 +1129,19 @@ mod tests {
         // With no data, should return prior-based probability
         let p = tracker.posterior_prob_ir_above(1.0, 0.9, 6.0);
         // prior_mean=0.9 < threshold=1.0, so P should be ~0.45
-        assert!((p - 0.45).abs() < 0.1, "P should be ~0.45 for prior < threshold: {}", p);
+        assert!(
+            (p - 0.45).abs() < 0.1,
+            "P should be ~0.45 for prior < threshold: {}",
+            p
+        );
 
         let p_high = tracker.posterior_prob_ir_above(1.0, 1.5, 6.0);
         // prior_mean=1.5 > threshold=1.0, so P should be ~0.55
-        assert!((p_high - 0.55).abs() < 0.1, "P should be ~0.55 for prior > threshold: {}", p_high);
+        assert!(
+            (p_high - 0.55).abs() < 0.1,
+            "P should be ~0.55 for prior > threshold: {}",
+            p_high
+        );
     }
 
     #[test]
@@ -1139,19 +1151,24 @@ mod tests {
         // Good discrimination across multiple bins
         // This pattern creates IR > 1.0
         for _ in 0..40 {
-            tracker.update(0.05, false);  // Low prob -> false
-            tracker.update(0.25, false);  // Low-mid prob -> false
-            tracker.update(0.75, true);   // High-mid prob -> true
-            tracker.update(0.95, true);   // High prob -> true
+            tracker.update(0.05, false); // Low prob -> false
+            tracker.update(0.25, false); // Low-mid prob -> false
+            tracker.update(0.75, true); // High-mid prob -> true
+            tracker.update(0.95, true); // High prob -> true
         }
 
         // Check IR is actually > 1.0 for this pattern
         let ir = tracker.information_ratio();
-        
+
         // With strong edge (IR > 1.0), P(IR > 0.5) should be high
         // Use lower threshold since IR=1.0 is the "neutral" point
         let p = tracker.posterior_prob_ir_above(0.5, 0.9, 6.0);
-        assert!(p > 0.7, "P(IR > 0.5) should be high for strong edge (IR={:.3}): {}", ir, p);
+        assert!(
+            p > 0.7,
+            "P(IR > 0.5) should be high for strong edge (IR={:.3}): {}",
+            ir,
+            p
+        );
     }
 
     #[test]
@@ -1168,7 +1185,12 @@ mod tests {
         // Use 0.5 threshold since single-bin gives IR=0
         let ir = tracker.information_ratio();
         let p = tracker.posterior_prob_ir_above(0.5, 0.9, 6.0);
-        assert!(p < 0.6, "P(IR > 0.5) should be low for no edge (IR={:.3}): {}", ir, p);
+        assert!(
+            p < 0.6,
+            "P(IR > 0.5) should be low for no edge (IR={:.3}): {}",
+            ir,
+            p
+        );
     }
 
     #[test]
@@ -1185,9 +1207,13 @@ mod tests {
         let ir = tracker.information_ratio();
 
         // Interval should contain the point estimate
-        assert!(lower <= ir && ir <= upper,
+        assert!(
+            lower <= ir && ir <= upper,
             "95% CI should contain IR: [{:.3}, {:.3}] vs IR={:.3}",
-            lower, upper, ir);
+            lower,
+            upper,
+            ir
+        );
     }
 
     #[test]
@@ -1210,9 +1236,12 @@ mod tests {
         let (lower2, upper2) = tracker.ir_credible_interval(0.95, 0.9, 6.0);
         let width2 = upper2 - lower2;
 
-        assert!(width2 < width1,
+        assert!(
+            width2 < width1,
             "CI should narrow with more samples: {} vs {}",
-            width2, width1);
+            width2,
+            width1
+        );
     }
 
     #[test]
@@ -1232,12 +1261,18 @@ mod tests {
         // Weak prior (low df): posterior close to data
         let post_weak = tracker.posterior_mean_ir(0.5, 2.0);
 
-        assert!(post_strong < post_weak,
+        assert!(
+            post_strong < post_weak,
             "Strong prior should shrink more: {:.3} vs {:.3}",
-            post_strong, post_weak);
-        assert!((post_weak - ir_hat).abs() < 0.2,
+            post_strong,
+            post_weak
+        );
+        assert!(
+            (post_weak - ir_hat).abs() < 0.2,
             "Weak prior should be close to data: {:.3} vs {:.3}",
-            post_weak, ir_hat);
+            post_weak,
+            ir_hat
+        );
     }
 
     #[test]
@@ -1253,8 +1288,13 @@ mod tests {
 
         for (x, expected) in test_cases {
             let actual = InformationRatioTracker::standard_normal_cdf(x);
-            assert!((actual - expected).abs() < 0.01,
-                "Φ({}) = {} should be ~{}", x, actual, expected);
+            assert!(
+                (actual - expected).abs() < 0.01,
+                "Φ({}) = {} should be ~{}",
+                x,
+                actual,
+                expected
+            );
         }
     }
 
@@ -1266,8 +1306,13 @@ mod tests {
         for p in test_probs {
             let z = InformationRatioTracker::standard_normal_quantile(p);
             let p_back = InformationRatioTracker::standard_normal_cdf(z);
-            assert!((p_back - p).abs() < 0.02,
-                "Φ(Φ⁻¹({})) = {} should be ~{}", p, p_back, p);
+            assert!(
+                (p_back - p).abs() < 0.02,
+                "Φ(Φ⁻¹({})) = {} should be ~{}",
+                p,
+                p_back,
+                p
+            );
         }
     }
 
@@ -1296,7 +1341,11 @@ mod tests {
 
         let ir = tracker.information_ratio();
         // With mean error ~0.1 and std ~small, IR should be positive and significant
-        assert!(ir > 0.5, "IR should be positive for consistent bias, got {}", ir);
+        assert!(
+            ir > 0.5,
+            "IR should be positive for consistent bias, got {}",
+            ir
+        );
     }
 
     #[test]
@@ -1314,8 +1363,11 @@ mod tests {
         }
 
         let exp_ir_good = exp_tracker.information_ratio();
-        assert!(exp_ir_good > 1.0,
-            "Exp IR should be strong after consistent bias: {}", exp_ir_good);
+        assert!(
+            exp_ir_good > 1.0,
+            "Exp IR should be strong after consistent bias: {}",
+            exp_ir_good
+        );
 
         // Phase 2: 200 samples of noise (zero-mean error, high variance)
         for i in 0..200 {
@@ -1327,9 +1379,12 @@ mod tests {
 
         // Exponential IR should drop substantially from the good phase value
         // With decay=0.99, 200 new samples heavily dilute the old signal
-        assert!(exp_ir_after_noise < exp_ir_good * 0.5,
+        assert!(
+            exp_ir_after_noise < exp_ir_good * 0.5,
             "Exp IR should degrade after noise: {} vs good phase {}",
-            exp_ir_after_noise, exp_ir_good);
+            exp_ir_after_noise,
+            exp_ir_good
+        );
     }
 
     #[test]
@@ -1342,8 +1397,11 @@ mod tests {
         }
 
         let ir_after_good = tracker.information_ratio();
-        assert!(ir_after_good.abs() > 1.0,
-            "IR should be strong after 1000 good obs: {}", ir_after_good);
+        assert!(
+            ir_after_good.abs() > 1.0,
+            "IR should be strong after 1000 good obs: {}",
+            ir_after_good
+        );
 
         // Feed 500 bad observations (zero-mean noise)
         for i in 0..500 {
@@ -1354,9 +1412,12 @@ mod tests {
         let ir_after_bad = tracker.information_ratio();
 
         // Old good data should have decayed substantially
-        assert!(ir_after_bad.abs() < ir_after_good.abs() * 0.5,
+        assert!(
+            ir_after_bad.abs() < ir_after_good.abs() * 0.5,
             "IR should decay after bad data: {} vs original {}",
-            ir_after_bad, ir_after_good);
+            ir_after_bad,
+            ir_after_good
+        );
     }
 
     #[test]
@@ -1380,12 +1441,24 @@ mod tests {
         let ir_end = exp_tracker.information_ratio();
 
         // Both should be significant and positive (no regime change = same sign)
-        assert!(ir_mid > 1.0, "Exp IR should be significant at midpoint: {}", ir_mid);
-        assert!(ir_end > 1.0, "Exp IR should be significant at end: {}", ir_end);
+        assert!(
+            ir_mid > 1.0,
+            "Exp IR should be significant at midpoint: {}",
+            ir_mid
+        );
+        assert!(
+            ir_end > 1.0,
+            "Exp IR should be significant at end: {}",
+            ir_end
+        );
         // IR should not reverse direction or collapse without a regime change
         // (it can strengthen as EWMA warms up, but shouldn't drop to zero)
-        assert!(ir_end >= ir_mid * 0.5,
-            "IR should not collapse without regime change: mid={}, end={}", ir_mid, ir_end);
+        assert!(
+            ir_end >= ir_mid * 0.5,
+            "IR should not collapse without regime change: mid={}, end={}",
+            ir_mid,
+            ir_end
+        );
     }
 
     #[test]
@@ -1402,9 +1475,11 @@ mod tests {
 
         let eff_n = tracker.effective_sample_size();
         // Should be close to 500 (the steady-state value for decay=0.998)
-        assert!(eff_n > 400.0 && eff_n < 510.0,
+        assert!(
+            eff_n > 400.0 && eff_n < 510.0,
             "Effective n after 1000 obs with decay=0.998 should be ~430-500, got {}",
-            eff_n);
+            eff_n
+        );
         assert_eq!(tracker.total_observations(), 1000);
     }
 

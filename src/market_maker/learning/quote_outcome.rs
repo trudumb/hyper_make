@@ -414,10 +414,7 @@ impl QuoteOutcomeTracker {
     /// Returns true if a matching quote was found and resolved.
     pub fn on_fill(&mut self, is_bid: bool, edge_bps: f64) -> bool {
         // Find the most recent matching pending quote on the same side
-        let idx = self
-            .pending_quotes
-            .iter()
-            .rposition(|q| q.is_bid == is_bid);
+        let idx = self.pending_quotes.iter().rposition(|q| q.is_bid == is_bid);
 
         if let Some(idx) = idx {
             let quote = self.pending_quotes.remove(idx).unwrap();
@@ -435,8 +432,7 @@ impl QuoteOutcomeTracker {
                 state: quote.state,
                 spread_bps: quote.half_spread_bps * 2.0,
             };
-            self.fill_rate
-                .record(quote.half_spread_bps * 2.0, true);
+            self.fill_rate.record(quote.half_spread_bps * 2.0, true);
             self.push_outcome(outcome);
             true
         } else {
@@ -469,8 +465,7 @@ impl QuoteOutcomeTracker {
             spread_bps: quote.half_spread_bps * 2.0,
             subsequent_move_bps,
         };
-        self.fill_rate
-            .record(quote.half_spread_bps * 2.0, false);
+        self.fill_rate.record(quote.half_spread_bps * 2.0, false);
         self.push_outcome(outcome);
     }
 
@@ -550,7 +545,10 @@ impl QuoteOutcomeTracker {
     /// Create a checkpoint of the fill rate bins.
     pub fn to_checkpoint(&self) -> QuoteOutcomeCheckpoint {
         QuoteOutcomeCheckpoint {
-            bins: self.fill_rate.bins.iter()
+            bins: self
+                .fill_rate
+                .bins
+                .iter()
                 .map(|b| (b.lo_bps, b.hi_bps, b.observed_fills, b.observed_total))
                 .collect(),
         }
@@ -562,7 +560,8 @@ impl QuoteOutcomeTracker {
     /// which are migrated to Beta posteriors: alpha = fills + 1.0, beta = total - fills + 1.0.
     pub fn restore_from_checkpoint(&mut self, cp: &QuoteOutcomeCheckpoint) {
         if cp.bins.len() == self.fill_rate.bins.len() {
-            for (bin, &(lo, hi, fills, total)) in self.fill_rate.bins.iter_mut().zip(cp.bins.iter()) {
+            for (bin, &(lo, hi, fills, total)) in self.fill_rate.bins.iter_mut().zip(cp.bins.iter())
+            {
                 bin.lo_bps = lo;
                 bin.hi_bps = hi;
                 bin.observed_fills = fills;
@@ -798,7 +797,11 @@ mod tests {
         let est = bfr.fill_rate_at(5.0);
         assert_eq!(est.n_observations, 13);
         // Allow tolerance for prior + hierarchical influence
-        assert!((est.mean - 3.0 / 13.0).abs() < 0.1, "Mean should be near 3/13. Got: {}", est.mean);
+        assert!(
+            (est.mean - 3.0 / 13.0).abs() < 0.1,
+            "Mean should be near 3/13. Got: {}",
+            est.mean
+        );
 
         assert_eq!(bfr.total_quotes(), 13);
         assert_eq!(bfr.total_fills(), 3);
@@ -811,9 +814,20 @@ mod tests {
         // With no data, should return prior mean (~0.5) with high variance
         let est = bfr.fill_rate_at(5.0);
         assert_eq!(est.n_observations, 0);
-        assert!((est.mean - 0.5).abs() < 0.1, "Empty bin should have mean ~0.5. Got: {}", est.mean);
-        assert!(est.variance > 0.01, "Empty bin should have high variance. Got: {}", est.variance);
-        assert!(est.blend_active, "Blend should be active with zero observations");
+        assert!(
+            (est.mean - 0.5).abs() < 0.1,
+            "Empty bin should have mean ~0.5. Got: {}",
+            est.mean
+        );
+        assert!(
+            est.variance > 0.01,
+            "Empty bin should have high variance. Got: {}",
+            est.variance
+        );
+        assert!(
+            est.blend_active,
+            "Blend should be active with zero observations"
+        );
     }
 
     #[test]
@@ -829,8 +843,16 @@ mod tests {
         }
 
         let est = bfr.fill_rate_at(5.0);
-        assert!((est.mean - 0.5).abs() < 0.05, "200 obs should converge to ~0.5. Got: {}", est.mean);
-        assert!(est.variance < 0.005, "200 obs should have tight variance. Got: {}", est.variance);
+        assert!(
+            (est.mean - 0.5).abs() < 0.05,
+            "200 obs should converge to ~0.5. Got: {}",
+            est.mean
+        );
+        assert!(
+            est.variance < 0.005,
+            "200 obs should have tight variance. Got: {}",
+            est.variance
+        );
     }
 
     #[test]
@@ -851,15 +873,26 @@ mod tests {
         }
         let sparse_est = bfr.fill_rate_at(3.0);
         // Should be pulled below 1.0 by coarse prior (~0.5)
-        assert!(sparse_est.mean < 0.95, "3 obs should shrink toward parent. Got: {}", sparse_est.mean);
-        assert!(sparse_est.blend_active, "Blend should be active with 3 observations");
+        assert!(
+            sparse_est.mean < 0.95,
+            "3 obs should shrink toward parent. Got: {}",
+            sparse_est.mean
+        );
+        assert!(
+            sparse_est.blend_active,
+            "Blend should be active with 3 observations"
+        );
 
         // Add 1000 more observations to [2,4) — should mostly ignore parent
         for _ in 0..1000 {
             bfr.record(3.0, true);
         }
         let dense_est = bfr.fill_rate_at(3.0);
-        assert!(dense_est.mean > 0.8, "Many obs should mostly ignore parent. Got: {}", dense_est.mean);
+        assert!(
+            dense_est.mean > 0.8,
+            "Many obs should mostly ignore parent. Got: {}",
+            dense_est.mean
+        );
     }
 
     #[test]
@@ -868,9 +901,17 @@ mod tests {
 
         for spread in [0.5, 3.0, 5.0, 7.0, 9.0, 12.0, 18.0, 25.0, 100.0] {
             let est = bfr.fill_rate_at(spread);
-            assert!(est.mean >= 0.0 && est.mean <= 1.0,
-                "Mean must be in [0,1]. Got: {} at {} bps", est.mean, spread);
-            assert!(est.variance >= 0.0, "Variance must be non-negative at {} bps", spread);
+            assert!(
+                est.mean >= 0.0 && est.mean <= 1.0,
+                "Mean must be in [0,1]. Got: {} at {} bps",
+                est.mean,
+                spread
+            );
+            assert!(
+                est.variance >= 0.0,
+                "Variance must be non-negative at {} bps",
+                spread
+            );
         }
     }
 
@@ -882,7 +923,10 @@ mod tests {
             n_observations: 5,
             blend_active: true,
         };
-        assert!((with_blend.variance_adjusted() - 0.15).abs() < 1e-9, "1.5x when blend active");
+        assert!(
+            (with_blend.variance_adjusted() - 0.15).abs() < 1e-9,
+            "1.5x when blend active"
+        );
 
         let without_blend = FillRateEstimate {
             mean: 0.5,
@@ -890,7 +934,10 @@ mod tests {
             n_observations: 100,
             blend_active: false,
         };
-        assert!((without_blend.variance_adjusted() - 0.10).abs() < 1e-9, "1.0x when no blend");
+        assert!(
+            (without_blend.variance_adjusted() - 0.10).abs() < 1e-9,
+            "1.0x when no blend"
+        );
     }
 
     #[test]
@@ -964,8 +1011,12 @@ mod tests {
         // Verify fill rates match
         let orig_est = tracker.fill_rate().fill_rate_at(3.0);
         let restored_est = restored.fill_rate().fill_rate_at(3.0);
-        assert!((orig_est.mean - restored_est.mean).abs() < 0.01,
-            "Restored mean should match original. Got: {} vs {}", restored_est.mean, orig_est.mean);
+        assert!(
+            (orig_est.mean - restored_est.mean).abs() < 0.01,
+            "Restored mean should match original. Got: {} vs {}",
+            restored_est.mean,
+            orig_est.mean
+        );
         assert_eq!(orig_est.n_observations, restored_est.n_observations);
     }
 
@@ -987,8 +1038,16 @@ mod tests {
         tracker.on_fill(true, 1.5);
 
         let (bias, rmse) = tracker.epnl_prediction_accuracy();
-        assert!((bias - 0.5).abs() < 0.01, "Bias should be +0.5 (optimistic). Got: {}", bias);
-        assert!((rmse - 0.5).abs() < 0.01, "RMSE should be 0.5. Got: {}", rmse);
+        assert!(
+            (bias - 0.5).abs() < 0.01,
+            "Bias should be +0.5 (optimistic). Got: {}",
+            bias
+        );
+        assert!(
+            (rmse - 0.5).abs() < 0.01,
+            "RMSE should be 0.5. Got: {}",
+            rmse
+        );
 
         // Register another with None — should not affect reconciliation
         tracker.register_quote(PendingQuote {
@@ -1028,12 +1087,20 @@ mod tests {
         // Posterior mean ≈ 0.5 (with small hierarchical shift)
         let est = tracker.fill_rate().fill_rate_at(1.0);
         assert_eq!(est.n_observations, 20);
-        assert!((est.mean - 0.5).abs() < 0.1, "Migrated bin should have mean ~0.5. Got: {}", est.mean);
+        assert!(
+            (est.mean - 0.5).abs() < 0.1,
+            "Migrated bin should have mean ~0.5. Got: {}",
+            est.mean
+        );
 
         // Bin [2,4): fills=5, total=15 → alpha = 1+5 = 6, beta = 1+10 = 11
         // Posterior mean ≈ 5/15 ≈ 0.33 (shifted by hierarchy)
         let est2 = tracker.fill_rate().fill_rate_at(3.0);
         assert_eq!(est2.n_observations, 15);
-        assert!((est2.mean - 0.33).abs() < 0.15, "Migrated bin should have mean ~0.33. Got: {}", est2.mean);
+        assert!(
+            (est2.mean - 0.33).abs() < 0.15,
+            "Migrated bin should have mean ~0.33. Got: {}",
+            est2.mean
+        );
     }
 }

@@ -349,7 +349,10 @@ mod tests {
         // Zero mid — should not panic
         let grid = PriceGrid::for_current_state(0.0, 0.01, 5.0, &cfg, 1.0);
         let s = grid.snap(100.0);
-        assert!(s.is_finite(), "snap with zero mid should produce finite result");
+        assert!(
+            s.is_finite(),
+            "snap with zero mid should produce finite result"
+        );
 
         // Zero tick — should return price unchanged
         let grid = PriceGrid::for_current_state(30.0, 0.0, 5.0, &cfg, 1.0);
@@ -360,7 +363,10 @@ mod tests {
         // Negative mid — should not panic
         let grid = PriceGrid::for_current_state(-10.0, 0.01, 5.0, &cfg, 1.0);
         let s = grid.snap(30.0);
-        assert!(s.is_finite(), "snap with negative mid should produce finite result");
+        assert!(
+            s.is_finite(),
+            "snap with negative mid should produce finite result"
+        );
 
         // Zero sigma — should not panic, spacing falls back to tick-based
         let grid = PriceGrid::for_current_state(30.0, 0.01, 0.0, &cfg, 1.0);

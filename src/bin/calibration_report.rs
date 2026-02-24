@@ -701,10 +701,7 @@ fn print_ascii(report: &CalibrationReport) {
         );
         println!(" Reduce-only thresholds:");
         for rt in &pos.reduce_only_thresholds {
-            println!(
-                "   - {:10} {:.2} ({})",
-                rt.regime, rt.threshold, rt.note
-            );
+            println!("   - {:10} {:.2} ({})", rt.regime, rt.threshold, rt.note);
         }
         println!(" Fills recorded: {}", pos.n_fills_recorded);
         println!("{separator}");

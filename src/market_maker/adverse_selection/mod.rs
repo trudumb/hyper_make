@@ -27,6 +27,7 @@ pub mod microstructure_features;
 mod pre_fill_classifier;
 pub mod toxicity_regime;
 
+pub use book_dynamics::{BookDynamicsTracker, IcebergDetector, SweepDetector};
 pub use cancel_race::{CancelRaceConfig, CancelRaceSummary, CancelRaceTracker};
 pub use depth_decay::{DepthDecayAS, DepthDecayASSummary, FillWithDepth};
 pub use enhanced_classifier::{
@@ -38,8 +39,7 @@ pub use microstructure_features::{
     MicrostructureFeatures, TradeObservation,
 };
 pub use pre_fill_classifier::{PreFillASClassifier, PreFillClassifierConfig, PreFillSummary};
-pub use toxicity_regime::{ToxicityRegime, ToxicityThresholds, OfiAccelerationSignals};
-pub use book_dynamics::{BookDynamicsTracker, IcebergDetector, SweepDetector};
+pub use toxicity_regime::{OfiAccelerationSignals, ToxicityRegime, ToxicityThresholds};
 
 /// Configuration for adverse selection estimation.
 #[derive(Debug, Clone)]
@@ -83,7 +83,7 @@ impl Default for AdverseSelectionConfig {
             // MAINNET OPTIMIZED: Shorter horizon for liquid markets with faster mean reversion
             measurement_horizon_ms: 500, // Reduced from 1000ms
             // MAINNET OPTIMIZED: Faster adaptation to changing AS patterns
-            ewma_alpha: 0.12, // Increased from 0.05 - faster adaptation
+            ewma_alpha: 0.12,     // Increased from 0.05 - faster adaptation
             min_fills_warmup: 50, // Increased from 20 — need statistically meaningful sample
             // Increased from 1000 to handle 10-minute tracking window.
             // At ~2 fills/sec peak, 10 min = ~1200 fills. Use 5000 for safety margin.

@@ -38,10 +38,10 @@ pub struct PriorAgePolicy {
 impl Default for PriorAgePolicy {
     fn default() -> Self {
         Self {
-            full_confidence_age_s: 4.0 * 3600.0,   // 4 hours
-            decay_horizon_s: 72.0 * 3600.0,         // 72 hours
+            full_confidence_age_s: 4.0 * 3600.0, // 4 hours
+            decay_horizon_s: 72.0 * 3600.0,      // 72 hours
             confidence_floor: 0.15,
-            hard_reject_age_s: 168.0 * 3600.0,      // 7 days
+            hard_reject_age_s: 168.0 * 3600.0, // 7 days
         }
     }
 }

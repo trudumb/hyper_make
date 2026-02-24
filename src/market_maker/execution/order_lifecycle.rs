@@ -210,9 +210,9 @@ impl OrderLifecycle {
             return None;
         }
 
-        self.events.last().map(|last| {
-            last.timestamp.saturating_sub(self.created_at)
-        })
+        self.events
+            .last()
+            .map(|last| last.timestamp.saturating_sub(self.created_at))
     }
 
     /// Get the remaining size.

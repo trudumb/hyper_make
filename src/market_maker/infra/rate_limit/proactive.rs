@@ -58,9 +58,7 @@ impl CumulativeQuotaState {
         // Exponential backoff: 30s, 60s, 120s, 240s... max 10min
         let base = Duration::from_secs(30);
         let multiplier = 2.0_f64.powi((self.consecutive_exhaustions - 1).min(4) as i32);
-        let backoff = Duration::from_secs_f64(
-            (base.as_secs_f64() * multiplier).min(600.0)
-        );
+        let backoff = Duration::from_secs_f64((base.as_secs_f64() * multiplier).min(600.0));
 
         // Add jitter: ± 50% uniform noise (queuing theory: avoid herd behavior)
         let jitter_factor = 0.5 + rand::random::<f64>(); // [0.5, 1.5]

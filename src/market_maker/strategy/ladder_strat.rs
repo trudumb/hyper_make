@@ -4,27 +4,26 @@ use tracing::{debug, info, warn};
 
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
-use crate::market_maker::config::{Quote, QuoteConfig, SizeQuantum};
 use crate::market_maker::config::auto_derive::CapitalTier;
+use crate::market_maker::config::{Quote, QuoteConfig, SizeQuantum};
 // VolatilityRegime removed - regime_scalar was redundant with vol_scalar
+use crate::market_maker::quoting::ladder::risk_budget::{
+    allocate_risk_budget, compute_allocation_temperature, SideRiskBudget, SoftmaxParams,
+};
+use crate::market_maker::quoting::ladder::tick_grid::{
+    enumerate_ask_ticks, enumerate_bid_ticks, score_ticks, select_optimal_ticks, TickGridConfig,
+    TickScoringParams,
+};
 use crate::market_maker::quoting::{
     BayesianFillModel, DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator,
     EntropyConstrainedOptimizer, EntropyDistributionConfig, EntropyOptimizerConfig, Ladder,
     LadderConfig, LadderLevel, LadderParams, LevelOptimizationParams, MarketRegime,
-};
-use crate::market_maker::quoting::ladder::tick_grid::{
-    TickGridConfig, TickScoringParams, enumerate_bid_ticks, enumerate_ask_ticks,
-    score_ticks, select_optimal_ticks,
-};
-use crate::market_maker::quoting::ladder::risk_budget::{
-    SideRiskBudget, SoftmaxParams, allocate_risk_budget, compute_allocation_temperature,
 };
 
 use super::{
     CalibratedRiskModel, KellySizer, MarketParams, QuotingStrategy, RiskConfig, RiskFeatures,
     RiskModelConfig, SpreadComposition,
 };
-
 
 /// Inventory utilization ratio at which kill-switch side-clearing activates.
 /// At 90% (vs old 100%), clearing triggers 10% earlier, preventing the final
@@ -79,11 +78,7 @@ pub fn dynamic_margin_utilization(
     };
 
     // Warmup boost: slightly higher utilization early to attract fills
-    let warmup_boost = if warmup_progress < 0.3 {
-        0.05
-    } else {
-        0.0
-    };
+    let warmup_boost = if warmup_progress < 0.3 { 0.05 } else { 0.0 };
 
     ((base + warmup_boost) * headroom_factor).clamp(0.30, 0.90)
 }
@@ -510,17 +505,20 @@ impl LadderStrategy {
         // Component 4: Regime adjustment
         // Volatile regime → wider spreads
         let regime_mult = match market_params.adverse_regime {
-            0 => 0.9,  // Calm: slightly tighter
-            1 => 1.0,  // Normal: baseline
-            2 => 1.3,  // Volatile: significantly wider
-            _ => 1.0,  // Fallback
+            0 => 0.9, // Calm: slightly tighter
+            1 => 1.0, // Normal: baseline
+            2 => 1.3, // Volatile: significantly wider
+            _ => 1.0, // Fallback
         };
 
         // Combine multiplicatively
         let raw_mult = trend_discount * bootstrap_discount * uncertainty_premium * regime_mult;
 
         // Bound to reasonable range
-        let bayesian_mult = raw_mult.clamp(cfg.gamma_min / cfg.gamma_base, cfg.gamma_max / cfg.gamma_base);
+        let bayesian_mult = raw_mult.clamp(
+            cfg.gamma_min / cfg.gamma_base,
+            cfg.gamma_max / cfg.gamma_base,
+        );
 
         tracing::debug!(
             trend_confidence = %format!("{:.3}", market_params.trend_confidence),
@@ -600,14 +598,19 @@ impl LadderStrategy {
         // supports it — rounding up from 0.24 to 0.34 would exceed position limits.
         let raw_bid = available_for_bids.min(half_max).min(per_side_cap);
         let bid_round_up = available_for_bids >= quantum.min_viable_size;
-        let bid_size = quantum.clamp_to_viable(raw_bid, bid_round_up).unwrap_or(0.0);
+        let bid_size = quantum
+            .clamp_to_viable(raw_bid, bid_round_up)
+            .unwrap_or(0.0);
         let raw_ask = available_for_asks.min(half_max).min(per_side_cap);
         let ask_round_up = available_for_asks >= quantum.min_viable_size;
-        let ask_size = quantum.clamp_to_viable(raw_ask, ask_round_up).unwrap_or(0.0);
+        let ask_size = quantum
+            .clamp_to_viable(raw_ask, ask_round_up)
+            .unwrap_or(0.0);
 
         // Depth: use min_viable_depth_bps from capacity budget (QueueValue breakeven),
         // falling back to max(min_depth_bps, 5.0) to survive QueueValue filtering.
-        let depth_bps = market_params.capacity_budget
+        let depth_bps = market_params
+            .capacity_budget
             .as_ref()
             .map(|b| b.min_viable_depth_bps)
             .unwrap_or(5.0)
@@ -617,11 +620,8 @@ impl LadderStrategy {
 
         // Generate bid (if meets min_notional)
         if quantum.is_sufficient(bid_size) && available_for_bids > 0.0 {
-            let mut bid_price = round_to_significant_and_decimal(
-                mark * (1.0 - depth_frac),
-                5,
-                config.decimals,
-            );
+            let mut bid_price =
+                round_to_significant_and_decimal(mark * (1.0 - depth_frac), 5, config.decimals);
             // Rounding can push bid_price back to mark — nudge down by one tick
             if bid_price >= mark {
                 bid_price = mark - one_tick;
@@ -637,11 +637,8 @@ impl LadderStrategy {
 
         // Generate ask (if meets min_notional)
         if quantum.is_sufficient(ask_size) && available_for_asks > 0.0 {
-            let mut ask_price = round_to_significant_and_decimal(
-                mark * (1.0 + depth_frac),
-                5,
-                config.decimals,
-            );
+            let mut ask_price =
+                round_to_significant_and_decimal(mark * (1.0 + depth_frac), 5, config.decimals);
             // Rounding can push ask_price back to mark — nudge up by one tick
             if ask_price <= mark {
                 ask_price = mark + one_tick;
@@ -686,7 +683,9 @@ impl LadderStrategy {
         market_params: &MarketParams,
         max_position: f64,
     ) -> SpreadComposition {
-        let effective_max_position = market_params.effective_max_position(max_position).min(max_position);
+        let effective_max_position = market_params
+            .effective_max_position(max_position)
+            .min(max_position);
         // NOTE: regime_gamma_multiplier is already inside effective_gamma()
         let gamma = self.effective_gamma(market_params, 0.0, effective_max_position);
 
@@ -701,8 +700,8 @@ impl LadderStrategy {
         let glft_half_bps = glft_half_frac * 10_000.0;
 
         // Risk premium from regime and position zone
-        let risk_premium_bps = market_params.regime_risk_premium_bps
-            + market_params.total_risk_premium_bps;
+        let risk_premium_bps =
+            market_params.regime_risk_premium_bps + market_params.total_risk_premium_bps;
 
         let quota_addon_bps = market_params.quota_shadow_spread_bps.min(50.0);
 
@@ -839,7 +838,8 @@ impl LadderStrategy {
             const REGIME_BLEND_WEIGHT_WARMUP: f64 = 0.2;
             let regime_blend_weight = if market_params.adaptive_warmup_progress < 1.0 {
                 let t = market_params.adaptive_warmup_progress;
-                REGIME_BLEND_WEIGHT_WARMUP + t * (REGIME_BLEND_WEIGHT_FULL - REGIME_BLEND_WEIGHT_WARMUP)
+                REGIME_BLEND_WEIGHT_WARMUP
+                    + t * (REGIME_BLEND_WEIGHT_FULL - REGIME_BLEND_WEIGHT_WARMUP)
             } else {
                 REGIME_BLEND_WEIGHT_FULL
             };
@@ -932,7 +932,7 @@ impl LadderStrategy {
 
         // 1. Drift — uncapped signal, bounded only by ±95% GLFT half-spread clamp below
         let drift_shift_bps = market_params.drift_signal_bps;
-        
+
         // 2. Inventory Penalty
         // gamma has regime & beta_inventory applied natively via effective_gamma
         let q = if effective_max_position > EPSILON {
@@ -942,19 +942,19 @@ impl LadderStrategy {
         };
         // Penalty = q * gamma * sigma^2 * T in bps
         let inv_penalty_bps = q * gamma * market_params.sigma.powi(2) * time_horizon * 10_000.0;
-        
+
         // 3. Funding Carry (annualized rate converted to per-second, multiply by T)
         // 365.25 * 24 * 60 * 60 = 31,557,600
         let funding_per_sec = market_params.funding_rate / 31_557_600.0;
         let funding_carry_bps = funding_per_sec * time_horizon * 10_000.0;
-        
+
         // Total shift combines all fundamental flows
         // Drift pulls reservation price in direction of momentum.
         // Inventory penalty pushes reservation price away from position (short pushes down, long pushes up).
         // Funding carry pushes reservation price away from expensive funding side.
         let total_shift_bps = drift_shift_bps - inv_penalty_bps - funding_carry_bps;
         let shift_fraction = total_shift_bps / 10_000.0;
-        
+
         let reservation_mid = market_params.microprice * (1.0 + shift_fraction);
 
         // SAFETY: Bound skewed mid within 95% of GLFT half-spread to prevent crossing.
@@ -1115,8 +1115,14 @@ impl LadderStrategy {
         );
 
         // Track floor-binding frequency — if this fires >5% of cycles, gamma is miscalibrated
-        let bid_bound = dynamic_depths.bid.iter().any(|d| (*d - effective_floor_bps).abs() < 0.01);
-        let ask_bound = dynamic_depths.ask.iter().any(|d| (*d - effective_floor_bps).abs() < 0.01);
+        let bid_bound = dynamic_depths
+            .bid
+            .iter()
+            .any(|d| (*d - effective_floor_bps).abs() < 0.01);
+        let ask_bound = dynamic_depths
+            .ask
+            .iter()
+            .any(|d| (*d - effective_floor_bps).abs() < 0.01);
         if bid_bound || ask_bound {
             tracing::warn!(
                 effective_floor_bps = %format!("{:.2}", effective_floor_bps),
@@ -1178,12 +1184,10 @@ impl LadderStrategy {
         // === KEPT INFRASTRUCTURE ADDONS (correct AS extensions, not protection) ===
         // Governor (API rate limit) + cascade (fill cascade tracker) + self_impact + funding_carry.
         // WS4: staleness and flow_toxicity addons REMOVED — routed through estimators.
-        let kept_bid_addon_bps = (market_params.governor_bid_addon_bps
-            + market_params.cascade_bid_addon_bps)
-            .min(25.0);
-        let kept_ask_addon_bps = (market_params.governor_ask_addon_bps
-            + market_params.cascade_ask_addon_bps)
-            .min(25.0);
+        let kept_bid_addon_bps =
+            (market_params.governor_bid_addon_bps + market_params.cascade_bid_addon_bps).min(25.0);
+        let kept_ask_addon_bps =
+            (market_params.governor_ask_addon_bps + market_params.cascade_ask_addon_bps).min(25.0);
         if kept_bid_addon_bps > 0.01 {
             for depth in dynamic_depths.bid.iter_mut() {
                 *depth += kept_bid_addon_bps;
@@ -1299,7 +1303,7 @@ impl LadderStrategy {
                 carry_cost_bps: market_params.funding_carry_bps,
                 toxicity_score: market_params.toxicity_score,
                 circuit_breaker_active: market_params.should_pull_quotes,
-                drawdown_frac: 0.0, // handled by capital coordinator
+                drawdown_frac: 0.0,   // handled by capital coordinator
                 self_impact_bps: 0.0, // self impact handled by actuary later
                 cascade_addon_bps: market_params.cascade_bid_addon_bps,
                 inventory_beta: self.risk_model.beta_inventory,
@@ -1320,11 +1324,23 @@ impl LadderStrategy {
 
             let gamma_baseline = self.risk_config.gamma_base;
             let reducing_thresh = super::glft::reducing_threshold_bps(
-                position, effective_max_position, fee_bps, gamma, gamma_baseline,
+                position,
+                effective_max_position,
+                fee_bps,
+                gamma,
+                gamma_baseline,
             );
 
-            let bid_threshold = if bid_is_reducing { reducing_thresh } else { 0.0 };
-            let ask_threshold = if ask_is_reducing { reducing_thresh } else { 0.0 };
+            let bid_threshold = if bid_is_reducing {
+                reducing_thresh
+            } else {
+                0.0
+            };
+            let ask_threshold = if ask_is_reducing {
+                reducing_thresh
+            } else {
+                0.0
+            };
 
             // Save closest levels before filtering — needed for cascade exemption
             let closest_bid_depth = dynamic_depths.bid.first().copied();
@@ -1344,7 +1360,8 @@ impl LadderStrategy {
             // starvation. Without this, a 20+ bps cascade addon kills all levels because
             // fill probability at extreme depths ≈ 0, making E[PnL] ≈ 0 - AS < 0.
             const CASCADE_EXEMPT_THRESHOLD_BPS: f64 = 10.0;
-            if dynamic_depths.bid.is_empty() && pre_bid_count > 0
+            if dynamic_depths.bid.is_empty()
+                && pre_bid_count > 0
                 && market_params.cascade_bid_addon_bps > CASCADE_EXEMPT_THRESHOLD_BPS
             {
                 if let Some(depth) = closest_bid_depth {
@@ -1356,7 +1373,8 @@ impl LadderStrategy {
                     );
                 }
             }
-            if dynamic_depths.ask.is_empty() && pre_ask_count > 0
+            if dynamic_depths.ask.is_empty()
+                && pre_ask_count > 0
                 && market_params.cascade_ask_addon_bps > CASCADE_EXEMPT_THRESHOLD_BPS
             {
                 if let Some(depth) = closest_ask_depth {
@@ -1710,21 +1728,22 @@ impl LadderStrategy {
             // If Kelly sizer is enabled and warmed up, cap total resting size per side
             // to kelly_fraction × effective_max_position. Quarter-Kelly is the default.
             // Feature-flagged: kelly_fraction() returns None when disabled or not warmed up.
-            let (available_for_bids, available_for_asks) = if let Some(kelly_f) = self.kelly_fraction() {
-                let kelly_budget = kelly_f * effective_max_position;
-                let capped_bids = available_for_bids.min(kelly_budget);
-                let capped_asks = available_for_asks.min(kelly_budget);
-                tracing::info!(
-                    kelly_fraction = %format!("{:.3}", kelly_f),
-                    kelly_budget = %format!("{:.6}", kelly_budget),
-                    bid_cap = %format!("{:.6} -> {:.6}", available_for_bids, capped_bids),
-                    ask_cap = %format!("{:.6} -> {:.6}", available_for_asks, capped_asks),
-                    "Kelly sizing cap applied"
-                );
-                (capped_bids, capped_asks)
-            } else {
-                (available_for_bids, available_for_asks)
-            };
+            let (available_for_bids, available_for_asks) =
+                if let Some(kelly_f) = self.kelly_fraction() {
+                    let kelly_budget = kelly_f * effective_max_position;
+                    let capped_bids = available_for_bids.min(kelly_budget);
+                    let capped_asks = available_for_asks.min(kelly_budget);
+                    tracing::info!(
+                        kelly_fraction = %format!("{:.3}", kelly_f),
+                        kelly_budget = %format!("{:.6}", kelly_budget),
+                        bid_cap = %format!("{:.6} -> {:.6}", available_for_bids, capped_bids),
+                        ask_cap = %format!("{:.6} -> {:.6}", available_for_asks, capped_asks),
+                        "Kelly sizing cap applied"
+                    );
+                    (capped_bids, capped_asks)
+                } else {
+                    (available_for_bids, available_for_asks)
+                };
 
             // === EXPOSURE BUDGET CAP (E1: aggregate fill protection) ===
             // Cap per-side sizing to the exposure budget's available capacity.
@@ -1770,7 +1789,11 @@ impl LadderStrategy {
             //
             // Formula: max_levels = available_capacity / quantum.min_viable_size
             // SizeQuantum uses exact ceiling math — no fudge factors needed.
-            let quantum = SizeQuantum::compute(config.min_notional, market_params.microprice, config.sz_decimals);
+            let quantum = SizeQuantum::compute(
+                config.min_notional,
+                market_params.microprice,
+                config.sz_decimals,
+            );
 
             // Warn if position limit is too small to place even one minimum-notional order
             if quantum.min_viable_size > effective_max_position {
@@ -1827,15 +1850,15 @@ impl LadderStrategy {
                 let tick_size = 10f64.powi(-(config.decimals as i32));
 
                 // GLFT touch depth in bps (used as minimum depth for tick grid)
-                let glft_touch_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
+                let glft_touch_bps =
+                    self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
                 let touch_bps = glft_touch_bps.max(effective_floor_bps);
 
                 // WS2: Wider depth range using tier-dependent multiplier.
                 // Old: max(kappa_cap, touch * 2.0) — only 7.5 bps range for 5 levels.
                 // New: max(kappa_cap, touch * depth_range_multiplier) — 30+ bps for meaningful diversity.
                 let policy = &market_params.capital_policy;
-                let max_depth_bps = (touch_bps * policy.depth_range_multiplier)
-                    .min(100.0); // Absolute cap: never deeper than 100 bps
+                let max_depth_bps = (touch_bps * policy.depth_range_multiplier).min(100.0); // Absolute cap: never deeper than 100 bps
 
                 // WS3: API-budget-aware level count — generate fewer levels when
                 // headroom is low to avoid reconciler dropping excess.
@@ -1913,38 +1936,50 @@ impl LadderStrategy {
                 };
 
                 // WS1: Allocate sizes via utility-proportional softmax
-                let (bid_allocs, bid_diag) = allocate_risk_budget(&selected_bids, &bid_budget, &softmax_params);
-                let (ask_allocs, ask_diag) = allocate_risk_budget(&selected_asks, &ask_budget, &softmax_params);
+                let (bid_allocs, bid_diag) =
+                    allocate_risk_budget(&selected_bids, &bid_budget, &softmax_params);
+                let (ask_allocs, ask_diag) =
+                    allocate_risk_budget(&selected_asks, &ask_budget, &softmax_params);
 
                 // Skip if Red zone cleared accumulating side
-                let bid_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
-                    && position > 0.0;
-                let ask_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
-                    && position < 0.0;
+                let bid_cleared_by_zone =
+                    abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position > 0.0;
+                let ask_cleared_by_zone =
+                    abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position < 0.0;
 
                 // Build ladder from tick-grid allocations
                 let bids: smallvec::SmallVec<_> = if bid_cleared_by_zone {
                     smallvec::smallvec![]
                 } else {
-                    bid_allocs.iter().map(|a| {
-                        LadderLevel {
-                            price: round_to_significant_and_decimal(a.tick.price, 5, config.decimals),
+                    bid_allocs
+                        .iter()
+                        .map(|a| LadderLevel {
+                            price: round_to_significant_and_decimal(
+                                a.tick.price,
+                                5,
+                                config.decimals,
+                            ),
                             size: a.size,
                             depth_bps: a.tick.depth_bps,
-                        }
-                    }).collect()
+                        })
+                        .collect()
                 };
 
                 let asks: smallvec::SmallVec<_> = if ask_cleared_by_zone {
                     smallvec::smallvec![]
                 } else {
-                    ask_allocs.iter().map(|a| {
-                        LadderLevel {
-                            price: round_to_significant_and_decimal(a.tick.price, 5, config.decimals),
+                    ask_allocs
+                        .iter()
+                        .map(|a| LadderLevel {
+                            price: round_to_significant_and_decimal(
+                                a.tick.price,
+                                5,
+                                config.decimals,
+                            ),
                             size: a.size,
                             depth_bps: a.tick.depth_bps,
-                        }
-                    }).collect()
+                        })
+                        .collect()
                 };
 
                 // Apply spread compensation multiplier for small capital
@@ -1955,7 +1990,9 @@ impl LadderStrategy {
                         let new_depth = level.depth_bps * policy.spread_compensation_mult;
                         let offset = market_params.microprice * (new_depth / 10_000.0);
                         level.price = round_to_significant_and_decimal(
-                            market_params.microprice - offset, 5, config.decimals,
+                            market_params.microprice - offset,
+                            5,
+                            config.decimals,
                         );
                         level.depth_bps = new_depth;
                     }
@@ -1963,26 +2000,36 @@ impl LadderStrategy {
                         let new_depth = level.depth_bps * policy.spread_compensation_mult;
                         let offset = market_params.microprice * (new_depth / 10_000.0);
                         level.price = round_to_significant_and_decimal(
-                            market_params.microprice + offset, 5, config.decimals,
+                            market_params.microprice + offset,
+                            5,
+                            config.decimals,
                         );
                         level.depth_bps = new_depth;
                     }
                 }
 
                 // WS6: Diagnostic logging with size distribution
-                let bid_sizes_str: String = ladder.bids.iter()
+                let bid_sizes_str: String = ladder
+                    .bids
+                    .iter()
                     .map(|l| format!("{:.2}", l.size))
                     .collect::<Vec<_>>()
                     .join(",");
-                let ask_sizes_str: String = ladder.asks.iter()
+                let ask_sizes_str: String = ladder
+                    .asks
+                    .iter()
                     .map(|l| format!("{:.2}", l.size))
                     .collect::<Vec<_>>()
                     .join(",");
-                let bid_depths_str: String = ladder.bids.iter()
+                let bid_depths_str: String = ladder
+                    .bids
+                    .iter()
                     .map(|l| format!("{:.1}", l.depth_bps))
                     .collect::<Vec<_>>()
                     .join(",");
-                let ask_depths_str: String = ladder.asks.iter()
+                let ask_depths_str: String = ladder
+                    .asks
+                    .iter()
                     .map(|l| format!("{:.1}", l.depth_bps))
                     .collect::<Vec<_>>()
                     .join(",");
@@ -2008,515 +2055,541 @@ impl LadderStrategy {
 
                 ladder
             } else {
-            // === LEGACY PATH: bps-space depth generation + entropy optimization ===
+                // === LEGACY PATH: bps-space depth generation + entropy optimization ===
 
-            // 4. Generate ladder to get depth levels and prices (using dynamic depths)
-            // NOTE: Don't truncate here - let the entropy optimizer handle distribution
-            // The optimizer has built-in notional constraints that will filter sub-minimum levels
+                // 4. Generate ladder to get depth levels and prices (using dynamic depths)
+                // NOTE: Don't truncate here - let the entropy optimizer handle distribution
+                // The optimizer has built-in notional constraints that will filter sub-minimum levels
 
-            // DIAGNOSTIC: dump actual dynamic depths before ladder generation
-            if let Some(ref dd) = ladder_config.dynamic_depths {
-                let bid_depths_str: Vec<String> = dd.bid.iter().map(|d| format!("{d:.2}")).collect();
-                let ask_depths_str: Vec<String> = dd.ask.iter().map(|d| format!("{d:.2}")).collect();
-                info!(
-                    num_levels = ladder_config.num_levels,
-                    bid_depths = %bid_depths_str.join(","),
-                    ask_depths = %ask_depths_str.join(","),
-                    total_size = %format!("{:.4}", params.total_size),
-                    mid_price = %format!("{:.4}", params.mid_price),
-                    market_mid = %format!("{:.4}", params.market_mid),
-                    "DIAGNOSTIC: pre-generate ladder depths"
-                );
-            }
+                // DIAGNOSTIC: dump actual dynamic depths before ladder generation
+                if let Some(ref dd) = ladder_config.dynamic_depths {
+                    let bid_depths_str: Vec<String> =
+                        dd.bid.iter().map(|d| format!("{d:.2}")).collect();
+                    let ask_depths_str: Vec<String> =
+                        dd.ask.iter().map(|d| format!("{d:.2}")).collect();
+                    info!(
+                        num_levels = ladder_config.num_levels,
+                        bid_depths = %bid_depths_str.join(","),
+                        ask_depths = %ask_depths_str.join(","),
+                        total_size = %format!("{:.4}", params.total_size),
+                        mid_price = %format!("{:.4}", params.mid_price),
+                        market_mid = %format!("{:.4}", params.market_mid),
+                        "DIAGNOSTIC: pre-generate ladder depths"
+                    );
+                }
 
-            let mut ladder = Ladder::generate(&ladder_config, &params);
+                let mut ladder = Ladder::generate(&ladder_config, &params);
 
-            // DIAGNOSTIC: dump post-generate ladder levels
-            {
-                let bid_str: Vec<String> = ladder.bids.iter().map(|l| format!("({:.4}@{:.2}bps,sz={:.2})", l.price, l.depth_bps, l.size)).collect();
-                let ask_str: Vec<String> = ladder.asks.iter().map(|l| format!("({:.4}@{:.2}bps,sz={:.2})", l.price, l.depth_bps, l.size)).collect();
-                info!(
-                    bid_levels = ladder.bids.len(),
-                    ask_levels = ladder.asks.len(),
-                    bids = %bid_str.join(" | "),
-                    asks = %ask_str.join(" | "),
-                    "DIAGNOSTIC: post-generate ladder levels"
-                );
-            }
+                // DIAGNOSTIC: dump post-generate ladder levels
+                {
+                    let bid_str: Vec<String> = ladder
+                        .bids
+                        .iter()
+                        .map(|l| format!("({:.4}@{:.2}bps,sz={:.2})", l.price, l.depth_bps, l.size))
+                        .collect();
+                    let ask_str: Vec<String> = ladder
+                        .asks
+                        .iter()
+                        .map(|l| format!("({:.4}@{:.2}bps,sz={:.2})", l.price, l.depth_bps, l.size))
+                        .collect();
+                    info!(
+                        bid_levels = ladder.bids.len(),
+                        ask_levels = ladder.asks.len(),
+                        bids = %bid_str.join(" | "),
+                        asks = %ask_str.join(" | "),
+                        "DIAGNOSTIC: post-generate ladder levels"
+                    );
+                }
 
-            // Log if capacity is tight (for debugging), but don't truncate
-            if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels
-            {
-                tracing::debug!(
+                // Log if capacity is tight (for debugging), but don't truncate
+                if effective_bid_levels < configured_levels
+                    || effective_ask_levels < configured_levels
+                {
+                    tracing::debug!(
                     configured = configured_levels,
                     capacity_bid = effective_bid_levels,
                     capacity_ask = effective_ask_levels,
                     "Capacity suggests fewer levels, but entropy optimizer will handle distribution"
                 );
-            }
+                }
 
-            // 5. Build LevelOptimizationParams for bids
-            // Use Kelly time horizon for Bayesian fill probability (τ for P(fill|δ,τ))
-            let tau_for_fill = market_params.kelly_time_horizon;
-            let bid_level_params: Vec<_> = ladder
-                .bids
-                .iter()
-                .map(|level| {
-                    // Use Bayesian fill model (empirical when warmed up, theoretical fallback)
-                    let fill_intensity = fill_intensity_with_model(
-                        &self.fill_model,
-                        level.depth_bps,
-                        params.sigma,
-                        tau_for_fill,
-                        params.kappa,
-                    );
-                    let spread_capture =
-                        spread_capture_at_depth(level.depth_bps, &params, ladder_config.fees_bps);
-                    let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
-                    LevelOptimizationParams {
-                        depth_bps: level.depth_bps,
-                        fill_intensity,
-                        spread_capture,
-                        margin_per_unit: market_params.microprice / leverage,
-                        adverse_selection,
-                    }
-                })
-                .collect();
+                // 5. Build LevelOptimizationParams for bids
+                // Use Kelly time horizon for Bayesian fill probability (τ for P(fill|δ,τ))
+                let tau_for_fill = market_params.kelly_time_horizon;
+                let bid_level_params: Vec<_> = ladder
+                    .bids
+                    .iter()
+                    .map(|level| {
+                        // Use Bayesian fill model (empirical when warmed up, theoretical fallback)
+                        let fill_intensity = fill_intensity_with_model(
+                            &self.fill_model,
+                            level.depth_bps,
+                            params.sigma,
+                            tau_for_fill,
+                            params.kappa,
+                        );
+                        let spread_capture = spread_capture_at_depth(
+                            level.depth_bps,
+                            &params,
+                            ladder_config.fees_bps,
+                        );
+                        let adverse_selection =
+                            adverse_selection_at_depth(level.depth_bps, &params);
+                        LevelOptimizationParams {
+                            depth_bps: level.depth_bps,
+                            fill_intensity,
+                            spread_capture,
+                            margin_per_unit: market_params.microprice / leverage,
+                            adverse_selection,
+                        }
+                    })
+                    .collect();
 
-            // 6. Optimize bid sizes
-            if !bid_level_params.is_empty() {
-                if market_params.capital_policy.skip_entropy_optimization {
-                    // CAPITAL-AWARE: Equal-weight allocation for Micro/Small tiers.
-                    // Saves compute and produces predictable, min-size orders.
-                    let equal_size = available_for_bids / ladder.bids.len().max(1) as f64;
-                    for bid in &mut ladder.bids {
-                        bid.size = truncate_float(equal_size, config.sz_decimals, false);
-                    }
-                    debug!(
-                        equal_size = %format!("{:.4}", equal_size),
-                        levels = ladder.bids.len(),
-                        "Skip entropy: equal-weight bid allocation"
-                    );
-                } else {
-                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
-                    // Uses information-theoretic entropy constraints to maintain diversity
-                    // and prevent collapse to 1-2 orders even under adverse conditions.
-                    let entropy_config = EntropyOptimizerConfig {
-                        distribution: EntropyDistributionConfig {
-                            min_entropy: market_params.entropy_min_entropy,
-                            base_temperature: market_params.entropy_base_temperature,
-                            min_allocation_floor: market_params.entropy_min_allocation_floor,
-                            thompson_samples: market_params.entropy_thompson_samples,
+                // 6. Optimize bid sizes
+                if !bid_level_params.is_empty() {
+                    if market_params.capital_policy.skip_entropy_optimization {
+                        // CAPITAL-AWARE: Equal-weight allocation for Micro/Small tiers.
+                        // Saves compute and produces predictable, min-size orders.
+                        let equal_size = available_for_bids / ladder.bids.len().max(1) as f64;
+                        for bid in &mut ladder.bids {
+                            bid.size = truncate_float(equal_size, config.sz_decimals, false);
+                        }
+                        debug!(
+                            equal_size = %format!("{:.4}", equal_size),
+                            levels = ladder.bids.len(),
+                            "Skip entropy: equal-weight bid allocation"
+                        );
+                    } else {
+                        // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                        // Uses information-theoretic entropy constraints to maintain diversity
+                        // and prevent collapse to 1-2 orders even under adverse conditions.
+                        let entropy_config = EntropyOptimizerConfig {
+                            distribution: EntropyDistributionConfig {
+                                min_entropy: market_params.entropy_min_entropy,
+                                base_temperature: market_params.entropy_base_temperature,
+                                min_allocation_floor: market_params.entropy_min_allocation_floor,
+                                thompson_samples: market_params.entropy_thompson_samples,
+                                ..Default::default()
+                            },
+                            min_notional: config.min_notional,
                             ..Default::default()
-                        },
-                        min_notional: config.min_notional,
-                        ..Default::default()
-                    };
+                        };
 
-                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
-                        entropy_config,
-                        market_params.microprice,
-                        margin_for_bids, // Use inventory-weighted margin split (not full margin)
-                        available_for_bids,
-                        leverage,
-                    );
+                        let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                            entropy_config,
+                            market_params.microprice,
+                            margin_for_bids, // Use inventory-weighted margin split (not full margin)
+                            available_for_bids,
+                            leverage,
+                        );
 
-                    let regime = Self::build_market_regime(market_params);
-                    let entropy_alloc = entropy_optimizer.optimize(&bid_level_params, &regime);
+                        let regime = Self::build_market_regime(market_params);
+                        let entropy_alloc = entropy_optimizer.optimize(&bid_level_params, &regime);
 
-                    info!(
-                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
-                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
-                        entropy_floor_active = entropy_alloc.entropy_floor_active,
-                        active_levels = entropy_alloc.active_levels,
-                        "Entropy optimizer applied to bids"
-                    );
+                        info!(
+                            entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                            effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                            entropy_floor_active = entropy_alloc.entropy_floor_active,
+                            active_levels = entropy_alloc.active_levels,
+                            "Entropy optimizer applied to bids"
+                        );
 
-                    let allocation = entropy_alloc.to_legacy();
+                        let allocation = entropy_alloc.to_legacy();
 
-                    for (i, &size) in allocation.sizes.iter().enumerate() {
-                        if i < ladder.bids.len() {
-                            // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
-                            ladder.bids[i].size = truncate_float(size, config.sz_decimals, false);
+                        for (i, &size) in allocation.sizes.iter().enumerate() {
+                            if i < ladder.bids.len() {
+                                // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
+                                ladder.bids[i].size =
+                                    truncate_float(size, config.sz_decimals, false);
+                            }
                         }
                     }
                 }
-            }
 
-            // 7. Build LevelOptimizationParams for asks
-            let ask_level_params: Vec<_> = ladder
-                .asks
-                .iter()
-                .map(|level| {
-                    // Use Bayesian fill model (empirical when warmed up, theoretical fallback)
-                    let fill_intensity = fill_intensity_with_model(
-                        &self.fill_model,
-                        level.depth_bps,
-                        params.sigma,
-                        tau_for_fill,
-                        params.kappa,
-                    );
-                    let spread_capture =
-                        spread_capture_at_depth(level.depth_bps, &params, ladder_config.fees_bps);
-                    let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
-                    LevelOptimizationParams {
-                        depth_bps: level.depth_bps,
-                        fill_intensity,
-                        spread_capture,
-                        margin_per_unit: market_params.microprice / leverage,
-                        adverse_selection,
-                    }
-                })
-                .collect();
+                // 7. Build LevelOptimizationParams for asks
+                let ask_level_params: Vec<_> = ladder
+                    .asks
+                    .iter()
+                    .map(|level| {
+                        // Use Bayesian fill model (empirical when warmed up, theoretical fallback)
+                        let fill_intensity = fill_intensity_with_model(
+                            &self.fill_model,
+                            level.depth_bps,
+                            params.sigma,
+                            tau_for_fill,
+                            params.kappa,
+                        );
+                        let spread_capture = spread_capture_at_depth(
+                            level.depth_bps,
+                            &params,
+                            ladder_config.fees_bps,
+                        );
+                        let adverse_selection =
+                            adverse_selection_at_depth(level.depth_bps, &params);
+                        LevelOptimizationParams {
+                            depth_bps: level.depth_bps,
+                            fill_intensity,
+                            spread_capture,
+                            margin_per_unit: market_params.microprice / leverage,
+                            adverse_selection,
+                        }
+                    })
+                    .collect();
 
-            // 8. Optimize ask sizes
-            if !ask_level_params.is_empty() {
-                if market_params.capital_policy.skip_entropy_optimization {
-                    // CAPITAL-AWARE: Equal-weight allocation for Micro/Small tiers.
-                    let equal_size = available_for_asks / ladder.asks.len().max(1) as f64;
-                    for ask in &mut ladder.asks {
-                        ask.size = truncate_float(equal_size, config.sz_decimals, false);
-                    }
-                    debug!(
-                        equal_size = %format!("{:.4}", equal_size),
-                        levels = ladder.asks.len(),
-                        "Skip entropy: equal-weight ask allocation"
-                    );
-                } else {
-                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
-                    // Uses information-theoretic entropy constraints to maintain diversity
-                    // and prevent collapse to 1-2 orders even under adverse conditions.
-                    let entropy_config = EntropyOptimizerConfig {
-                        distribution: EntropyDistributionConfig {
-                            min_entropy: market_params.entropy_min_entropy,
-                            base_temperature: market_params.entropy_base_temperature,
-                            min_allocation_floor: market_params.entropy_min_allocation_floor,
-                            thompson_samples: market_params.entropy_thompson_samples,
+                // 8. Optimize ask sizes
+                if !ask_level_params.is_empty() {
+                    if market_params.capital_policy.skip_entropy_optimization {
+                        // CAPITAL-AWARE: Equal-weight allocation for Micro/Small tiers.
+                        let equal_size = available_for_asks / ladder.asks.len().max(1) as f64;
+                        for ask in &mut ladder.asks {
+                            ask.size = truncate_float(equal_size, config.sz_decimals, false);
+                        }
+                        debug!(
+                            equal_size = %format!("{:.4}", equal_size),
+                            levels = ladder.asks.len(),
+                            "Skip entropy: equal-weight ask allocation"
+                        );
+                    } else {
+                        // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                        // Uses information-theoretic entropy constraints to maintain diversity
+                        // and prevent collapse to 1-2 orders even under adverse conditions.
+                        let entropy_config = EntropyOptimizerConfig {
+                            distribution: EntropyDistributionConfig {
+                                min_entropy: market_params.entropy_min_entropy,
+                                base_temperature: market_params.entropy_base_temperature,
+                                min_allocation_floor: market_params.entropy_min_allocation_floor,
+                                thompson_samples: market_params.entropy_thompson_samples,
+                                ..Default::default()
+                            },
+                            min_notional: config.min_notional,
                             ..Default::default()
-                        },
-                        min_notional: config.min_notional,
-                        ..Default::default()
-                    };
+                        };
 
-                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
-                        entropy_config,
-                        market_params.microprice,
-                        margin_for_asks, // Use inventory-weighted margin split (not full margin)
-                        available_for_asks,
-                        leverage,
-                    );
+                        let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                            entropy_config,
+                            market_params.microprice,
+                            margin_for_asks, // Use inventory-weighted margin split (not full margin)
+                            available_for_asks,
+                            leverage,
+                        );
 
-                    let regime = Self::build_market_regime(market_params);
-                    let entropy_alloc = entropy_optimizer.optimize(&ask_level_params, &regime);
+                        let regime = Self::build_market_regime(market_params);
+                        let entropy_alloc = entropy_optimizer.optimize(&ask_level_params, &regime);
 
-                    info!(
-                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
-                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
-                        entropy_floor_active = entropy_alloc.entropy_floor_active,
-                        active_levels = entropy_alloc.active_levels,
-                        "Entropy optimizer applied to asks"
-                    );
+                        info!(
+                            entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                            effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                            entropy_floor_active = entropy_alloc.entropy_floor_active,
+                            active_levels = entropy_alloc.active_levels,
+                            "Entropy optimizer applied to asks"
+                        );
 
-                    let allocation = entropy_alloc.to_legacy();
+                        let allocation = entropy_alloc.to_legacy();
 
-                    for (i, &size) in allocation.sizes.iter().enumerate() {
-                        if i < ladder.asks.len() {
-                            // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
-                            ladder.asks[i].size = truncate_float(size, config.sz_decimals, false);
+                        for (i, &size) in allocation.sizes.iter().enumerate() {
+                            if i < ladder.asks.len() {
+                                // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
+                                ladder.asks[i].size =
+                                    truncate_float(size, config.sz_decimals, false);
+                            }
                         }
                     }
                 }
-            }
 
-            // 8b. PER-LEVEL SIZE CAP: No single resting order may exceed 25% of the USER'S
-            // risk-based max position (not the margin-based quoting capacity).
-            // GLFT inventory theory: if a single fill can push q to max, the reservation
-            // price adjustment q*gamma*sigma^2*T swings maximally and the MM cannot recover.
-            // This cap guarantees at least 4 fills are needed to reach max inventory,
-            // giving the gamma/skew feedback loop time to widen spreads defensively.
-            //
-            // We cap against max_position (the $50 USD-derived risk limit = 1.58 contracts),
-            // NOT effective_max_position (margin-based quoting capacity = 51 contracts).
-            // The risk limit is what matters for inventory blowup prevention.
-            let per_level_cap = truncate_float(
-                (max_position * MAX_SINGLE_ORDER_FRACTION).max(quantum.min_viable_size),
-                config.sz_decimals,
-                false,
-            );
-            let mut any_capped = false;
-            for level in ladder.bids.iter_mut().chain(ladder.asks.iter_mut()) {
-                if level.size > per_level_cap {
-                    any_capped = true;
-                    level.size = per_level_cap;
-                }
-            }
-            if any_capped {
-                info!(
-                    per_level_cap = %format!("{:.6}", per_level_cap),
-                    risk_max_position = %format!("{:.6}", max_position),
-                    fraction = %format!("{:.0}%", MAX_SINGLE_ORDER_FRACTION * 100.0),
-                    "Per-level size cap applied: no single order exceeds {}% of risk max position",
-                    (MAX_SINGLE_ORDER_FRACTION * 100.0) as u32,
+                // 8b. PER-LEVEL SIZE CAP: No single resting order may exceed 25% of the USER'S
+                // risk-based max position (not the margin-based quoting capacity).
+                // GLFT inventory theory: if a single fill can push q to max, the reservation
+                // price adjustment q*gamma*sigma^2*T swings maximally and the MM cannot recover.
+                // This cap guarantees at least 4 fills are needed to reach max inventory,
+                // giving the gamma/skew feedback loop time to widen spreads defensively.
+                //
+                // We cap against max_position (the $50 USD-derived risk limit = 1.58 contracts),
+                // NOT effective_max_position (margin-based quoting capacity = 51 contracts).
+                // The risk limit is what matters for inventory blowup prevention.
+                let per_level_cap = truncate_float(
+                    (max_position * MAX_SINGLE_ORDER_FRACTION).max(quantum.min_viable_size),
+                    config.sz_decimals,
+                    false,
                 );
-            }
-
-            // 9. Filter out levels below minimum notional (exchange will reject them anyway)
-            // SizeQuantum is the exact truncation-safe minimum — no fudge factor needed.
-            // Use >= (not >): levels at exactly min_viable_size are valid and truncation-stable.
-            let min_size_for_exchange = quantum.min_viable_size;
-            let bids_before = ladder.bids.len();
-            let asks_before = ladder.asks.len();
-            ladder.bids.retain(|l| l.size >= min_size_for_exchange);
-            ladder.asks.retain(|l| l.size >= min_size_for_exchange);
-
-            // 10. CONCENTRATION FALLBACK: If ladder is empty but total available size
-            // meets min_notional, create single concentrated order at tightest depth.
-            // This handles TWO cases:
-            //   a) Levels existed but were filtered by min_size_for_exchange (bids_before > 0)
-            //   b) Ladder::generate() returned empty because total_size was too small to
-            //      distribute across num_levels and pass min_notional per level (bids_before == 0)
-            // Case (b) occurs with small capital in restrictive regimes (e.g., $100 capital,
-            // Extreme regime → effective_max ~1 HYPE → 0.09/level across 10 levels < $10 min)
-            let _min_size_for_order = config.min_notional / market_params.microprice; // Kept for reference
-            // FIX: Use min_viable_depth_bps from capacity budget to survive QueueValue filtering.
-            // Was: ladder_config.min_depth_bps (2.0 bps) → below QueueValue breakeven (4.5 bps)
-            let tightest_depth_bps = market_params.capacity_budget
-                .as_ref()
-                .map(|b| b.min_viable_depth_bps)
-                .unwrap_or(5.0)
-                .max(ladder_config.min_depth_bps);
-
-            // Bid concentration fallback — skip if Red zone cleared bids (reduce-only for longs)
-            let bid_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
-                && position > 0.0;
-            if ladder.bids.is_empty() && !bid_cleared_by_zone {
-                // Total available size for bids, capped at 25% of the USER'S risk-based
-                // max position per order (not margin-based quoting capacity).
-                // GLFT inventory theory: one fill at max position creates maximal reservation
-                // price swing q*gamma*sigma^2*T with zero recovery capacity.
-                let per_order_cap = (max_position * MAX_SINGLE_ORDER_FRACTION)
-                    .max(quantum.min_viable_size);
-                let total_bid_size = quantum
-                    .clamp_to_viable(available_for_bids.min(per_order_cap), true)
-                    .unwrap_or(0.0);
-
-                if quantum.is_sufficient(total_bid_size) && total_bid_size > 1e-10 {
-                    // Create concentrated order at tightest depth
-                    let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
-                    let bid_price = round_to_significant_and_decimal(
-                        market_params.microprice - offset,
-                        5,
-                        config.decimals,
-                    );
-
-                    ladder.bids.push(LadderLevel {
-                        price: bid_price,
-                        size: total_bid_size,
-                        depth_bps: tightest_depth_bps,
-                    });
-
+                let mut any_capped = false;
+                for level in ladder.bids.iter_mut().chain(ladder.asks.iter_mut()) {
+                    if level.size > per_level_cap {
+                        any_capped = true;
+                        level.size = per_level_cap;
+                    }
+                }
+                if any_capped {
                     info!(
-                        size = %format!("{:.6}", total_bid_size),
-                        price = %format!("{:.2}", bid_price),
-                        notional = %format!("{:.2}", total_bid_size * bid_price),
-                        depth_bps = %format!("{:.2}", tightest_depth_bps),
-                        levels_before = bids_before,
-                        per_order_cap = %format!("{:.6}", per_order_cap),
-                        "Bid concentration fallback: single order at tightest depth (size-capped)"
-                    );
-                } else {
-                    warn!(
-                        bids_before = bids_before,
-                        available_margin = %format!("{:.2}", available_margin),
-                        available_position = %format!("{:.6}", available_for_bids),
-                        min_notional = %format!("{:.2}", config.min_notional),
-                        min_level_size = %format!("{:.6}", ladder_config.min_level_size),
-                        mid_price = %format!("{:.2}", market_params.microprice),
-                        "All bid levels filtered out (total size below min_notional)"
+                        per_level_cap = %format!("{:.6}", per_level_cap),
+                        risk_max_position = %format!("{:.6}", max_position),
+                        fraction = %format!("{:.0}%", MAX_SINGLE_ORDER_FRACTION * 100.0),
+                        "Per-level size cap applied: no single order exceeds {}% of risk max position",
+                        (MAX_SINGLE_ORDER_FRACTION * 100.0) as u32,
                     );
                 }
-            }
 
-            // Ask concentration fallback — skip if Red zone cleared asks (reduce-only for shorts)
-            let ask_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
-                && position < 0.0;
-            if ladder.asks.is_empty() && !ask_cleared_by_zone {
-                // Total available size for asks, capped at 25% of the USER'S risk-based
-                // max position per order (not margin-based quoting capacity).
-                let per_order_cap = (max_position * MAX_SINGLE_ORDER_FRACTION)
-                    .max(quantum.min_viable_size);
-                let total_ask_size = quantum
-                    .clamp_to_viable(available_for_asks.min(per_order_cap), true)
-                    .unwrap_or(0.0);
+                // 9. Filter out levels below minimum notional (exchange will reject them anyway)
+                // SizeQuantum is the exact truncation-safe minimum — no fudge factor needed.
+                // Use >= (not >): levels at exactly min_viable_size are valid and truncation-stable.
+                let min_size_for_exchange = quantum.min_viable_size;
+                let bids_before = ladder.bids.len();
+                let asks_before = ladder.asks.len();
+                ladder.bids.retain(|l| l.size >= min_size_for_exchange);
+                ladder.asks.retain(|l| l.size >= min_size_for_exchange);
 
-                if quantum.is_sufficient(total_ask_size) && total_ask_size > 1e-10 {
-                    // Create concentrated order at tightest depth
-                    let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
-                    let ask_price = round_to_significant_and_decimal(
-                        market_params.microprice + offset,
-                        5,
-                        config.decimals,
-                    );
+                // 10. CONCENTRATION FALLBACK: If ladder is empty but total available size
+                // meets min_notional, create single concentrated order at tightest depth.
+                // This handles TWO cases:
+                //   a) Levels existed but were filtered by min_size_for_exchange (bids_before > 0)
+                //   b) Ladder::generate() returned empty because total_size was too small to
+                //      distribute across num_levels and pass min_notional per level (bids_before == 0)
+                // Case (b) occurs with small capital in restrictive regimes (e.g., $100 capital,
+                // Extreme regime → effective_max ~1 HYPE → 0.09/level across 10 levels < $10 min)
+                let _min_size_for_order = config.min_notional / market_params.microprice; // Kept for reference
+                                                                                          // FIX: Use min_viable_depth_bps from capacity budget to survive QueueValue filtering.
+                                                                                          // Was: ladder_config.min_depth_bps (2.0 bps) → below QueueValue breakeven (4.5 bps)
+                let tightest_depth_bps = market_params
+                    .capacity_budget
+                    .as_ref()
+                    .map(|b| b.min_viable_depth_bps)
+                    .unwrap_or(5.0)
+                    .max(ladder_config.min_depth_bps);
 
-                    ladder.asks.push(LadderLevel {
-                        price: ask_price,
-                        size: total_ask_size,
-                        depth_bps: tightest_depth_bps,
-                    });
+                // Bid concentration fallback — skip if Red zone cleared bids (reduce-only for longs)
+                let bid_cleared_by_zone =
+                    abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position > 0.0;
+                if ladder.bids.is_empty() && !bid_cleared_by_zone {
+                    // Total available size for bids, capped at 25% of the USER'S risk-based
+                    // max position per order (not margin-based quoting capacity).
+                    // GLFT inventory theory: one fill at max position creates maximal reservation
+                    // price swing q*gamma*sigma^2*T with zero recovery capacity.
+                    let per_order_cap =
+                        (max_position * MAX_SINGLE_ORDER_FRACTION).max(quantum.min_viable_size);
+                    let total_bid_size = quantum
+                        .clamp_to_viable(available_for_bids.min(per_order_cap), true)
+                        .unwrap_or(0.0);
 
-                    info!(
-                        size = %format!("{:.6}", total_ask_size),
-                        price = %format!("{:.2}", ask_price),
-                        notional = %format!("{:.2}", total_ask_size * ask_price),
-                        depth_bps = %format!("{:.2}", tightest_depth_bps),
-                        levels_before = asks_before,
-                        per_order_cap = %format!("{:.6}", per_order_cap),
-                        "Ask concentration fallback: single order at tightest depth (size-capped)"
-                    );
-                } else {
-                    warn!(
-                        asks_before = asks_before,
-                        available_margin = %format!("{:.2}", available_margin),
-                        available_position = %format!("{:.6}", available_for_asks),
-                        min_notional = %format!("{:.2}", config.min_notional),
-                        min_level_size = %format!("{:.6}", ladder_config.min_level_size),
-                        mid_price = %format!("{:.2}", market_params.microprice),
-                        "All ask levels filtered out (total size below min_notional)"
-                    );
+                    if quantum.is_sufficient(total_bid_size) && total_bid_size > 1e-10 {
+                        // Create concentrated order at tightest depth
+                        let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
+                        let bid_price = round_to_significant_and_decimal(
+                            market_params.microprice - offset,
+                            5,
+                            config.decimals,
+                        );
+
+                        ladder.bids.push(LadderLevel {
+                            price: bid_price,
+                            size: total_bid_size,
+                            depth_bps: tightest_depth_bps,
+                        });
+
+                        info!(
+                            size = %format!("{:.6}", total_bid_size),
+                            price = %format!("{:.2}", bid_price),
+                            notional = %format!("{:.2}", total_bid_size * bid_price),
+                            depth_bps = %format!("{:.2}", tightest_depth_bps),
+                            levels_before = bids_before,
+                            per_order_cap = %format!("{:.6}", per_order_cap),
+                            "Bid concentration fallback: single order at tightest depth (size-capped)"
+                        );
+                    } else {
+                        warn!(
+                            bids_before = bids_before,
+                            available_margin = %format!("{:.2}", available_margin),
+                            available_position = %format!("{:.6}", available_for_bids),
+                            min_notional = %format!("{:.2}", config.min_notional),
+                            min_level_size = %format!("{:.6}", ladder_config.min_level_size),
+                            mid_price = %format!("{:.2}", market_params.microprice),
+                            "All bid levels filtered out (total size below min_notional)"
+                        );
+                    }
                 }
-            }
 
-            // === COST-BASIS-AWARE PRICE CLAMPING ===
-            // Prevent selling below breakeven (long) or buying above breakeven (short).
-            // This eliminates the "buy high, sell low" pattern observed in live trading.
-            // Override only when urgency is low — high urgency overrides to exit.
-            //
-            // SKIP when position > 50% of max: reducing inventory is more important
-            // than protecting breakeven. In a 4h session this triggered 976 times
-            // (every cycle), preventing the strategy from ever reducing position.
-            //
-            // IMPORTANT: The breakeven price must be snapped to the exchange tick grid
-            // BEFORE sig-fig rounding, using directional rounding (ceil for asks, floor
-            // for bids) to guarantee we never sell below / buy above true breakeven.
-            // The tick size is 10^(-price_decimals) where price_decimals = config.decimals.
-            if let Some(entry_price) = market_params.avg_entry_price {
-                let breakeven = market_params.breakeven_price;
-                let position = inventory_ratio; // already computed above
-                let tick_size = 10f64.powi(-(config.decimals as i32));
+                // Ask concentration fallback — skip if Red zone cleared asks (reduce-only for shorts)
+                let ask_cleared_by_zone =
+                    abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position < 0.0;
+                if ladder.asks.is_empty() && !ask_cleared_by_zone {
+                    // Total available size for asks, capped at 25% of the USER'S risk-based
+                    // max position per order (not margin-based quoting capacity).
+                    let per_order_cap =
+                        (max_position * MAX_SINGLE_ORDER_FRACTION).max(quantum.min_viable_size);
+                    let total_ask_size = quantum
+                        .clamp_to_viable(available_for_asks.min(per_order_cap), true)
+                        .unwrap_or(0.0);
 
-                // Skip breakeven clamping when position is large — reducing is more important.
-                // At > 50% of max position, the inventory risk from holding outweighs the
-                // small loss from selling below / buying above breakeven.
-                let skip_clamping = position.abs() > 0.5;
+                    if quantum.is_sufficient(total_ask_size) && total_ask_size > 1e-10 {
+                        // Create concentrated order at tightest depth
+                        let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
+                        let ask_price = round_to_significant_and_decimal(
+                            market_params.microprice + offset,
+                            5,
+                            config.decimals,
+                        );
 
-                if breakeven > 0.0 && !skip_clamping {
-                    if position > 0.0 {
-                        // Long position: don't sell below breakeven unless urgent.
-                        // Round breakeven UP to tick grid so ask >= true breakeven.
-                        // Divisor 20.0: triggers urgency override earlier than the
-                        // previous /50.0 (at ~10 bps underwater vs ~25 bps before).
-                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 20.0).max(0.0)).min(1.0);
-                        if urgency < 0.5 {
-                            // Snap breakeven UP to tick grid (ceil), then enforce 5-sig-fig
-                            let breakeven_on_tick = (breakeven / tick_size).ceil() * tick_size;
-                            let mut rounded_breakeven = round_to_significant_and_decimal(
-                                breakeven_on_tick,
-                                5,
-                                config.decimals,
-                            );
-                            // Safety: if sig-fig rounding dropped us below true breakeven,
-                            // bump up by one tick and re-round
-                            if rounded_breakeven < breakeven - EPSILON {
-                                rounded_breakeven = round_to_significant_and_decimal(
-                                    rounded_breakeven + tick_size,
+                        ladder.asks.push(LadderLevel {
+                            price: ask_price,
+                            size: total_ask_size,
+                            depth_bps: tightest_depth_bps,
+                        });
+
+                        info!(
+                            size = %format!("{:.6}", total_ask_size),
+                            price = %format!("{:.2}", ask_price),
+                            notional = %format!("{:.2}", total_ask_size * ask_price),
+                            depth_bps = %format!("{:.2}", tightest_depth_bps),
+                            levels_before = asks_before,
+                            per_order_cap = %format!("{:.6}", per_order_cap),
+                            "Ask concentration fallback: single order at tightest depth (size-capped)"
+                        );
+                    } else {
+                        warn!(
+                            asks_before = asks_before,
+                            available_margin = %format!("{:.2}", available_margin),
+                            available_position = %format!("{:.6}", available_for_asks),
+                            min_notional = %format!("{:.2}", config.min_notional),
+                            min_level_size = %format!("{:.6}", ladder_config.min_level_size),
+                            mid_price = %format!("{:.2}", market_params.microprice),
+                            "All ask levels filtered out (total size below min_notional)"
+                        );
+                    }
+                }
+
+                // === COST-BASIS-AWARE PRICE CLAMPING ===
+                // Prevent selling below breakeven (long) or buying above breakeven (short).
+                // This eliminates the "buy high, sell low" pattern observed in live trading.
+                // Override only when urgency is low — high urgency overrides to exit.
+                //
+                // SKIP when position > 50% of max: reducing inventory is more important
+                // than protecting breakeven. In a 4h session this triggered 976 times
+                // (every cycle), preventing the strategy from ever reducing position.
+                //
+                // IMPORTANT: The breakeven price must be snapped to the exchange tick grid
+                // BEFORE sig-fig rounding, using directional rounding (ceil for asks, floor
+                // for bids) to guarantee we never sell below / buy above true breakeven.
+                // The tick size is 10^(-price_decimals) where price_decimals = config.decimals.
+                if let Some(entry_price) = market_params.avg_entry_price {
+                    let breakeven = market_params.breakeven_price;
+                    let position = inventory_ratio; // already computed above
+                    let tick_size = 10f64.powi(-(config.decimals as i32));
+
+                    // Skip breakeven clamping when position is large — reducing is more important.
+                    // At > 50% of max position, the inventory risk from holding outweighs the
+                    // small loss from selling below / buying above breakeven.
+                    let skip_clamping = position.abs() > 0.5;
+
+                    if breakeven > 0.0 && !skip_clamping {
+                        if position > 0.0 {
+                            // Long position: don't sell below breakeven unless urgent.
+                            // Round breakeven UP to tick grid so ask >= true breakeven.
+                            // Divisor 20.0: triggers urgency override earlier than the
+                            // previous /50.0 (at ~10 bps underwater vs ~25 bps before).
+                            let urgency = (position.abs()
+                                * (-market_params.unrealized_pnl_bps / 20.0).max(0.0))
+                            .min(1.0);
+                            if urgency < 0.5 {
+                                // Snap breakeven UP to tick grid (ceil), then enforce 5-sig-fig
+                                let breakeven_on_tick = (breakeven / tick_size).ceil() * tick_size;
+                                let mut rounded_breakeven = round_to_significant_and_decimal(
+                                    breakeven_on_tick,
                                     5,
                                     config.decimals,
                                 );
-                            }
+                                // Safety: if sig-fig rounding dropped us below true breakeven,
+                                // bump up by one tick and re-round
+                                if rounded_breakeven < breakeven - EPSILON {
+                                    rounded_breakeven = round_to_significant_and_decimal(
+                                        rounded_breakeven + tick_size,
+                                        5,
+                                        config.decimals,
+                                    );
+                                }
 
-                            let mut clamped_count = 0;
-                            for level in ladder.asks.iter_mut() {
-                                if level.price < breakeven {
-                                    level.price = rounded_breakeven;
-                                    clamped_count += 1;
+                                let mut clamped_count = 0;
+                                for level in ladder.asks.iter_mut() {
+                                    if level.price < breakeven {
+                                        level.price = rounded_breakeven;
+                                        clamped_count += 1;
+                                    }
+                                }
+                                if clamped_count > 0 {
+                                    tracing::info!(
+                                        entry = %format!("{:.4}", entry_price),
+                                        breakeven = %format!("{:.4}", breakeven),
+                                        rounded_breakeven = %format!("{:.4}", rounded_breakeven),
+                                        tick_size = %tick_size,
+                                        unrealized_bps = %format!("{:.1}", market_params.unrealized_pnl_bps),
+                                        clamped = clamped_count,
+                                        urgency = %format!("{:.2}", urgency),
+                                        "[COST-BASIS] Long: clamped ask prices to breakeven"
+                                    );
                                 }
                             }
-                            if clamped_count > 0 {
-                                tracing::info!(
-                                    entry = %format!("{:.4}", entry_price),
-                                    breakeven = %format!("{:.4}", breakeven),
-                                    rounded_breakeven = %format!("{:.4}", rounded_breakeven),
-                                    tick_size = %tick_size,
-                                    unrealized_bps = %format!("{:.1}", market_params.unrealized_pnl_bps),
-                                    clamped = clamped_count,
-                                    urgency = %format!("{:.2}", urgency),
-                                    "[COST-BASIS] Long: clamped ask prices to breakeven"
-                                );
-                            }
-                        }
-                    } else if position < 0.0 {
-                        // Short position: don't buy above breakeven unless urgent.
-                        // Round breakeven DOWN to tick grid so bid <= true breakeven.
-                        // Divisor 20.0: triggers urgency override earlier (see long side comment).
-                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 20.0).max(0.0)).min(1.0);
-                        if urgency < 0.5 {
-                            // Snap breakeven DOWN to tick grid (floor), then enforce 5-sig-fig
-                            let breakeven_on_tick = (breakeven / tick_size).floor() * tick_size;
-                            let mut rounded_breakeven = round_to_significant_and_decimal(
-                                breakeven_on_tick,
-                                5,
-                                config.decimals,
-                            );
-                            // Safety: if sig-fig rounding pushed us above true breakeven,
-                            // drop by one tick and re-round
-                            if rounded_breakeven > breakeven + EPSILON {
-                                rounded_breakeven = round_to_significant_and_decimal(
-                                    rounded_breakeven - tick_size,
+                        } else if position < 0.0 {
+                            // Short position: don't buy above breakeven unless urgent.
+                            // Round breakeven DOWN to tick grid so bid <= true breakeven.
+                            // Divisor 20.0: triggers urgency override earlier (see long side comment).
+                            let urgency = (position.abs()
+                                * (-market_params.unrealized_pnl_bps / 20.0).max(0.0))
+                            .min(1.0);
+                            if urgency < 0.5 {
+                                // Snap breakeven DOWN to tick grid (floor), then enforce 5-sig-fig
+                                let breakeven_on_tick = (breakeven / tick_size).floor() * tick_size;
+                                let mut rounded_breakeven = round_to_significant_and_decimal(
+                                    breakeven_on_tick,
                                     5,
                                     config.decimals,
                                 );
-                            }
-
-                            let mut clamped_count = 0;
-                            for level in ladder.bids.iter_mut() {
-                                if level.price > breakeven {
-                                    level.price = rounded_breakeven;
-                                    clamped_count += 1;
+                                // Safety: if sig-fig rounding pushed us above true breakeven,
+                                // drop by one tick and re-round
+                                if rounded_breakeven > breakeven + EPSILON {
+                                    rounded_breakeven = round_to_significant_and_decimal(
+                                        rounded_breakeven - tick_size,
+                                        5,
+                                        config.decimals,
+                                    );
                                 }
-                            }
-                            if clamped_count > 0 {
-                                tracing::info!(
-                                    entry = %format!("{:.4}", entry_price),
-                                    breakeven = %format!("{:.4}", breakeven),
-                                    rounded_breakeven = %format!("{:.4}", rounded_breakeven),
-                                    tick_size = %tick_size,
-                                    unrealized_bps = %format!("{:.1}", market_params.unrealized_pnl_bps),
-                                    clamped = clamped_count,
-                                    urgency = %format!("{:.2}", urgency),
-                                    "[COST-BASIS] Short: clamped bid prices to breakeven"
-                                );
+
+                                let mut clamped_count = 0;
+                                for level in ladder.bids.iter_mut() {
+                                    if level.price > breakeven {
+                                        level.price = rounded_breakeven;
+                                        clamped_count += 1;
+                                    }
+                                }
+                                if clamped_count > 0 {
+                                    tracing::info!(
+                                        entry = %format!("{:.4}", entry_price),
+                                        breakeven = %format!("{:.4}", breakeven),
+                                        rounded_breakeven = %format!("{:.4}", rounded_breakeven),
+                                        tick_size = %tick_size,
+                                        unrealized_bps = %format!("{:.1}", market_params.unrealized_pnl_bps),
+                                        clamped = clamped_count,
+                                        urgency = %format!("{:.2}", urgency),
+                                        "[COST-BASIS] Short: clamped bid prices to breakeven"
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // DIAGNOSTIC: Only warn if still empty after concentration fallback
-            if ladder.bids.is_empty() && ladder.asks.is_empty() {
-                let dynamic_min_size = quantum.min_viable_size;
-                warn!(
-                    available_for_bids = %format!("{:.6}", available_for_bids),
-                    available_for_asks = %format!("{:.6}", available_for_asks),
-                    min_notional = %format!("{:.2}", config.min_notional),
-                    dynamic_min_size = %format!("{:.6}", dynamic_min_size),
-                    margin_available = %format!("{:.2}", available_margin),
-                    bid_notional = %format!("{:.2}", available_for_bids * market_params.microprice),
-                    ask_notional = %format!("{:.2}", available_for_asks * market_params.microprice),
-                    "Ladder completely empty: available size below min_notional (no fallback possible)"
-                );
-            }
+                // DIAGNOSTIC: Only warn if still empty after concentration fallback
+                if ladder.bids.is_empty() && ladder.asks.is_empty() {
+                    let dynamic_min_size = quantum.min_viable_size;
+                    warn!(
+                        available_for_bids = %format!("{:.6}", available_for_bids),
+                        available_for_asks = %format!("{:.6}", available_for_asks),
+                        min_notional = %format!("{:.2}", config.min_notional),
+                        dynamic_min_size = %format!("{:.6}", dynamic_min_size),
+                        margin_available = %format!("{:.2}", available_margin),
+                        bid_notional = %format!("{:.2}", available_for_bids * market_params.microprice),
+                        ask_notional = %format!("{:.2}", available_for_asks * market_params.microprice),
+                        "Ladder completely empty: available size below min_notional (no fallback possible)"
+                    );
+                }
 
-            ladder
+                ladder
             }; // close else (legacy path)
 
             // === GUARANTEED QUOTE FLOOR ===
@@ -2547,10 +2620,10 @@ impl LadderStrategy {
             // Skew = up to 30% of half-spread, proportional to inventory
             let guaranteed_skew_bps = guaranteed_inv_ratio * guaranteed_half_spread_bps * 0.3;
 
-            let bid_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
-                && position > 0.0;
-            let ask_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
-                && position < 0.0;
+            let bid_cleared_by_zone =
+                abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position > 0.0;
+            let ask_cleared_by_zone =
+                abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position < 0.0;
 
             // WS4: Guaranteed quotes always apply (no binary circuit breaker gate).
             // At extreme γ, guaranteed quote spread is already very wide.
@@ -2699,7 +2772,8 @@ impl QuotingStrategy for LadderStrategy {
         let edge_mean = tracker.avg_win() * tracker.win_rate()
             - tracker.avg_loss() * (1.0 - tracker.win_rate());
         let edge_std = (tracker.avg_win() + tracker.avg_loss()) * 0.5; // rough estimate
-        let (should_size, fraction, _confidence) = self.kelly_sizer.sizing_decision(edge_mean, edge_std);
+        let (should_size, fraction, _confidence) =
+            self.kelly_sizer.sizing_decision(edge_mean, edge_std);
         if should_size {
             Some(fraction)
         } else {
@@ -2834,14 +2908,20 @@ mod tests {
     fn test_margin_split_long_favors_asks() {
         // Long position → more margin to asks (mean-revert)
         let (bid_w, ask_w) = compute_margin_split(0.5);
-        assert!(ask_w > bid_w, "Long should favor asks: bid={bid_w:.3}, ask={ask_w:.3}");
+        assert!(
+            ask_w > bid_w,
+            "Long should favor asks: bid={bid_w:.3}, ask={ask_w:.3}"
+        );
     }
 
     #[test]
     fn test_margin_split_short_favors_bids() {
         // Short position → more margin to bids (mean-revert)
         let (bid_w, ask_w) = compute_margin_split(-0.5);
-        assert!(bid_w > ask_w, "Short should favor bids: bid={bid_w:.3}, ask={ask_w:.3}");
+        assert!(
+            bid_w > ask_w,
+            "Short should favor bids: bid={bid_w:.3}, ask={ask_w:.3}"
+        );
     }
 
     #[test]
@@ -2888,19 +2968,35 @@ mod tests {
 
         // kappa = 8000 → cap = 2.5 bps
         let cap_8000: f64 = (2.0 / 8000.0 * 10_000.0_f64).max(1.5);
-        assert!((cap_8000 - 2.5).abs() < 0.01, "kappa=8000 → cap=2.5 bps, got {:.2}", cap_8000);
+        assert!(
+            (cap_8000 - 2.5).abs() < 0.01,
+            "kappa=8000 → cap=2.5 bps, got {:.2}",
+            cap_8000
+        );
 
         // kappa = 2500 → cap = 8.0 bps
         let cap_2500: f64 = (2.0 / 2500.0 * 10_000.0_f64).max(1.5);
-        assert!((cap_2500 - 8.0).abs() < 0.01, "kappa=2500 → cap=8.0 bps, got {:.2}", cap_2500);
+        assert!(
+            (cap_2500 - 8.0).abs() < 0.01,
+            "kappa=2500 → cap=8.0 bps, got {:.2}",
+            cap_2500
+        );
 
         // kappa = 500 → cap = 40 bps (very wide)
         let cap_500: f64 = (2.0 / 500.0 * 10_000.0_f64).max(1.5);
-        assert!((cap_500 - 40.0).abs() < 0.01, "kappa=500 → cap=40 bps, got {:.2}", cap_500);
+        assert!(
+            (cap_500 - 40.0).abs() < 0.01,
+            "kappa=500 → cap=40 bps, got {:.2}",
+            cap_500
+        );
 
         // kappa = 20000 → cap = 1.5 bps (clamped to min fee floor)
         let cap_20k: f64 = (2.0 / 20000.0 * 10_000.0_f64).max(1.5);
-        assert!((cap_20k - 1.5).abs() < f64::EPSILON, "kappa=20000 → cap=1.5 bps (min), got {:.2}", cap_20k);
+        assert!(
+            (cap_20k - 1.5).abs() < f64::EPSILON,
+            "kappa=20000 → cap=1.5 bps (min), got {:.2}",
+            cap_20k
+        );
     }
 
     #[test]
@@ -2915,7 +3011,10 @@ mod tests {
             assert!(
                 caps[i] > caps[i + 1],
                 "Cap should decrease as kappa increases: kappa[{}]={:.1} > kappa[{}]={:.1}",
-                i, caps[i], i + 1, caps[i + 1]
+                i,
+                caps[i],
+                i + 1,
+                caps[i + 1]
             );
         }
     }
@@ -2936,7 +3035,8 @@ mod tests {
         assert!(
             glft_approx_bps > effective_floor_warmed,
             "Warmed: GLFT ({:.2}) should exceed floor ({:.2}) — floor NOT binding",
-            glft_approx_bps, effective_floor_warmed
+            glft_approx_bps,
+            effective_floor_warmed
         );
 
         // Cold: buffer = 2.0 → effective_floor = 4.5 → GLFT (2.75) < floor (4.5) → binding
@@ -2945,7 +3045,8 @@ mod tests {
         assert!(
             glft_approx_bps < effective_floor_cold,
             "Cold: floor ({:.2}) should exceed GLFT ({:.2}) — floor BINDING (defensive)",
-            effective_floor_cold, glft_approx_bps
+            effective_floor_cold,
+            glft_approx_bps
         );
     }
 
@@ -2980,15 +3081,19 @@ mod tests {
         let min_floor_bps: f64 = 1.5; // new default
 
         let physical_floor = fee_bps.max(tick_bps).max(latency_bps).max(min_floor_bps);
-        assert!((physical_floor - 1.5_f64).abs() < 0.01,
-            "Physical floor should be 1.5 bps (maker fee), got {physical_floor}");
+        assert!(
+            (physical_floor - 1.5_f64).abs() < 0.01,
+            "Physical floor should be 1.5 bps (maker fee), got {physical_floor}"
+        );
 
         // GLFT optimal should be ABOVE the fee floor in normal conditions
         // GLFT approx: 1/kappa * 10000 + fee
         let kappa = 2000.0;
         let glft_approx = 1.0 / kappa * 10_000.0 + fee_bps;
-        assert!(glft_approx > physical_floor,
-            "GLFT ({glft_approx:.2}) should exceed physical floor ({physical_floor:.2})");
+        assert!(
+            glft_approx > physical_floor,
+            "GLFT ({glft_approx:.2}) should exceed physical floor ({physical_floor:.2})"
+        );
     }
 
     #[test]
@@ -3026,18 +3131,22 @@ mod tests {
         // Continuous size scaling: (1 - 0.75 * ratio²).max(0.25)
         // Must be monotonically decreasing
         let ratios: [f64; 6] = [0.0, 0.3, 0.5, 0.6, 0.8, 1.0];
-        let mults: Vec<f64> = ratios.iter()
+        let mults: Vec<f64> = ratios
+            .iter()
             .map(|r| (1.0 - 0.75 * r * r).max(0.25))
             .collect();
         for i in 1..mults.len() {
             assert!(
-                mults[i] <= mults[i-1],
+                mults[i] <= mults[i - 1],
                 "Size mult should decrease: at {:.1} got {:.3} > {:.3} at {:.1}",
-                ratios[i], mults[i], mults[i-1], ratios[i-1]
+                ratios[i],
+                mults[i],
+                mults[i - 1],
+                ratios[i - 1]
             );
         }
         assert!(mults[0] > 0.99, "At 0% utilization, mult should be ~1.0");
-        assert!(mults[mults.len()-1] >= 0.25, "Floor at 0.25");
+        assert!(mults[mults.len() - 1] >= 0.25, "Floor at 0.25");
     }
 
     #[test]
@@ -3047,12 +3156,18 @@ mod tests {
         let beta = 7.0;
         let utilization = 0.8;
         let gamma_scalar = 1.0 + beta * utilization * utilization;
-        assert!(gamma_scalar > 4.0, "At 80% utilization, gamma scalar should be > 4.0: {gamma_scalar}");
+        assert!(
+            gamma_scalar > 4.0,
+            "At 80% utilization, gamma scalar should be > 4.0: {gamma_scalar}"
+        );
 
         // At 60% (old Yellow boundary)
         let utilization_60 = 0.6;
         let gamma_60 = 1.0 + beta * utilization_60 * utilization_60;
-        assert!(gamma_60 > 3.0, "At 60% utilization, gamma scalar should be > 3.0: {gamma_60}");
+        assert!(
+            gamma_60 > 3.0,
+            "At 60% utilization, gamma scalar should be > 3.0: {gamma_60}"
+        );
     }
 
     #[test]
@@ -3074,7 +3189,10 @@ mod tests {
             bid_depths.clear();
         }
 
-        assert!(bid_depths.is_empty(), "Long in Red → bids should be cleared");
+        assert!(
+            bid_depths.is_empty(),
+            "Long in Red → bids should be cleared"
+        );
         assert!(!ask_depths.is_empty(), "Long in Red → asks should remain");
 
         // Short case
@@ -3087,7 +3205,10 @@ mod tests {
         }
 
         assert!(!bid_depths2.is_empty(), "Short in Red → bids should remain");
-        assert!(ask_depths2.is_empty(), "Short in Red → asks should be cleared");
+        assert!(
+            ask_depths2.is_empty(),
+            "Short in Red → asks should be cleared"
+        );
     }
 
     #[test]
@@ -3098,19 +3219,31 @@ mod tests {
         let breakeven = entry * (1.0 + fee_rate); // 100.015
 
         let ask_price = 99.99; // Below breakeven
-        assert!(ask_price < breakeven, "Ask ({ask_price}) should be below breakeven ({breakeven})");
+        assert!(
+            ask_price < breakeven,
+            "Ask ({ask_price}) should be below breakeven ({breakeven})"
+        );
 
         // Clamping should move it up to breakeven
         let clamped = breakeven;
-        assert!(clamped >= breakeven, "Clamped ask should be at or above breakeven");
+        assert!(
+            clamped >= breakeven,
+            "Clamped ask should be at or above breakeven"
+        );
 
         // Short position: bids should not go above breakeven
         let breakeven_short = entry * (1.0 - fee_rate); // 99.985
         let bid_price = 100.01; // Above breakeven for short
-        assert!(bid_price > breakeven_short, "Bid ({bid_price}) should be above breakeven ({breakeven_short})");
+        assert!(
+            bid_price > breakeven_short,
+            "Bid ({bid_price}) should be above breakeven ({breakeven_short})"
+        );
 
         let clamped_bid = breakeven_short;
-        assert!(clamped_bid <= breakeven_short, "Clamped bid should be at or below breakeven");
+        assert!(
+            clamped_bid <= breakeven_short,
+            "Clamped bid should be at or below breakeven"
+        );
     }
 
     #[test]
@@ -3199,13 +3332,19 @@ mod tests {
         let unrealized_bps: f64 = -60.0; // 6 bps underwater
 
         let urgency: f64 = (position_fraction * (-unrealized_bps / 50.0_f64).max(0.0)).min(1.0);
-        assert!(urgency > 0.5, "High position + underwater should produce urgency > 0.5, got {urgency}");
+        assert!(
+            urgency > 0.5,
+            "High position + underwater should produce urgency > 0.5, got {urgency}"
+        );
 
         // Small position, slightly underwater: no urgency override
         let position_fraction2: f64 = 0.2;
         let unrealized_bps2: f64 = -5.0;
         let urgency2: f64 = (position_fraction2 * (-unrealized_bps2 / 50.0_f64).max(0.0)).min(1.0);
-        assert!(urgency2 < 0.5, "Small position, slightly underwater: urgency should be < 0.5, got {urgency2}");
+        assert!(
+            urgency2 < 0.5,
+            "Small position, slightly underwater: urgency should be < 0.5, got {urgency2}"
+        );
     }
 
     #[test]
@@ -3225,7 +3364,7 @@ mod tests {
         let strategy = LadderStrategy::new(0.07);
         let config = QuoteConfig {
             mid_price: 30.0,
-            decimals: 2,   // $0.01 tick = 3.3 bps on $30
+            decimals: 2, // $0.01 tick = 3.3 bps on $30
             sz_decimals: 2,
             min_notional: 10.0,
         };
@@ -3269,7 +3408,8 @@ mod tests {
             assert!(
                 notional >= config.min_notional,
                 "Bid notional ${:.2} should meet min_notional ${:.2}",
-                notional, config.min_notional
+                notional,
+                config.min_notional
             );
         }
         for level in &ladder.asks {
@@ -3277,7 +3417,8 @@ mod tests {
             assert!(
                 notional >= config.min_notional,
                 "Ask notional ${:.2} should meet min_notional ${:.2}",
-                notional, config.min_notional
+                notional,
+                config.min_notional
             );
         }
 
@@ -3285,18 +3426,20 @@ mod tests {
         assert!(
             ladder.bids[0].price < market_params.microprice,
             "Bid {:.4} should be below mid {:.4}",
-            ladder.bids[0].price, market_params.microprice
+            ladder.bids[0].price,
+            market_params.microprice
         );
         assert!(
             ladder.asks[0].price > market_params.microprice,
             "Ask {:.4} should be above mid {:.4}",
-            ladder.asks[0].price, market_params.microprice
+            ladder.asks[0].price,
+            market_params.microprice
         );
 
         // REGRESSION: depth should be GLFT-derived, not hardcoded 5 bps.
         // Verify spread invariant: ask_price > bid_price.
-        let spread_bps = (ladder.asks[0].price - ladder.bids[0].price)
-            / market_params.microprice * 10_000.0;
+        let spread_bps =
+            (ladder.asks[0].price - ladder.bids[0].price) / market_params.microprice * 10_000.0;
         assert!(
             spread_bps > 0.0,
             "Spread must be positive, got {:.2} bps",
@@ -3314,7 +3457,7 @@ mod tests {
         let strategy = LadderStrategy::new(0.07);
         let config = QuoteConfig {
             mid_price: 30.0,
-            decimals: 2,   // $0.01 tick
+            decimals: 2, // $0.01 tick
             sz_decimals: 2,
             min_notional: 10.0,
         };
@@ -3357,7 +3500,8 @@ mod tests {
         assert!(
             total_bid_size < total_ask_size * 0.5,
             "Near-max long: bid size ({:.4}) should be much smaller than ask size ({:.4})",
-            total_bid_size, total_ask_size
+            total_bid_size,
+            total_ask_size
         );
     }
 
@@ -3372,7 +3516,7 @@ mod tests {
         let strategy = LadderStrategy::new(0.07);
         let config = QuoteConfig {
             mid_price: 30.0,
-            decimals: 2,   // $0.01 tick = 3.3 bps on $30
+            decimals: 2, // $0.01 tick = 3.3 bps on $30
             sz_decimals: 2,
             min_notional: 10.0,
         };
@@ -3404,7 +3548,8 @@ mod tests {
         assert!(
             ladder.bids.len() + ladder.asks.len() > 2,
             "Large tier with $10k capital should produce multi-level ladder, got {} bids + {} asks",
-            ladder.bids.len(), ladder.asks.len()
+            ladder.bids.len(),
+            ladder.asks.len()
         );
 
         // Now verify Micro tier also produces valid GLFT output (not a separate path)
@@ -3419,13 +3564,7 @@ mod tests {
         micro_params.sigma = 0.001;
         micro_params.kappa = 2000.0;
 
-        let micro_ladder = strategy.calculate_ladder(
-            &config,
-            0.0,
-            3.24,
-            1.0,
-            &micro_params,
-        );
+        let micro_ladder = strategy.calculate_ladder(&config, 0.0, 3.24, 1.0, &micro_params);
 
         // Micro tier should also produce valid output through standard pipeline
         assert!(
@@ -3438,14 +3577,16 @@ mod tests {
             assert!(
                 micro_ladder.bids[0].price < micro_params.microprice,
                 "Micro bid {:.4} should be below mid {:.4}",
-                micro_ladder.bids[0].price, micro_params.microprice
+                micro_ladder.bids[0].price,
+                micro_params.microprice
             );
         }
         if !micro_ladder.asks.is_empty() {
             assert!(
                 micro_ladder.asks[0].price > micro_params.microprice,
                 "Micro ask {:.4} should be above mid {:.4}",
-                micro_ladder.asks[0].price, micro_params.microprice
+                micro_ladder.asks[0].price,
+                micro_params.microprice
             );
         }
     }
@@ -3454,7 +3595,7 @@ mod tests {
     #[test]
     fn test_kappa_priority_chain_coordinator() {
         let mut params = MarketParams::default();
-        params.kappa = 1000.0;  // Legacy kappa
+        params.kappa = 1000.0; // Legacy kappa
         params.coordinator_kappa = 600.0;
         params.coordinator_uncertainty_premium_bps = 2.0;
         params.use_coordinator_kappa = true;
@@ -3481,7 +3622,8 @@ mod tests {
         assert!(
             composition.warmup_addon_bps >= params.coordinator_uncertainty_premium_bps,
             "Warmup addon ({:.2}) should include coordinator uncertainty premium ({:.2})",
-            composition.warmup_addon_bps, params.coordinator_uncertainty_premium_bps
+            composition.warmup_addon_bps,
+            params.coordinator_uncertainty_premium_bps
         );
 
         // Also verify warmup addon is zero when adaptive_warmup_progress = 1.0
@@ -3534,7 +3676,9 @@ mod tests {
         let glft_optimal_bps = 3.0_f64;
         let effective_floor_bps = 2.0_f64;
 
-        let guaranteed = (fee_bps + tick_bps).max(glft_optimal_bps).max(effective_floor_bps);
+        let guaranteed = (fee_bps + tick_bps)
+            .max(glft_optimal_bps)
+            .max(effective_floor_bps);
         assert!(
             (guaranteed - 3.0).abs() < 1e-10,
             "Should be max(2.0, 3.0, 2.0) = 3.0, got {guaranteed}"
@@ -3542,7 +3686,9 @@ mod tests {
 
         // When GLFT is narrow, fee+tick dominates
         let glft_narrow = 1.0_f64;
-        let guaranteed2 = (fee_bps + tick_bps).max(glft_narrow).max(effective_floor_bps);
+        let guaranteed2 = (fee_bps + tick_bps)
+            .max(glft_narrow)
+            .max(effective_floor_bps);
         assert!(
             (guaranteed2 - 2.0).abs() < 1e-10,
             "Should be max(2.0, 1.0, 2.0) = 2.0, got {guaranteed2}"
@@ -3560,7 +3706,10 @@ mod tests {
 
         // Long 50%: push bid down, ask tighter (attract sells)
         let skew_long = 0.5 * half_spread * 0.3;
-        assert!((skew_long - 0.75).abs() < 1e-10, "Long skew should be +0.75 bps, got {skew_long}");
+        assert!(
+            (skew_long - 0.75).abs() < 1e-10,
+            "Long skew should be +0.75 bps, got {skew_long}"
+        );
         // bid_depth = half_spread + skew = 5.75 (wider)
         // ask_depth = half_spread - skew = 4.25 (tighter to attract fills)
         let bid_depth = half_spread + skew_long;
@@ -3572,7 +3721,10 @@ mod tests {
         assert!(skew_short < 0.0, "Short skew should be negative");
         let bid_depth_short = half_spread + skew_short; // tighter
         let ask_depth_short = half_spread - skew_short; // wider
-        assert!(ask_depth_short > bid_depth_short, "Short: ask should be deeper than bid");
+        assert!(
+            ask_depth_short > bid_depth_short,
+            "Short: ask should be deeper than bid"
+        );
     }
 
     #[test]
@@ -3601,15 +3753,23 @@ mod tests {
         let bid_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position > 0.0;
         let ask_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position < 0.0;
 
-        assert!(bid_cleared, "Long at 95%: bids should be cleared (threshold=90%)");
+        assert!(
+            bid_cleared,
+            "Long at 95%: bids should be cleared (threshold=90%)"
+        );
         assert!(!ask_cleared, "Long at 95%: asks should NOT be cleared");
 
         // Short at >90%: asks cleared
         let position_short = -1.0_f64;
-        let bid_cleared_short = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position_short > 0.0;
-        let ask_cleared_short = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position_short < 0.0;
+        let bid_cleared_short =
+            abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position_short > 0.0;
+        let ask_cleared_short =
+            abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position_short < 0.0;
 
-        assert!(!bid_cleared_short, "Short at 95%: bids should NOT be cleared");
+        assert!(
+            !bid_cleared_short,
+            "Short at 95%: bids should NOT be cleared"
+        );
         assert!(ask_cleared_short, "Short at 95%: asks should be cleared");
     }
 
@@ -3621,7 +3781,10 @@ mod tests {
         let bid_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position > 0.0;
         let ask_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position < 0.0;
 
-        assert!(!bid_cleared, "Long at 85%: bids should NOT be cleared (below 90% threshold)");
+        assert!(
+            !bid_cleared,
+            "Long at 85%: bids should NOT be cleared (below 90% threshold)"
+        );
         assert!(!ask_cleared, "Long at 85%: asks should NOT be cleared");
     }
 
@@ -3634,7 +3797,7 @@ mod tests {
         let strategy = LadderStrategy::new(0.07);
         let config = QuoteConfig {
             mid_price: 25.0,
-            decimals: 2,    // $0.01 tick = 0.4 bps — fine-grained enough for GLFT offsets
+            decimals: 2, // $0.01 tick = 0.4 bps — fine-grained enough for GLFT offsets
             sz_decimals: 2,
             min_notional: 10.0,
         };
@@ -3653,8 +3816,8 @@ mod tests {
 
         let ladder = strategy.calculate_ladder(
             &config,
-            0.0,  // flat
-            5.0,  // max position
+            0.0, // flat
+            5.0, // max position
             1.0,
             &market_params,
         );
@@ -3673,12 +3836,14 @@ mod tests {
         assert!(
             ladder.bids[0].price < market_params.microprice,
             "Guaranteed bid {:.4} should be below mid {:.4}",
-            ladder.bids[0].price, market_params.microprice
+            ladder.bids[0].price,
+            market_params.microprice
         );
         assert!(
             ladder.asks[0].price > market_params.microprice,
             "Guaranteed ask {:.4} should be above mid {:.4}",
-            ladder.asks[0].price, market_params.microprice
+            ladder.asks[0].price,
+            market_params.microprice
         );
     }
 
@@ -3704,20 +3869,15 @@ mod tests {
         market_params.sigma = 0.001;
         market_params.kappa = 2000.0;
 
-        let ladder = strategy.calculate_ladder(
-            &config,
-            0.0,
-            5.0,
-            1.0,
-            &market_params,
-        );
+        let ladder = strategy.calculate_ladder(&config, 0.0, 5.0, 1.0, &market_params);
 
         // Guaranteed quotes produce minimal size on each side
         // (margin=0 prevents additional levels but not guaranteed quotes)
         assert!(
             ladder.bids.len() <= 1 && ladder.asks.len() <= 1,
             "Zero margin should produce at most guaranteed quotes, got {} bids + {} asks",
-            ladder.bids.len(), ladder.asks.len()
+            ladder.bids.len(),
+            ladder.asks.len()
         );
     }
 
@@ -3743,13 +3903,7 @@ mod tests {
         market_params.sigma = 0.001;
         market_params.kappa = 2000.0;
 
-        let ladder = strategy.calculate_ladder(
-            &config,
-            0.0,
-            5.0,
-            1.0,
-            &market_params,
-        );
+        let ladder = strategy.calculate_ladder(&config, 0.0, 5.0, 1.0, &market_params);
 
         assert!(
             !ladder.bids.is_empty() || !ladder.asks.is_empty(),
@@ -3777,7 +3931,7 @@ mod tests {
         params.kappa = 2000.0;
         params.arrival_intensity = 0.5;
         params.capital_policy.use_tick_grid = false; // Force non-tick-grid path for reservation mid testing
-        // Set valid BBO so build_raw_ladder doesn't clamp bid_base to market_mid
+                                                     // Set valid BBO so build_raw_ladder doesn't clamp bid_base to market_mid
         params.cached_best_bid = 99.95;
         params.cached_best_ask = 100.05;
 
@@ -3847,7 +4001,7 @@ mod tests {
         params.sigma = 0.005;
         params.kappa = 2000.0;
         params.capital_policy.use_tick_grid = false; // Force non-tick-grid path for reservation mid testing
-        // Set valid BBO so build_raw_ladder doesn't clamp ask_floor to market_mid
+                                                     // Set valid BBO so build_raw_ladder doesn't clamp ask_floor to market_mid
         params.cached_best_bid = 99.95;
         params.cached_best_ask = 100.05;
 
@@ -3894,13 +4048,17 @@ mod tests {
         // Extreme bullish drift (reservation mid reads drift_signal_bps)
         params.drift_signal_bps = 500.0;
         let ladder = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
-        
+
         let bid_price = ladder.bids.first().map(|l| l.price).unwrap_or(0.0);
-        
+
         // It must not cross the market ask (which is bounded by mid)
         // Our constraint on half_spread_bound + depth means it effectively won't cross the mid.
         // Even with huge drift, bounded reservation + depth subtraction keeps bids sane.
-        assert!(bid_price <= 100.0, "Clamped reservation mid should prevent crossing the real market mid. bid: {}", bid_price);
+        assert!(
+            bid_price <= 100.0,
+            "Clamped reservation mid should prevent crossing the real market mid. bid: {}",
+            bid_price
+        );
     }
 
     #[test]
@@ -3936,8 +4094,8 @@ mod tests {
         let ladder_15 = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
 
         // Compare average bid prices across all levels
-        let avg_bid_5: f64 = ladder_5.bids.iter().map(|l| l.price).sum::<f64>()
-            / ladder_5.bids.len().max(1) as f64;
+        let avg_bid_5: f64 =
+            ladder_5.bids.iter().map(|l| l.price).sum::<f64>() / ladder_5.bids.len().max(1) as f64;
         let avg_bid_15: f64 = ladder_15.bids.iter().map(|l| l.price).sum::<f64>()
             / ladder_15.bids.len().max(1) as f64;
         assert!(

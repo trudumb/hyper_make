@@ -482,14 +482,22 @@ mod tests {
         // This shows that 5 bps is very tight for κ=2000
         let gamma = derive_gamma_from_glft(5.0, 2000.0, 0.0002, 60.0);
         assert!(gamma >= 0.05 && gamma <= 5.0, "gamma = {}", gamma);
-        
+
         // With wider spread (20 bps), gamma should be lower
         let gamma_wide = derive_gamma_from_glft(20.0, 2000.0, 0.0002, 60.0);
-        assert!(gamma_wide >= 0.05 && gamma_wide <= 5.0, "gamma_wide = {}", gamma_wide);
-        
+        assert!(
+            gamma_wide >= 0.05 && gamma_wide <= 5.0,
+            "gamma_wide = {}",
+            gamma_wide
+        );
+
         // Lower kappa should give lower gamma for same spread
         let gamma_low_kappa = derive_gamma_from_glft(10.0, 500.0, 0.0002, 60.0);
-        assert!(gamma_low_kappa >= 0.05 && gamma_low_kappa <= 5.0, "gamma_low_kappa = {}", gamma_low_kappa);
+        assert!(
+            gamma_low_kappa >= 0.05 && gamma_low_kappa <= 5.0,
+            "gamma_low_kappa = {}",
+            gamma_low_kappa
+        );
     }
 
     #[test]
@@ -505,7 +513,11 @@ mod tests {
         // $10k account, 0.25 Kelly, 2% daily vol
         let max_loss = derive_max_daily_loss(10_000.0, 0.25, 0.02);
         // Should be ~$100 (10k × 0.25 × 0.02 × 2)
-        assert!(max_loss > 80.0 && max_loss < 120.0, "max_loss = {}", max_loss);
+        assert!(
+            max_loss > 80.0 && max_loss < 120.0,
+            "max_loss = {}",
+            max_loss
+        );
     }
 
     #[test]

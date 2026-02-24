@@ -613,10 +613,7 @@ mod tests {
         }
 
         let p = t.depth_persistence();
-        assert!(
-            p > 0.9,
-            "stable book should have high persistence, got {p}"
-        );
+        assert!(p > 0.9, "stable book should have high persistence, got {p}");
     }
 
     #[test]
@@ -671,10 +668,7 @@ mod tests {
 
         let ratio = d.hidden_liquidity_ratio(true);
         // First observation: EWMA = 0.0 * 0.95 + 0.5 * 0.05 = 0.025
-        assert!(
-            (ratio - 0.025).abs() < 1e-9,
-            "expected 0.025, got {ratio}"
-        );
+        assert!((ratio - 0.025).abs() < 1e-9, "expected 0.025, got {ratio}");
     }
 
     #[test]
@@ -689,10 +683,7 @@ mod tests {
         d.on_fill_with_book_update(false, 10.0, 90.0);
 
         let ratio = d.hidden_liquidity_ratio(false);
-        assert!(
-            ratio.abs() < 1e-9,
-            "expected 0.0, got {ratio}"
-        );
+        assert!(ratio.abs() < 1e-9, "expected 0.0, got {ratio}");
     }
 
     #[test]
@@ -905,7 +896,10 @@ mod tests {
         let obs = det.drift_observation(2500);
         assert!(obs.is_some());
         let (z, _r) = obs.unwrap();
-        assert!(z < 0.0, "buy sweep should produce negative z (bearish), got {z}");
+        assert!(
+            z < 0.0,
+            "buy sweep should produce negative z (bearish), got {z}"
+        );
     }
 
     #[test]
@@ -922,10 +916,7 @@ mod tests {
         // At t=4s, expired (window is 3s)
         det.record_fill(false, 0.1, 1, 4000); // trigger cleanup
         let (_, ask) = det.sweep_scores(4000);
-        assert!(
-            ask < 1.0,
-            "old sweep should have expired, got ask={ask}"
-        );
+        assert!(ask < 1.0, "old sweep should have expired, got ask={ask}");
     }
 
     #[test]
@@ -933,7 +924,7 @@ mod tests {
         let mut det = SweepDetector::new();
 
         // Equal buy and sell sweeps
-        det.record_fill(true, 5.0, 2, 1000);  // ask_score = 10
+        det.record_fill(true, 5.0, 2, 1000); // ask_score = 10
         det.record_fill(false, 5.0, 2, 1500); // bid_score = 10
 
         let obs = det.drift_observation(2000);

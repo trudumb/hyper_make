@@ -640,14 +640,10 @@ impl MarginAwareSizer {
                 if adjusted_size == 0.0 {
                     "No available margin".to_string()
                 } else {
-                    format!(
-                        "Reduced from {size} to {adjusted_size} due to margin limits"
-                    )
+                    format!("Reduced from {size} to {adjusted_size} due to margin limits")
                 }
             } else {
-                format!(
-                    "Reduced from {size} to {adjusted_size} due to order size limit"
-                )
+                format!("Reduced from {size} to {adjusted_size} due to order size limit")
             };
             (true, Some(reason))
         } else {

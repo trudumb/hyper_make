@@ -201,8 +201,7 @@ impl QueuePositionTracker {
             return self.config.default_queue_position;
         }
 
-        Self::compute_depth_from_levels(levels, price, is_bid)
-            .max(self.config.min_queue_position)
+        Self::compute_depth_from_levels(levels, price, is_bid).max(self.config.min_queue_position)
     }
 
     /// Compute depth ahead from L2 levels for a given price and side.
@@ -559,12 +558,7 @@ impl QueuePositionTracker {
     /// * `half_spread_bps` - Half-spread in basis points
     /// * `alpha` - Queue value decay rate
     /// * `beta` - Linear cost
-    pub fn total_queue_value(
-        &self,
-        half_spread_bps: f64,
-        alpha: f64,
-        beta: f64,
-    ) -> f64 {
+    pub fn total_queue_value(&self, half_spread_bps: f64, alpha: f64, beta: f64) -> f64 {
         self.positions
             .keys()
             .filter_map(|&oid| self.order_queue_value(oid, half_spread_bps, alpha, beta))

@@ -177,8 +177,13 @@ impl PositionDecisionEngine {
     /// PositionAction indicating HOLD, ADD, or REDUCE
     pub fn decide(&self, input: &PositionDecisionInput) -> PositionAction {
         let PositionDecisionInput {
-            position, max_position, belief_drift, belief_confidence,
-            edge_bps, trend_momentum_bps, unrealized_pnl_bps,
+            position,
+            max_position,
+            belief_drift,
+            belief_confidence,
+            edge_bps,
+            trend_momentum_bps,
+            unrealized_pnl_bps,
         } = *input;
         let inv_ratio = if max_position > 1e-9 {
             (position / max_position).abs()
@@ -235,8 +240,8 @@ impl PositionDecisionEngine {
         // When changepoint resets beliefs, belief_drift and belief_confidence drop to ~0.
         // This guard reads raw price momentum (NOT from belief system) to prevent
         // selling into a profitable, trend-aligned position.
-        let trend_aligned = trend_momentum_bps.signum() == position_sign
-            && trend_momentum_bps.abs() > 5.0; // Meaningful trend
+        let trend_aligned =
+            trend_momentum_bps.signum() == position_sign && trend_momentum_bps.abs() > 5.0; // Meaningful trend
         if trend_aligned && unrealized_pnl_bps > -2.0 {
             return PositionAction::Hold;
         }
@@ -352,7 +357,9 @@ impl PositionDecisionEngine {
     }
 
     /// Get diagnostic summary of continuation signals.
-    pub fn signal_summary(&self) -> crate::market_maker::stochastic::continuation::ContinuationSignalSummary {
+    pub fn signal_summary(
+        &self,
+    ) -> crate::market_maker::stochastic::continuation::ContinuationSignalSummary {
         self.continuation.signal_summary()
     }
 
@@ -427,8 +434,11 @@ mod tests {
         });
 
         // With high p_cont, alignment, and confidence, should HOLD
-        assert!(action.is_hold() || action.is_add(),
-            "Expected HOLD or ADD with high p_cont, got {:?}", action);
+        assert!(
+            action.is_hold() || action.is_add(),
+            "Expected HOLD or ADD with high p_cont, got {:?}",
+            action
+        );
     }
 
     #[test]
@@ -446,7 +456,10 @@ mod tests {
         });
 
         // Position opposes beliefs → should REDUCE
-        assert!(action.is_reduce(), "Expected REDUCE when position opposes beliefs");
+        assert!(
+            action.is_reduce(),
+            "Expected REDUCE when position opposes beliefs"
+        );
     }
 
     #[test]
@@ -472,8 +485,11 @@ mod tests {
         // Note: depends on continuation posterior state
         match action {
             PositionAction::Add { kelly_frac } => {
-                assert!(kelly_frac > 0.0 && kelly_frac <= 0.3,
-                    "Kelly should be in (0, 0.3], got {}", kelly_frac);
+                assert!(
+                    kelly_frac > 0.0 && kelly_frac <= 0.3,
+                    "Kelly should be in (0, 0.3], got {}",
+                    kelly_frac
+                );
             }
             PositionAction::Hold => {
                 // Also acceptable if not quite meeting add threshold
@@ -522,8 +538,11 @@ mod tests {
         });
 
         // Trend-momentum guard should fire: position aligned with trend, not underwater
-        assert!(action.is_hold(),
-            "Expected HOLD from trend-momentum guard, got {:?}", action);
+        assert!(
+            action.is_hold(),
+            "Expected HOLD from trend-momentum guard, got {:?}",
+            action
+        );
     }
 
     #[test]
@@ -541,8 +560,11 @@ mod tests {
         });
 
         // Underwater position should still reduce even with aligned trend
-        assert!(action.is_reduce(),
-            "Expected REDUCE when deeply underwater, got {:?}", action);
+        assert!(
+            action.is_reduce(),
+            "Expected REDUCE when deeply underwater, got {:?}",
+            action
+        );
     }
 
     #[test]
@@ -552,24 +574,15 @@ mod tests {
 
         // ADD with kelly=0.2 and ratio=0.3 → (1-0.2) * 0.3 = 0.24
         // Reduces skew toward zero (not reverses it)
-        let add_result = action_to_inventory_ratio(
-            PositionAction::Add { kelly_frac: 0.2 },
-            0.3,
-        );
+        let add_result = action_to_inventory_ratio(PositionAction::Add { kelly_frac: 0.2 }, 0.3);
         assert!((add_result - 0.24).abs() < 0.001);
 
         // ADD with kelly=1.0 → full conviction → 0 skew
-        let add_full = action_to_inventory_ratio(
-            PositionAction::Add { kelly_frac: 1.0 },
-            0.3,
-        );
+        let add_full = action_to_inventory_ratio(PositionAction::Add { kelly_frac: 1.0 }, 0.3);
         assert!((add_full).abs() < 0.001);
 
         // REDUCE with urgency=1.5 and ratio=0.4 → 1.5 * 0.4 = 0.6
-        let reduce_result = action_to_inventory_ratio(
-            PositionAction::Reduce { urgency: 1.5 },
-            0.4,
-        );
+        let reduce_result = action_to_inventory_ratio(PositionAction::Reduce { urgency: 1.5 }, 0.4);
         assert!((reduce_result - 0.6).abs() < 0.001);
     }
 
@@ -589,12 +602,12 @@ mod tests {
         // Also update signals to reflect cascade regime
         // (in production, this would come from HMM and other signal sources)
         engine.update_signals(
-            0.0,                       // No changepoint
-            2.0,                       // Normal entropy
-            0.7,                       // High momentum continuation (typical in cascade)
-            0.5,                       // Some trend agreement
-            0.5,                       // Some trend confidence
-            [0.0, 0.0, 0.2, 0.8],     // Cascade-dominant regime
+            0.0,                  // No changepoint
+            2.0,                  // Normal entropy
+            0.7,                  // High momentum continuation (typical in cascade)
+            0.5,                  // Some trend agreement
+            0.5,                  // Some trend confidence
+            [0.0, 0.0, 0.2, 0.8], // Cascade-dominant regime
         );
 
         // Should have elevated continuation probability reflecting cascade regime
@@ -619,12 +632,12 @@ mod tests {
 
         // Simulate changepoint detection
         engine.update_signals(
-            0.8,                       // High changepoint
-            0.5,                       // Low entropy
-            0.5,                       // Neutral momentum
-            0.0,                       // No trend
-            0.0,                       // No trend confidence
-            [0.2, 0.5, 0.2, 0.1],     // Normal regime
+            0.8,                  // High changepoint
+            0.5,                  // Low entropy
+            0.5,                  // Neutral momentum
+            0.0,                  // No trend
+            0.0,                  // No trend confidence
+            [0.2, 0.5, 0.2, 0.1], // Normal regime
         );
 
         let p_after = engine.prob_continuation();

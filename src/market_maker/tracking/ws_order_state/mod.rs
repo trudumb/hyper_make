@@ -179,7 +179,8 @@ mod tests {
         let mut mgr = WsOrderStateManager::new();
 
         // Add an order
-        let order = crate::market_maker::tracking::TrackedOrder::new(123, Side::Buy, 50000.0, 0.01, 0.0);
+        let order =
+            crate::market_maker::tracking::TrackedOrder::new(123, Side::Buy, 50000.0, 0.01, 0.0);
         mgr.add_order(order);
 
         // Prepare cancel

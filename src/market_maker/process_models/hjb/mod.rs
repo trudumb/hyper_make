@@ -26,7 +26,9 @@ mod summary;
 pub use config::HJBConfig;
 pub use controller::HJBInventoryController;
 pub use ou_drift::{OUDriftConfig, OUDriftEstimator, OUDriftSummary, OUUpdateResult};
-pub use queue_value::{BatchQueueValue, HJBQueueValueCalculator, HJBQueueValueConfig, OrderQueueValue};
+pub use queue_value::{
+    BatchQueueValue, HJBQueueValueCalculator, HJBQueueValueConfig, OrderQueueValue,
+};
 pub use summary::{DriftAdjustedSkew, HJBSummary, MomentumStats};
 
 // ============================================================================

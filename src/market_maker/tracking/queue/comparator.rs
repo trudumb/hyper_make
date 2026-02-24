@@ -86,7 +86,7 @@ impl Default for QueueValueConfig {
             spread_capture_bps: 8.0,       // Estimated spread capture
             min_order_age_secs: 0.3,       // Wait 300ms before considering replacement
             enabled: true,
-            api_cost_bps: 3.0,             // API call cost in bps (rate limit + queue loss)
+            api_cost_bps: 3.0, // API call cost in bps (rate limit + queue loss)
         }
     }
 }
@@ -390,8 +390,8 @@ mod tests {
             default_queue_position: 5.0,
             refresh_threshold: 0.1,
             min_order_age_for_refresh: 0.1,
-            refresh_cost_bps: 5.0,       // EV cost of refresh
-            spread_capture_bps: 8.0,     // Expected spread capture
+            refresh_cost_bps: 5.0,   // EV cost of refresh
+            spread_capture_bps: 8.0, // Expected spread capture
         })
     }
 
@@ -404,7 +404,7 @@ mod tests {
             spread_capture_bps: 8.0,
             min_order_age_secs: 0.0, // Disable age check for tests
             enabled: true,
-            api_cost_bps: 3.0,       // API call cost in bps
+            api_cost_bps: 3.0, // API call cost in bps
         }
     }
 

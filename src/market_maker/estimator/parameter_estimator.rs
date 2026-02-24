@@ -652,7 +652,12 @@ impl ParameterEstimator {
             5.0 // Default to 5 bps if no mid
         };
         let p_informed = self.informed_flow.decomposition().p_informed;
-        self.latent_filter.glosten_milgrom_update(timestamp_ms, is_buy, p_informed, depth_bps * 2.0);
+        self.latent_filter.glosten_milgrom_update(
+            timestamp_ms,
+            is_buy,
+            p_informed,
+            depth_bps * 2.0,
+        );
 
         // 2. Feed fill rate model
         // Calculate depth from placement price vs mid
@@ -733,8 +738,9 @@ impl ParameterEstimator {
         );
 
         // Update Latent Filter with observation
-        let r_noise = 1.0; 
-        self.latent_filter.update_microprice(self.current_time_ms, self.microprice(), r_noise);
+        let r_noise = 1.0;
+        self.latent_filter
+            .update_microprice(self.current_time_ms, self.microprice(), r_noise);
 
         // === Hierarchical Kappa: Update market kappa as prior (always active) ===
         let market_kappa = self.market_kappa.posterior_mean();
@@ -1245,7 +1251,13 @@ impl ParameterEstimator {
         p_informed: f64,
         now_ms: u64,
     ) {
-        self.microprice_estimator.update_from_fill(fill_price, mid, is_ask_fill, p_informed, now_ms);
+        self.microprice_estimator.update_from_fill(
+            fill_price,
+            mid,
+            is_ask_fill,
+            p_informed,
+            now_ms,
+        );
     }
 
     // === Regime Detection ===
@@ -1902,14 +1914,16 @@ impl ParameterEstimator {
         &mut self,
         bundle: &crate::market_maker::checkpoint::CheckpointBundle,
     ) {
-        self.volatility_filter.restore_checkpoint(&bundle.vol_filter);
+        self.volatility_filter
+            .restore_checkpoint(&bundle.vol_filter);
         self.informed_flow.restore_checkpoint(&bundle.informed_flow);
         self.fill_rate_model.restore_checkpoint(&bundle.fill_rate);
         self.own_kappa.restore_checkpoint(&bundle.kappa_own);
         self.own_kappa_bid.restore_checkpoint(&bundle.kappa_bid);
         self.own_kappa_ask.restore_checkpoint(&bundle.kappa_ask);
         self.momentum_model.restore_checkpoint(&bundle.momentum);
-        self.kappa_orchestrator.restore_from_checkpoint(&bundle.kappa_orchestrator);
+        self.kappa_orchestrator
+            .restore_from_checkpoint(&bundle.kappa_orchestrator);
 
         // Recover adapted kappa prior from the own_kappa checkpoint.
         // The prior_alpha/prior_beta in the checkpoint reflect any prior adaptation
@@ -2281,7 +2295,10 @@ mod tests {
     #[test]
     fn test_max_warmup_secs_config() {
         let config = EstimatorConfig::default();
-        assert_eq!(config.max_warmup_secs, 30, "default warmup timeout should be 30s");
+        assert_eq!(
+            config.max_warmup_secs, 30,
+            "default warmup timeout should be 30s"
+        );
 
         let estimator = ParameterEstimator::new(config);
         assert_eq!(estimator.max_warmup_secs(), 30);
@@ -2369,7 +2386,10 @@ mod tests {
         let mut estimator = ParameterEstimator::new(config);
 
         // Don't feed any observations — confidence will be low
-        assert!(estimator.market_kappa.confidence() < 0.5 || estimator.market_kappa.observation_count() < 100);
+        assert!(
+            estimator.market_kappa.confidence() < 0.5
+                || estimator.market_kappa.observation_count() < 100
+        );
 
         estimator.adapt_kappa_prior();
 
@@ -2438,19 +2458,31 @@ mod tests {
         // The strength formula is: min(20.0, 5.0 + ln(obs_count / 100))
         // At 100 obs: 5.0 + ln(1) = 5.0
         let s100 = (5.0_f64 + (100.0 / 100.0_f64).ln()).min(20.0);
-        assert!((s100 - 5.0).abs() < 1e-6, "At 100 obs strength should be 5.0, got {s100}");
+        assert!(
+            (s100 - 5.0).abs() < 1e-6,
+            "At 100 obs strength should be 5.0, got {s100}"
+        );
 
         // At 1000 obs: 5.0 + ln(10) ≈ 7.30
         let s1000 = (5.0 + (1000.0 / 100.0_f64).ln()).min(20.0);
-        assert!((s1000 - 7.302).abs() < 0.01, "At 1000 obs strength should be ~7.3, got {s1000}");
+        assert!(
+            (s1000 - 7.302).abs() < 0.01,
+            "At 1000 obs strength should be ~7.3, got {s1000}"
+        );
 
         // At 10000 obs: 5.0 + ln(100) ≈ 9.61
         let s10000 = (5.0 + (10000.0 / 100.0_f64).ln()).min(20.0);
-        assert!((s10000 - 9.605).abs() < 0.01, "At 10000 obs strength should be ~9.6, got {s10000}");
+        assert!(
+            (s10000 - 9.605).abs() < 0.01,
+            "At 10000 obs strength should be ~9.6, got {s10000}"
+        );
 
         // Strength is capped at 20.0 even at extreme counts
         let s_huge = (5.0 + (10_000_000.0 / 100.0_f64).ln()).min(20.0);
-        assert!((s_huge - 16.51).abs() < 0.1, "At 10M obs strength should be ~16.5, got {s_huge}");
+        assert!(
+            (s_huge - 16.51).abs() < 0.1,
+            "At 10M obs strength should be ~16.5, got {s_huge}"
+        );
 
         // Verify the cap actually works by computing beyond the max
         let s_extreme = (5.0 + (1e15_f64 / 100.0).ln()).min(20.0);
@@ -2648,10 +2680,7 @@ mod tests {
         // Check after only 30 minutes — should NOT alert (< 1 hour)
         let thirty_min_later = 1_000_000 + 30 * 60 * 1000;
         let alert = estimator.check_kappa_stagnation(thirty_min_later);
-        assert!(
-            alert.is_none(),
-            "Should not alert before 1 hour of runtime"
-        );
+        assert!(alert.is_none(), "Should not alert before 1 hour of runtime");
     }
 
     #[test]
@@ -2703,10 +2732,10 @@ mod tests {
             let t = 1_000_000 + i * 1000;
             estimator.on_own_fill(
                 t,
-                100.0,           // placement_price
-                100.0 + 0.001,   // fill_price (tiny distance = high kappa)
-                0.01,            // fill_size
-                true,            // is_buy
+                100.0,         // placement_price
+                100.0 + 0.001, // fill_price (tiny distance = high kappa)
+                0.01,          // fill_size
+                true,          // is_buy
             );
         }
 

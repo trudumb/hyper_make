@@ -303,16 +303,16 @@ impl AdverseSelectionEstimator {
                 self.informed_fills_count += 1;
                 // Glosten-Milgrom: Track informed jump magnitude (fractional)
                 const GM_ALPHA: f64 = 0.1;
-                self.informed_as_ewma = GM_ALPHA * signed_as.abs()
-                    + (1.0 - GM_ALPHA) * self.informed_as_ewma;
+                self.informed_as_ewma =
+                    GM_ALPHA * signed_as.abs() + (1.0 - GM_ALPHA) * self.informed_as_ewma;
                 if is_buy {
                     self.informed_buy_count += 1;
-                    self.informed_as_buy_ewma = GM_ALPHA * signed_as.abs()
-                        + (1.0 - GM_ALPHA) * self.informed_as_buy_ewma;
+                    self.informed_as_buy_ewma =
+                        GM_ALPHA * signed_as.abs() + (1.0 - GM_ALPHA) * self.informed_as_buy_ewma;
                 } else {
                     self.informed_sell_count += 1;
-                    self.informed_as_sell_ewma = GM_ALPHA * signed_as.abs()
-                        + (1.0 - GM_ALPHA) * self.informed_as_sell_ewma;
+                    self.informed_as_sell_ewma =
+                        GM_ALPHA * signed_as.abs() + (1.0 - GM_ALPHA) * self.informed_as_sell_ewma;
                 }
             } else {
                 self.uninformed_fills_count += 1;
@@ -484,7 +484,8 @@ impl AdverseSelectionEstimator {
         }
 
         // P(informed | fill): empirical when available, predicted (with GMM blend) as fallback
-        let p_informed = self.empirical_alpha_touch()
+        let p_informed = self
+            .empirical_alpha_touch()
             .unwrap_or_else(|| self.predicted_alpha());
 
         // E[ΔP | informed]: EWMA of AS magnitude for informed-classified fills
@@ -637,7 +638,6 @@ impl AdverseSelectionEstimator {
         self.horizon_stats[self.best_horizon_idx].as_ewma * 10000.0
     }
 
-
     // === Informed Fill Classification for Parameter Learning ===
 
     /// Get the count of fills classified as "informed" (adverse move > threshold).
@@ -669,13 +669,21 @@ impl AdverseSelectionEstimator {
     /// Empirical P(informed | buy fill) from per-side classification.
     pub fn empirical_alpha_buy(&self) -> Option<f64> {
         let total = self.informed_buy_count + self.uninformed_buy_count;
-        if total == 0 { None } else { Some(self.informed_buy_count as f64 / total as f64) }
+        if total == 0 {
+            None
+        } else {
+            Some(self.informed_buy_count as f64 / total as f64)
+        }
     }
 
     /// Empirical P(informed | sell fill) from per-side classification.
     pub fn empirical_alpha_sell(&self) -> Option<f64> {
         let total = self.informed_sell_count + self.uninformed_sell_count;
-        if total == 0 { None } else { Some(self.informed_sell_count as f64 / total as f64) }
+        if total == 0 {
+            None
+        } else {
+            Some(self.informed_sell_count as f64 / total as f64)
+        }
     }
 
     /// Calibrate P(informed) from InformedFlowEstimator's EM decomposition.
@@ -734,7 +742,9 @@ impl AdverseSelectionEstimator {
 
     /// Deprecated: use `as_variance_risk_premium_bps(gamma)` instead.
     /// Kept for backward compatibility during transition.
-    #[deprecated(note = "Use as_variance_risk_premium_bps(gamma) — returns additive bps, not multiplier")]
+    #[deprecated(
+        note = "Use as_variance_risk_premium_bps(gamma) — returns additive bps, not multiplier"
+    )]
     pub fn recent_as_severity_mult(&self) -> f64 {
         if self.recent_as_ewma_bps > 5.0 {
             1.5
@@ -909,36 +919,36 @@ mod tests {
     #[test]
     fn test_informed_fill_classification() {
         let mut est = make_estimator();
-        
+
         // Set threshold to 5 bps (default)
         assert_eq!(est.informed_threshold_bps(), 5.0);
-        
+
         // Initially no fills classified
         assert_eq!(est.informed_fills_count(), 0);
         assert_eq!(est.uninformed_fills_count(), 0);
         assert_eq!(est.empirical_alpha_touch(), None);
-        
+
         // Add an informed fill (adverse move > 5 bps = 0.05%)
         est.record_fill(1, 1.0, true, 100.0);
         std::thread::sleep(TEST_HORIZON_SLEEP);
         // Price drops 0.1% = 10 bps adverse (> 5 bps threshold)
         est.update(99.9);
-        
+
         assert_eq!(est.informed_fills_count(), 1);
         assert_eq!(est.uninformed_fills_count(), 0);
-        
+
         // Add an uninformed fill (adverse move < 5 bps)
         est.record_fill(2, 1.0, true, 100.0);
         std::thread::sleep(TEST_HORIZON_SLEEP);
         // Price drops 0.02% = 2 bps adverse (< 5 bps threshold)
         est.update(99.98);
-        
+
         assert_eq!(est.informed_fills_count(), 1);
         assert_eq!(est.uninformed_fills_count(), 1);
-        
+
         // Check empirical alpha_touch = 1/2 = 0.5
         assert!((est.empirical_alpha_touch().unwrap() - 0.5).abs() < 0.01);
-        
+
         // Take counts resets them
         let (informed, uninformed) = est.take_informed_counts();
         assert_eq!(informed, 1);
@@ -950,17 +960,17 @@ mod tests {
     #[test]
     fn test_informed_threshold_adjustment() {
         let mut est = make_estimator();
-        
+
         // Can adjust threshold
         est.set_informed_threshold_bps(10.0);
         assert_eq!(est.informed_threshold_bps(), 10.0);
-        
+
         // With higher threshold, same fill becomes uninformed
         est.record_fill(1, 1.0, true, 100.0);
         std::thread::sleep(TEST_HORIZON_SLEEP);
         // Price drops 0.08% = 8 bps adverse (< 10 bps threshold now)
         est.update(99.92);
-        
+
         assert_eq!(est.informed_fills_count(), 0);
         assert_eq!(est.uninformed_fills_count(), 1);
     }
@@ -1011,10 +1021,7 @@ mod tests {
 
         // After enough fills, variance should be > 0 (AS values differ)
         let var = est.as_floor_variance_bps2();
-        assert!(
-            var >= 0.0,
-            "Variance should be non-negative, got {var}"
-        );
+        assert!(var >= 0.0, "Variance should be non-negative, got {var}");
     }
 
     #[test]
@@ -1050,7 +1057,10 @@ mod tests {
 
         assert!(est.is_warmed_up(), "Should be warmed up after 6 fills");
         let adj = est.spread_adjustment();
-        assert!(adj > 0.0, "GM adjustment should be positive with mixed fills");
+        assert!(
+            adj > 0.0,
+            "GM adjustment should be positive with mixed fills"
+        );
         // P(informed) ≈ 0.5, E[jump|informed] ≈ 0.001 → adj ≈ 0.0005
         assert!(adj < 0.005, "GM adjustment should be reasonable: got {adj}");
     }
@@ -1073,8 +1083,10 @@ mod tests {
         // Buy-side should have higher adjustment than sell-side
         let bid_adj = est.spread_adjustment_bid();
         let ask_adj = est.spread_adjustment_ask();
-        assert!(bid_adj > ask_adj,
-            "Buy-side (more informed) should have higher adj: bid={bid_adj} ask={ask_adj}");
+        assert!(
+            bid_adj > ask_adj,
+            "Buy-side (more informed) should have higher adj: bid={bid_adj} ask={ask_adj}"
+        );
     }
 
     // === Arrow-Pratt Tests ===
@@ -1096,15 +1108,22 @@ mod tests {
         est.update(99.7); // 30 bps
 
         let var = est.as_floor_variance_bps2();
-        assert!(var > 0.0, "Variance should be positive after differing AS magnitudes");
+        assert!(
+            var > 0.0,
+            "Variance should be positive after differing AS magnitudes"
+        );
 
         // Premium = 0.5 × γ × Var[AS]
         let premium_g1 = est.as_variance_risk_premium_bps(1.0);
         let premium_g2 = est.as_variance_risk_premium_bps(2.0);
-        assert!((premium_g2 - 2.0 * premium_g1).abs() < 1e-10,
-            "Premium should scale linearly with gamma");
-        assert!((premium_g1 - 0.5 * var).abs() < 1e-10,
-            "Premium(γ=1) = 0.5 × Var[AS]");
+        assert!(
+            (premium_g2 - 2.0 * premium_g1).abs() < 1e-10,
+            "Premium should scale linearly with gamma"
+        );
+        assert!(
+            (premium_g1 - 0.5 * var).abs() < 1e-10,
+            "Premium(γ=1) = 0.5 × Var[AS]"
+        );
     }
 
     #[test]
@@ -1161,19 +1180,30 @@ mod tests {
 
         // Long position → negative shift (sell pressure)
         let shift_long = reservation_price_shift(10.0, 0.0002, 60.0, 1.0, 0.0, 1000.0);
-        assert!(shift_long < 0.0, "Long position should produce negative shift");
+        assert!(
+            shift_long < 0.0,
+            "Long position should produce negative shift"
+        );
 
         // Short position → positive shift (buy pressure)
         let shift_short = reservation_price_shift(-10.0, 0.0002, 60.0, 1.0, 0.0, 1000.0);
-        assert!(shift_short > 0.0, "Short position should produce positive shift");
+        assert!(
+            shift_short > 0.0,
+            "Short position should produce positive shift"
+        );
 
         // Flat position → zero shift
         let shift_flat = reservation_price_shift(0.0, 0.0002, 60.0, 1.0, 0.0, 1000.0);
-        assert!((shift_flat).abs() < 1e-15, "Flat position should have zero shift");
+        assert!(
+            (shift_flat).abs() < 1e-15,
+            "Flat position should have zero shift"
+        );
 
         // HARA: losing money → higher gamma → larger shift
         let shift_losing = reservation_price_shift(10.0, 0.0002, 60.0, 1.0, -500.0, 1000.0);
-        assert!(shift_losing.abs() > shift_long.abs(),
-            "Losing PnL should increase shift magnitude via HARA gamma");
+        assert!(
+            shift_losing.abs() > shift_long.abs(),
+            "Losing PnL should increase shift magnitude via HARA gamma"
+        );
     }
 }

@@ -199,7 +199,7 @@ impl FlowFeatureVec {
 #[derive(Debug)]
 struct RollingVolume {
     window_ms: u64,
-    buy_volume: VecDeque<(i64, f64)>,  // (timestamp_ms, volume)
+    buy_volume: VecDeque<(i64, f64)>, // (timestamp_ms, volume)
     sell_volume: VecDeque<(i64, f64)>,
 }
 
@@ -401,7 +401,8 @@ impl BinanceFlowAnalyzer {
         }
 
         // Update VPIN
-        self.vpin.on_trade(size, price, self.latest_mid, timestamp_ms as u64);
+        self.vpin
+            .on_trade(size, price, self.latest_mid, timestamp_ms as u64);
 
         // Update rolling volume accumulators
         self.volume_1s.add(timestamp_ms, size, is_buy);
@@ -544,7 +545,12 @@ impl Default for BinanceFlowAnalyzer {
 mod tests {
     use super::*;
 
-    fn make_trade(timestamp_ms: i64, price: f64, quantity: f64, is_buyer_maker: bool) -> BinanceTradeUpdate {
+    fn make_trade(
+        timestamp_ms: i64,
+        price: f64,
+        quantity: f64,
+        is_buyer_maker: bool,
+    ) -> BinanceTradeUpdate {
         BinanceTradeUpdate {
             timestamp_ms,
             price,
@@ -596,7 +602,11 @@ mod tests {
 
         let features = analyzer.flow_features();
         // Should have positive imbalance (buy pressure)
-        assert!(features.imbalance_1s > 0.5, "Expected buy pressure, got {}", features.imbalance_1s);
+        assert!(
+            features.imbalance_1s > 0.5,
+            "Expected buy pressure, got {}",
+            features.imbalance_1s
+        );
     }
 
     #[test]
@@ -616,7 +626,11 @@ mod tests {
 
         let features = analyzer.flow_features();
         // Should have negative imbalance (sell pressure)
-        assert!(features.imbalance_1s < -0.5, "Expected sell pressure, got {}", features.imbalance_1s);
+        assert!(
+            features.imbalance_1s < -0.5,
+            "Expected sell pressure, got {}",
+            features.imbalance_1s
+        );
     }
 
     #[test]

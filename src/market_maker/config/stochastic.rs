@@ -492,10 +492,10 @@ impl Default for StochasticConfig {
 
             // Entropy-Based Distribution (always enabled)
             // CHANGED: Increased defaults to enforce better distribution with small capital
-            entropy_min_entropy: 2.2,      // At least ~9.0 effective levels to keep most of 10 active
+            entropy_min_entropy: 2.2, // At least ~9.0 effective levels to keep most of 10 active
             entropy_base_temperature: 1.5, // More uniform → fewer levels filtered by min notional
             entropy_min_allocation_floor: 0.04, // 4% minimum per level (was 2%)
-            entropy_thompson_samples: 5,   // Moderate stochasticity
+            entropy_thompson_samples: 5, // Moderate stochasticity
 
             // Calibration Fill Rate Controller
             // ENABLED by default - ensures fills for parameter calibration
@@ -511,9 +511,9 @@ impl Default for StochasticConfig {
             // Proactive Position Management
             // Phase 1: Time-Based Position Ramp
             enable_position_ramp: true,
-            ramp_duration_secs: 1800.0,      // 30 minutes
-            ramp_initial_fraction: 0.10,     // Start at 10%
-            ramp_curve: "sqrt".to_string(),  // Fast start, slow finish
+            ramp_duration_secs: 1800.0,     // 30 minutes
+            ramp_initial_fraction: 0.10,    // Start at 10%
+            ramp_curve: "sqrt".to_string(), // Fast start, slow finish
 
             // Phase 2: Confidence-Gated Sizing
             enable_confidence_sizing: true,
@@ -521,14 +521,14 @@ impl Default for StochasticConfig {
 
             // Phase 3: Proactive Directional Skew
             enable_proactive_skew: true,
-            proactive_skew_sensitivity: 2.0,         // bps per unit momentum×confidence
-            proactive_min_momentum_confidence: 0.6,  // 60% confidence threshold
-            proactive_min_momentum_bps: 5.0,         // 5 bps minimum momentum
+            proactive_skew_sensitivity: 2.0, // bps per unit momentum×confidence
+            proactive_min_momentum_confidence: 0.6, // 60% confidence threshold
+            proactive_min_momentum_bps: 5.0, // 5 bps minimum momentum
 
             // Phase 4: Performance-Gated Capacity
             enable_performance_gating: true,
-            performance_loss_reduction_mult: 2.0,     // 2x loss ratio
-            performance_min_capacity_fraction: 0.3,  // Never below 30%
+            performance_loss_reduction_mult: 2.0, // 2x loss ratio
+            performance_min_capacity_fraction: 0.3, // Never below 30%
 
             // Predictive Bias Extension (A-S Model)
             // Sensitivity and threshold for predictive skew from changepoint detection
@@ -652,5 +652,4 @@ impl StochasticConfig {
         self.kelly_tau_fixed = tau;
         self
     }
-
 }

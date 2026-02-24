@@ -437,14 +437,13 @@ impl SpreadBandit {
     pub fn restore_from_checkpoint(&mut self, checkpoint: &SpreadBanditCheckpoint) {
         for cell in &checkpoint.cells {
             if cell.context_idx < N_CONTEXTS && cell.arm_idx < N_ARMS {
-                self.cells[cell.context_idx][cell.arm_idx] =
-                    BayesianQValue::from_checkpoint(
-                        cell.mu_n,
-                        cell.kappa_n,
-                        cell.alpha,
-                        cell.beta,
-                        cell.n,
-                    );
+                self.cells[cell.context_idx][cell.arm_idx] = BayesianQValue::from_checkpoint(
+                    cell.mu_n,
+                    cell.kappa_n,
+                    cell.alpha,
+                    cell.beta,
+                    cell.n,
+                );
             }
         }
         self.total_updates = checkpoint.total_updates;

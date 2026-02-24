@@ -329,7 +329,11 @@ impl PredictionStandardizer {
     /// * `min_observations` - Minimum observations before using learned stats
     pub fn new(default_mean: f64, default_std: f64, min_observations: usize) -> Self {
         Self {
-            input_standardizer: SignalStandardizer::new(default_mean, default_std, min_observations),
+            input_standardizer: SignalStandardizer::new(
+                default_mean,
+                default_std,
+                min_observations,
+            ),
             temperature: 1.0,
             bias: 0.0,
             target_spread: 0.4, // Target std of predictions ≈ 0.2
@@ -389,8 +393,8 @@ impl PredictionStandardizer {
         // EMA update for output mean and variance
         let delta = output - self.output_mean;
         self.output_mean += self.output_alpha * delta;
-        self.output_variance = (1.0 - self.output_alpha) * self.output_variance
-            + self.output_alpha * delta * delta;
+        self.output_variance =
+            (1.0 - self.output_alpha) * self.output_variance + self.output_alpha * delta * delta;
 
         self.calibration_count += 1;
 
@@ -909,7 +913,7 @@ mod tests {
         // Process some data
         for i in 0..100 {
             let raw = vec![
-                (i as f64 % 5.0) - 2.0,        // -2 to 2
+                (i as f64 % 5.0) - 2.0,         // -2 to 2
                 0.3 + (i as f64 % 10.0) * 0.05, // 0.3 to 0.75
                 0.8 + (i as f64 % 5.0) * 0.1,   // 0.8 to 1.2
             ];

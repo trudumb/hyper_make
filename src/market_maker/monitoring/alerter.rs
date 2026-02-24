@@ -492,7 +492,10 @@ impl Alerter {
                     timestamp,
                     AlertType::SpreadBlowup,
                     AlertSeverity::Warning,
-                    format!("Spread blow-up: {:.1} bps (threshold: {:.1} bps)", spread_bps, self.config.spread_warning_bps),
+                    format!(
+                        "Spread blow-up: {:.1} bps (threshold: {:.1} bps)",
+                        spread_bps, self.config.spread_warning_bps
+                    ),
                 )
                 .with_value(spread_bps)
                 .with_threshold(self.config.spread_warning_bps),
@@ -509,7 +512,12 @@ impl Alerter {
     /// * `inventory_abs` - Absolute inventory size
     /// * `max_inventory` - Maximum allowed inventory
     /// * `timestamp` - Current timestamp in milliseconds
-    pub fn check_inventory(&self, inventory_abs: f64, max_inventory: f64, timestamp: u64) -> Option<Alert> {
+    pub fn check_inventory(
+        &self,
+        inventory_abs: f64,
+        max_inventory: f64,
+        timestamp: u64,
+    ) -> Option<Alert> {
         if max_inventory <= 0.0 {
             return None;
         }
@@ -527,7 +535,9 @@ impl Alerter {
                     AlertSeverity::Warning,
                     format!(
                         "Inventory imbalance: {:.4} / {:.4} ({:.0}%)",
-                        inventory_abs, max_inventory, utilization * 100.0
+                        inventory_abs,
+                        max_inventory,
+                        utilization * 100.0
                     ),
                 )
                 .with_value(utilization)
@@ -557,7 +567,10 @@ impl Alerter {
                     timestamp,
                     AlertType::SignalDecaying,
                     AlertSeverity::Warning,
-                    format!("Signal {} degraded: MI={:.4} < {:.4}", signal_name, mi, self.config.signal_mi_warning),
+                    format!(
+                        "Signal {} degraded: MI={:.4} < {:.4}",
+                        signal_name, mi, self.config.signal_mi_warning
+                    ),
                 )
                 .with_value(mi)
                 .with_threshold(self.config.signal_mi_warning),
@@ -606,15 +619,13 @@ impl Alerter {
             return None;
         }
         self.record_alert_time(AlertType::KillSwitchArmed, timestamp);
-        Some(
-            Alert::new(
-                self.next_id(),
-                timestamp,
-                AlertType::KillSwitchArmed,
-                AlertSeverity::Critical,
-                format!("Kill switch armed: {monitor_name} at HIGH severity"),
-            ),
-        )
+        Some(Alert::new(
+            self.next_id(),
+            timestamp,
+            AlertType::KillSwitchArmed,
+            AlertSeverity::Critical,
+            format!("Kill switch armed: {monitor_name} at HIGH severity"),
+        ))
     }
 
     /// Create a manual alert.

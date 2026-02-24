@@ -8,7 +8,8 @@ use crate::helpers::truncate_float;
 use crate::prelude::Result;
 
 use super::super::{
-    infra, CancelResult, MarketMaker, TradingEnvironment, Quote, QuotingStrategy, Side, TrackedOrder,
+    infra, CancelResult, MarketMaker, Quote, QuotingStrategy, Side, TrackedOrder,
+    TradingEnvironment,
 };
 use super::side_str;
 use super::RecoveryAction;
@@ -50,7 +51,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .unwrap_or_default()
             .as_millis() as u64;
         for &oid in &cancellable_oids {
-            self.cancel_race_tracker.record_cancel_request(oid, cancel_ts_ms);
+            self.cancel_race_tracker
+                .record_cancel_request(oid, cancel_ts_ms);
         }
 
         // Debug level here since executor.rs logs at INFO level
@@ -108,7 +110,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.cancel_race_tracker.record_cancel_request(oid, cancel_ts_ms);
+        self.cancel_race_tracker
+            .record_cancel_request(oid, cancel_ts_ms);
 
         // Mark as CancelPending before sending request
         if !self.orders.initiate_cancel(oid) {
@@ -185,8 +188,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         // === InventoryGovernor: Hard ceiling check (defense-in-depth) ===
-        if self.inventory_governor.would_exceed(self.position.position(), quote.size, is_buy)
-            && !self.inventory_governor.is_reducing(self.position.position(), is_buy)
+        if self
+            .inventory_governor
+            .would_exceed(self.position.position(), quote.size, is_buy)
+            && !self
+                .inventory_governor
+                .is_reducing(self.position.position(), is_buy)
         {
             warn!(
                 side = %side_str(side),
@@ -235,7 +242,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             };
             let reduce_only_threshold = hard_max * 0.95;
             if current_pos.abs() >= reduce_only_threshold {
-                let would_increase = (is_buy && current_pos >= 0.0) || (!is_buy && current_pos <= 0.0);
+                let would_increase =
+                    (is_buy && current_pos >= 0.0) || (!is_buy && current_pos <= 0.0);
                 if would_increase {
                     debug!(
                         side = %side_str(side),
@@ -355,7 +363,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // === Tier 1: Register with queue tracker ===
             // Use L2-derived depth estimate when available, fall back to conservative heuristic.
-            let depth_ahead = self.tier1.queue_tracker.estimate_depth_at_price(quote.price, is_buy);
+            let depth_ahead = self
+                .tier1
+                .queue_tracker
+                .estimate_depth_at_price(quote.price, is_buy);
             self.tier1.queue_tracker.order_placed(
                 result.oid,
                 quote.price,

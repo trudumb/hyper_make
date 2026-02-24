@@ -191,11 +191,7 @@ impl KellySizer {
     /// Get Kelly sizing decision for a given edge estimate.
     ///
     /// Returns (should_trade, optimal_fraction, confidence).
-    pub fn sizing_decision(
-        &self,
-        edge_mean_bps: f64,
-        edge_std_bps: f64,
-    ) -> (bool, f64, f64) {
+    pub fn sizing_decision(&self, edge_mean_bps: f64, edge_std_bps: f64) -> (bool, f64, f64) {
         if !self.enabled {
             return (false, 0.0, 0.0);
         }
@@ -260,7 +256,7 @@ pub struct WinLossTracker {
 impl Default for WinLossTracker {
     fn default() -> Self {
         Self {
-            ewma_wins: 5.0,   // Prior: 5 bps average win
+            ewma_wins: 5.0, // Prior: 5 bps average win
             n_wins: 0,
             ewma_losses: 3.0, // Prior: 3 bps average loss
             n_losses: 0,
@@ -460,11 +456,13 @@ mod tests {
             10.0, // 10 bps mean edge
             2.0,  // 2 bps std
             1.0,  // 100% fill probability
-            10000.0,
-            5.0,
-            100.0,
+            10000.0, 5.0, 100.0,
         );
-        assert!(size > 0.0, "Positive edge should give positive size: {}", size);
+        assert!(
+            size > 0.0,
+            "Positive edge should give positive size: {}",
+            size
+        );
     }
 
     #[test]
@@ -486,10 +484,7 @@ mod tests {
         let size = sizer.kelly_size(
             2.0,  // 2 bps mean edge
             20.0, // 20 bps std (very high uncertainty)
-            1.0,
-            10000.0,
-            5.0,
-            100.0,
+            1.0, 10000.0, 5.0, 100.0,
         );
         assert_eq!(size, 0.0, "Low confidence should give zero size");
     }
@@ -540,7 +535,10 @@ mod tests {
     #[test]
     fn test_normal_cdf() {
         // Test known values
-        assert!((normal_cdf(0.0) - 0.5).abs() < 0.001, "CDF(0) should be 0.5");
+        assert!(
+            (normal_cdf(0.0) - 0.5).abs() < 0.001,
+            "CDF(0) should be 0.5"
+        );
         assert!(normal_cdf(3.0) > 0.99, "CDF(3) should be > 0.99");
         assert!(normal_cdf(-3.0) < 0.01, "CDF(-3) should be < 0.01");
     }
@@ -573,37 +571,52 @@ mod tests {
     fn test_correlation_discount_calm() {
         // Calm regime (gamma_mult = 1.0): no discount
         let d = correlation_discount(1.0);
-        assert!((d - 1.0).abs() < 0.001,
-            "Calm regime should have discount=1.0, got {}", d);
+        assert!(
+            (d - 1.0).abs() < 0.001,
+            "Calm regime should have discount=1.0, got {}",
+            d
+        );
     }
 
     #[test]
     fn test_correlation_discount_volatile() {
         // Volatile regime (gamma_mult = 2.0): rho_est = 0.3, discount = 1/1.3 = 0.769
         let d = correlation_discount(2.0);
-        assert!((d - 0.769).abs() < 0.01,
-            "Volatile regime should have discount~0.77, got {}", d);
+        assert!(
+            (d - 0.769).abs() < 0.01,
+            "Volatile regime should have discount~0.77, got {}",
+            d
+        );
     }
 
     #[test]
     fn test_correlation_discount_extreme() {
         // Extreme regime (gamma_mult = 3.0): rho_est = 0.6, discount = 1/1.6 = 0.625
         let d = correlation_discount(3.0);
-        assert!((d - 0.625).abs() < 0.01,
-            "Extreme regime should have discount~0.63, got {}", d);
+        assert!(
+            (d - 0.625).abs() < 0.01,
+            "Extreme regime should have discount~0.63, got {}",
+            d
+        );
     }
 
     #[test]
     fn test_correlation_discount_clamps() {
         // Below calm: gamma_mult = 0.5 → rho_est = clamp(-0.5, 0, 2) * 0.3 = 0 → 1.0
         let d_below = correlation_discount(0.5);
-        assert!((d_below - 1.0).abs() < 0.001,
-            "Below-calm should clamp to 1.0, got {}", d_below);
+        assert!(
+            (d_below - 1.0).abs() < 0.001,
+            "Below-calm should clamp to 1.0, got {}",
+            d_below
+        );
 
         // Far above extreme: gamma_mult = 10.0 → rho_est = clamp(9.0, 0, 2) * 0.3 = 0.6 → 0.625
         let d_above = correlation_discount(10.0);
-        assert!((d_above - 0.625).abs() < 0.01,
-            "Far-above-extreme should clamp to ~0.63, got {}", d_above);
+        assert!(
+            (d_above - 0.625).abs() < 0.01,
+            "Far-above-extreme should clamp to ~0.63, got {}",
+            d_above
+        );
     }
 
     #[test]
@@ -615,7 +628,17 @@ mod tests {
         let d_extreme = correlation_discount(3.0);
 
         assert!(d_calm > d_normal, "calm {} > normal {}", d_calm, d_normal);
-        assert!(d_normal > d_volatile, "normal {} > volatile {}", d_normal, d_volatile);
-        assert!(d_volatile > d_extreme, "volatile {} > extreme {}", d_volatile, d_extreme);
+        assert!(
+            d_normal > d_volatile,
+            "normal {} > volatile {}",
+            d_normal,
+            d_volatile
+        );
+        assert!(
+            d_volatile > d_extreme,
+            "volatile {} > extreme {}",
+            d_volatile,
+            d_extreme
+        );
     }
 }

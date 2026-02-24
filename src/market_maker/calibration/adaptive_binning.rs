@@ -406,10 +406,15 @@ impl AdaptiveBinner {
 
         // Approximate standard error of IR
         // IR has high variance with small samples, decreases as sqrt(n)
-        let se = if n > 10.0 { 0.5 / (n - 5.0).sqrt() } else { 0.5 };
+        let se = if n > 10.0 {
+            0.5 / (n - 5.0).sqrt()
+        } else {
+            0.5
+        };
 
         // Posterior standard deviation (combines prior and data uncertainty)
-        let posterior_sd = se * (prior_df / (prior_df + n)).sqrt() + se / (1.0 + n / prior_df).sqrt();
+        let posterior_sd =
+            se * (prior_df / (prior_df + n)).sqrt() + se / (1.0 + n / prior_df).sqrt();
 
         // Z-score for threshold
         if posterior_sd < 1e-10 {
@@ -439,7 +444,12 @@ impl AdaptiveBinner {
     ///
     /// Returns (lower, upper) bounds at the specified confidence level.
     /// Uses Normal approximation with shrinkage.
-    pub fn ir_credible_interval(&self, confidence: f64, prior_mean: f64, prior_df: f64) -> (f64, f64) {
+    pub fn ir_credible_interval(
+        &self,
+        confidence: f64,
+        prior_mean: f64,
+        prior_df: f64,
+    ) -> (f64, f64) {
         let n = self.total_samples() as f64;
         if n < 5.0 {
             // Wide interval with minimal data
@@ -449,8 +459,13 @@ impl AdaptiveBinner {
         let posterior_mean = self.posterior_mean_ir(prior_mean, prior_df);
 
         // Approximate standard error
-        let se = if n > 10.0 { 0.5 / (n - 5.0).sqrt() } else { 0.5 };
-        let posterior_sd = se * (prior_df / (prior_df + n)).sqrt() + se / (1.0 + n / prior_df).sqrt();
+        let se = if n > 10.0 {
+            0.5 / (n - 5.0).sqrt()
+        } else {
+            0.5
+        };
+        let posterior_sd =
+            se * (prior_df / (prior_df + n)).sqrt() + se / (1.0 + n / prior_df).sqrt();
 
         // Z-score for confidence level (e.g., 0.95 -> 1.96)
         // Simplified: use logistic approximation inverse
@@ -519,7 +534,11 @@ mod tests {
 
         // With adaptive binning, samples should spread across bins
         let filled = binner.filled_bins();
-        assert!(filled >= 2, "Expected at least 2 filled bins, got {}", filled);
+        assert!(
+            filled >= 2,
+            "Expected at least 2 filled bins, got {}",
+            filled
+        );
     }
 
     #[test]
@@ -535,7 +554,11 @@ mod tests {
         assert!(binner.has_sufficient_data());
         let ir = binner.information_ratio();
         // With perfect discrimination, IR should be high
-        assert!(ir > 0.5, "Expected IR > 0.5 for perfect discrimination, got {}", ir);
+        assert!(
+            ir > 0.5,
+            "Expected IR > 0.5 for perfect discrimination, got {}",
+            ir
+        );
     }
 
     #[test]
@@ -550,7 +573,11 @@ mod tests {
 
         // Resolution should be low (all in one bin)
         let ir = binner.information_ratio();
-        assert!(ir < 0.5, "Expected low IR for no discrimination, got {}", ir);
+        assert!(
+            ir < 0.5,
+            "Expected low IR for no discrimination, got {}",
+            ir
+        );
     }
 
     #[test]
@@ -559,17 +586,21 @@ mod tests {
 
         // Good predictions: high prob when positive, low when negative
         for _ in 0..30 {
-            binner.update(0.8, true);  // High prob, positive outcome - correct
+            binner.update(0.8, true); // High prob, positive outcome - correct
             binner.update(0.2, false); // Low prob, negative outcome - correct
         }
         for _ in 0..10 {
             binner.update(0.8, false); // Wrong
-            binner.update(0.2, true);  // Wrong
+            binner.update(0.2, true); // Wrong
         }
 
         let acc = binner.accuracy();
         // 60 correct out of 80 = 75%
-        assert!((acc - 0.75).abs() < 0.05, "Expected ~75% accuracy, got {}", acc);
+        assert!(
+            (acc - 0.75).abs() < 0.05,
+            "Expected ~75% accuracy, got {}",
+            acc
+        );
     }
 
     #[test]
@@ -578,22 +609,26 @@ mod tests {
 
         // High confidence predictions (far from 0.5)
         for _ in 0..20 {
-            binner.update(0.9, true);   // High conf, correct
-            binner.update(0.1, false);  // High conf, correct
+            binner.update(0.9, true); // High conf, correct
+            binner.update(0.1, false); // High conf, correct
         }
         // Low confidence predictions (near 0.5)
         for _ in 0..20 {
-            binner.update(0.55, true);  // Low conf
+            binner.update(0.55, true); // Low conf
             binner.update(0.45, false); // Low conf
         }
         // Some wrong high-conf
         for _ in 0..5 {
-            binner.update(0.9, false);  // High conf, wrong
+            binner.update(0.9, false); // High conf, wrong
         }
 
         let (acc, count) = binner.high_confidence_accuracy(0.3);
         // High conf: 40 correct, 5 wrong = 40/45 ≈ 0.89
-        assert!(acc > 0.85, "Expected high accuracy for high-conf, got {}", acc);
+        assert!(
+            acc > 0.85,
+            "Expected high accuracy for high-conf, got {}",
+            acc
+        );
         assert_eq!(count, 45);
     }
 

@@ -122,8 +122,7 @@ impl NormalInverseGamma {
         let k_new = self.k + n;
         let m_new = (self.k * self.m + n * x_bar) / k_new;
         let alpha_new = self.alpha + n / 2.0;
-        let beta_new =
-            self.beta + 0.5 * ss + 0.5 * self.k * n * (x_bar - self.m).powi(2) / k_new;
+        let beta_new = self.beta + 0.5 * ss + 0.5 * self.k * n * (x_bar - self.m).powi(2) / k_new;
 
         self.k = k_new;
         self.m = m_new;
@@ -614,7 +613,10 @@ mod tests {
 
         assert!(kappa.n_fills == 20);
         assert!(kappa.total_time >= 100.0, "Total time should be >= 100s");
-        assert!(kappa.is_warmed_up(), "Should be warmed up after 20 fills over 100s");
+        assert!(
+            kappa.is_warmed_up(),
+            "Should be warmed up after 20 fills over 100s"
+        );
     }
 
     #[test]

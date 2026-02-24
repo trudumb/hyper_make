@@ -673,7 +673,9 @@ impl PrometheusMetrics {
              # TYPE mm_learned_params_observations counter\n\
              mm_learned_params_observations{{{}}} {}\n",
             labels,
-            self.inner.learned_params_observations.load(Ordering::Relaxed)
+            self.inner
+                .learned_params_observations
+                .load(Ordering::Relaxed)
         ));
 
         let learned_calibrated = self.inner.learned_params_calibrated.load(Ordering::Relaxed) == 1;
@@ -802,17 +804,16 @@ impl PrometheusMetrics {
             "learned_alpha_touch".to_string(),
             self.inner.learned_alpha_touch.load(),
         );
-        map.insert(
-            "learned_kappa".to_string(),
-            self.inner.learned_kappa.load(),
-        );
+        map.insert("learned_kappa".to_string(), self.inner.learned_kappa.load());
         map.insert(
             "learned_spread_floor_bps".to_string(),
             self.inner.learned_spread_floor_bps.load(),
         );
         map.insert(
             "learned_params_observations".to_string(),
-            self.inner.learned_params_observations.load(Ordering::Relaxed) as f64,
+            self.inner
+                .learned_params_observations
+                .load(Ordering::Relaxed) as f64,
         );
         map.insert(
             "learned_params_calibrated".to_string(),

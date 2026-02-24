@@ -1031,7 +1031,6 @@ pub struct HawkesExcitationPredictor {
     ewma_alpha: f64,
 
     // --- Synchronicity fields ---
-
     /// Recent inter-arrival times (seconds) for entropy computation.
     /// Defaults to empty on construction (checkpoint-compatible).
     inter_arrival_buffer: VecDeque<f64>,
@@ -1133,8 +1132,12 @@ impl HawkesExcitationPredictor {
         let mut min_dt = f64::MAX;
         let mut max_dt = f64::MIN;
         for &dt in &self.inter_arrival_buffer {
-            if dt < min_dt { min_dt = dt; }
-            if dt > max_dt { max_dt = dt; }
+            if dt < min_dt {
+                min_dt = dt;
+            }
+            if dt > max_dt {
+                max_dt = dt;
+            }
         }
 
         let range = max_dt - min_dt;
@@ -1230,10 +1233,7 @@ impl HawkesExcitationPredictor {
         }
 
         // Get beta from calibration (decay rate)
-        let beta = self
-            .latest_calibration
-            .map(|c| c.beta)
-            .unwrap_or(0.1);
+        let beta = self.latest_calibration.map(|c| c.beta).unwrap_or(0.1);
 
         // Expected excess events in horizon, accounting for decay
         // ∫₀^τ λ_excess × e^(-β×t) dt = λ_excess × (1 - e^(-β×τ)) / β
@@ -1274,7 +1274,8 @@ impl HawkesExcitationPredictor {
         // Square root scaling: responsive but not too aggressive
         let reduction = penalty_range * p_cluster.sqrt();
 
-        (self.config.max_penalty - reduction).clamp(self.config.min_penalty, self.config.max_penalty)
+        (self.config.max_penalty - reduction)
+            .clamp(self.config.min_penalty, self.config.max_penalty)
     }
 
     /// Check if we're in a high excitation state.
@@ -1921,7 +1922,7 @@ mod tests {
         predictor.update_calibration(calibration);
 
         assert!(predictor.is_high_excitation());
-        
+
         // Add summary with elevated intensity
         let summary = HawkesSummary {
             is_warmed_up: true,
@@ -2005,7 +2006,9 @@ mod tests {
             let penalty = predictor.excitation_penalty();
             assert!(
                 penalty >= 0.5 && penalty <= 1.0,
-                "Penalty {} out of range for branching {}", penalty, branching
+                "Penalty {} out of range for branching {}",
+                penalty,
+                branching
             );
         }
     }
@@ -2051,7 +2054,7 @@ mod tests {
     fn test_diagnostic_summary() {
         let predictor = HawkesExcitationPredictor::new();
         let summary = predictor.diagnostic_summary();
-        
+
         // Should contain key metrics
         assert!(summary.contains("p_cluster="));
         assert!(summary.contains("penalty="));
@@ -2131,8 +2134,7 @@ mod tests {
         // Highly varied inter-arrival times → high entropy → low synchronicity
         // Use a manually constructed "random-like" sequence
         let timestamps = [
-            0.0, 0.5, 0.52, 1.8, 1.81, 3.5, 3.9, 4.0, 7.0, 7.1,
-            7.3, 9.0, 12.0, 12.5, 15.0,
+            0.0, 0.5, 0.52, 1.8, 1.81, 3.5, 3.9, 4.0, 7.0, 7.1, 7.3, 9.0, 12.0, 12.5, 15.0,
         ];
         for &t in &timestamps {
             predictor.record_event_time(t);
@@ -2155,7 +2157,11 @@ mod tests {
             predictor.record_event_time(t);
         }
         let sync = predictor.synchronicity_coefficient();
-        assert!(sync >= 0.0 && sync <= 1.0, "Sync must be in [0,1], got {}", sync);
+        assert!(
+            sync >= 0.0 && sync <= 1.0,
+            "Sync must be in [0,1], got {}",
+            sync
+        );
     }
 
     #[test]

@@ -132,7 +132,6 @@ pub struct FundingFeatures {
     pub predicted_flow: f64,
 
     // === Phase 4A.2: Funding Magnitude Feature ===
-
     /// Funding magnitude × proximity product.
     ///
     /// High value predicts "bursty" regime and κ collapse as traders rush to exit
@@ -778,7 +777,11 @@ mod tests {
 
         // We can't easily control magnitude directly, so test boundary behavior
         let mult = features_low.kappa_multiplier();
-        assert!(mult >= 0.5 && mult <= 1.5, "Multiplier should be in [0.5, 1.5]: {}", mult);
+        assert!(
+            mult >= 0.5 && mult <= 1.5,
+            "Multiplier should be in [0.5, 1.5]: {}",
+            mult
+        );
     }
 
     #[test]
@@ -810,6 +813,10 @@ mod tests {
 
         // This is just below 1.0 threshold, so prob should be moderate
         let prob_high = features_high.bursty_regime_prob();
-        assert!(prob_high >= 0.0 && prob_high <= 1.0, "Prob should be in [0,1]: {}", prob_high);
+        assert!(
+            prob_high >= 0.0 && prob_high <= 1.0,
+            "Prob should be in [0,1]: {}",
+            prob_high
+        );
     }
 }

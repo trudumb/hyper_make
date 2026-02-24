@@ -96,9 +96,7 @@ impl SafetyAuditor {
                 max_position_value
             )
         } else if over_value_limit {
-            format!(
-                "{direction}: value ${position_value:.2} > ${max_position_value:.2} limit"
-            )
+            format!("{direction}: value ${position_value:.2} > ${max_position_value:.2} limit")
         } else {
             format!(
                 "{}: position={:.4} > {:.4} limit",

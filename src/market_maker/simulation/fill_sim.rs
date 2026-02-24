@@ -272,11 +272,11 @@ impl FillSimulator {
     /// Creates estimators for new orders, updates existing ones, and removes stale ones.
     fn refresh_queue_estimators(&mut self) {
         let orders = self.executor.get_active_orders();
-        let active_oids: std::collections::HashSet<u64> =
-            orders.iter().map(|o| o.oid).collect();
+        let active_oids: std::collections::HashSet<u64> = orders.iter().map(|o| o.oid).collect();
 
         // Remove estimators for orders that are no longer active
-        self.queue_estimators.retain(|oid, _| active_oids.contains(oid));
+        self.queue_estimators
+            .retain(|oid, _| active_oids.contains(oid));
 
         // Update or create estimators for active orders
         for order in &orders {
@@ -804,10 +804,8 @@ mod tests {
         );
 
         // Insert a queue estimator simulating back-of-queue (0.9 fraction)
-        sim.queue_estimators.insert(
-            42,
-            QueuePositionEstimator::new(42, 1.0, 10.0),
-        );
+        sim.queue_estimators
+            .insert(42, QueuePositionEstimator::new(42, 1.0, 10.0));
 
         let order = SimulatedOrder {
             oid: 42,
@@ -827,7 +825,11 @@ mod tests {
         // queue_frac = 0.9, age_bonus = 1.3 (old order), adjusted_frac = 0.9/1.3 ~ 0.692
         // factor = (1 - 0.692)^1.5 ~ 0.308^1.5 ~ 0.171
         assert!(queue_factor > 0.0);
-        assert!(queue_factor < 0.3, "Back-of-queue factor should be low, got {}", queue_factor);
+        assert!(
+            queue_factor < 0.3,
+            "Back-of-queue factor should be low, got {}",
+            queue_factor
+        );
     }
 
     #[test]
@@ -843,10 +845,8 @@ mod tests {
         );
 
         // Front of queue: only our order at the level
-        sim.queue_estimators.insert(
-            43,
-            QueuePositionEstimator::new(43, 1.0, 1.0),
-        );
+        sim.queue_estimators
+            .insert(43, QueuePositionEstimator::new(43, 1.0, 1.0));
 
         let order = SimulatedOrder {
             oid: 43,
@@ -864,7 +864,11 @@ mod tests {
 
         let queue_factor = sim.compute_queue_factor(&order);
         // queue_frac = 0.0, factor = (1 - 0)^1.5 = 1.0
-        assert!((queue_factor - 1.0).abs() < 1e-10, "Front of queue should have factor ~1.0, got {}", queue_factor);
+        assert!(
+            (queue_factor - 1.0).abs() < 1e-10,
+            "Front of queue should have factor ~1.0, got {}",
+            queue_factor
+        );
     }
 
     #[test]
@@ -892,10 +896,8 @@ mod tests {
         // Add a queue estimator for it
         let orders = executor.get_active_orders();
         if let Some(order) = orders.first() {
-            sim.queue_estimators.insert(
-                order.oid,
-                QueuePositionEstimator::new(order.oid, 1.0, 5.0),
-            );
+            sim.queue_estimators
+                .insert(order.oid, QueuePositionEstimator::new(order.oid, 1.0, 5.0));
             let oid = order.oid;
 
             assert!(sim.queue_estimators.contains_key(&oid));
@@ -911,8 +913,10 @@ mod tests {
 
             // If filled, queue estimator should be removed
             if !fills.is_empty() {
-                assert!(!sim.queue_estimators.contains_key(&oid),
-                    "Queue estimator should be removed after fill");
+                assert!(
+                    !sim.queue_estimators.contains_key(&oid),
+                    "Queue estimator should be removed after fill"
+                );
             }
         }
     }
@@ -933,8 +937,11 @@ mod tests {
         let alpha = 1.5;
         // At front of queue (depth=0), should return touch_fill_prob
         let p = est.conditional_fill_prob(0.0, touch_prob, alpha);
-        assert!((p - touch_prob).abs() < 1e-10,
-            "Front of queue should return touch_fill_prob, got {}", p);
+        assert!(
+            (p - touch_prob).abs() < 1e-10,
+            "Front of queue should return touch_fill_prob, got {}",
+            p
+        );
     }
 
     #[test]
@@ -979,8 +986,11 @@ mod tests {
         let est = QueuePositionEstimator::new(1, 1.0, 1.0);
         // Front of queue: depth = 0 -> scale = 1.0
         let scale = est.size_scale_for_level(0.0, 0.3, 1.5, 0.1);
-        assert!((scale - 1.0).abs() < 1e-10,
-            "Front of queue should have scale 1.0, got {}", scale);
+        assert!(
+            (scale - 1.0).abs() < 1e-10,
+            "Front of queue should have scale 1.0, got {}",
+            scale
+        );
     }
 
     #[test]
@@ -997,7 +1007,11 @@ mod tests {
         assert!(s0 > s5, "s0={} should be > s5={}", s0, s5);
         assert!(s5 > s20, "s5={} should be > s20={}", s5, s20);
         // All above minimum fraction
-        assert!(s20 >= min_frac, "Scale should be >= min_fraction, got {}", s20);
+        assert!(
+            s20 >= min_frac,
+            "Scale should be >= min_fraction, got {}",
+            s20
+        );
     }
 
     #[test]
@@ -1006,7 +1020,11 @@ mod tests {
         let min_frac = 0.5;
         // Very deep queue: should be clamped to min_fraction
         let scale = est.size_scale_for_level(1000.0, 0.3, 1.0, min_frac);
-        assert!(scale >= min_frac,
-            "Scale should be >= min_fraction {}, got {}", min_frac, scale);
+        assert!(
+            scale >= min_frac,
+            "Scale should be >= min_fraction {}, got {}",
+            min_frac,
+            scale
+        );
     }
 }

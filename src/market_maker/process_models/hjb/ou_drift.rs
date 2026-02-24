@@ -53,9 +53,9 @@ pub struct OUDriftConfig {
 impl Default for OUDriftConfig {
     fn default() -> Self {
         Self {
-            theta: 0.5,           // ~1.4s half-life
-            mu: 0.0,              // Neutral drift
-            reconcile_k: 2.0,     // 2σ threshold
+            theta: 0.5,                 // ~1.4s half-life
+            mu: 0.0,                    // Neutral drift
+            reconcile_k: 2.0,           // 2σ threshold
             initial_sigma_drift: 0.001, // 1 bps/sec
             min_variance: 1e-12,
             max_variance: 0.01,
@@ -233,8 +233,7 @@ impl OUDriftEstimator {
                 let mean_sq_innovation = self.innovation_sum_sq / self.innovation_count as f64;
                 // σ²_D ≈ mean(innovation²) / dt (simplified)
                 let avg_dt = 0.1; // Assume 100ms average between observations
-                self.sigma_drift = (mean_sq_innovation / avg_dt)
-                    .sqrt().clamp(1e-6, 0.1);
+                self.sigma_drift = (mean_sq_innovation / avg_dt).sqrt().clamp(1e-6, 0.1);
 
                 // Reset accumulators
                 self.innovation_sum_sq = 0.0;
@@ -356,11 +355,11 @@ impl OUDriftEstimator {
     pub fn adapt_to_regime(&mut self, regime: &str) {
         match regime {
             "trending" => {
-                self.config.theta = 0.2;      // Trust trends longer (slower reversion)
+                self.config.theta = 0.2; // Trust trends longer (slower reversion)
                 self.config.reconcile_k = 1.5; // Lower filter threshold (more responsive)
             }
             "cascade" => {
-                self.config.theta = 1.0;      // Fast mean reversion (don't chase)
+                self.config.theta = 1.0; // Fast mean reversion (don't chase)
                 self.config.reconcile_k = 3.0; // High noise filter (only big innovations)
             }
             _ => {
@@ -551,9 +550,7 @@ mod tests {
 
         // Feed 50 observations of pure noise around μ=0
         // Small noise should get ~5% gate weight, keeping drift near 0
-        let noise_vals = [
-            0.00005, -0.00003, 0.00002, -0.00004, 0.00001,
-        ];
+        let noise_vals = [0.00005, -0.00003, 0.00002, -0.00004, 0.00001];
         for i in 1u64..=50 {
             let noise = noise_vals[(i as usize) % noise_vals.len()];
             estimator.update(i * 100, noise);

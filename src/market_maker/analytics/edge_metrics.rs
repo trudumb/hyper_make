@@ -248,7 +248,9 @@ impl EdgeTracker {
         for _ in 0..NUM_RESAMPLES {
             let mut sum = 0.0;
             for _ in 0..n {
-                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let idx = ((rng_state >> 33) as usize) % n;
                 sum += self.snapshots[idx].realized_edge_bps;
             }
@@ -261,7 +263,11 @@ impl EdgeTracker {
         let lower_idx = ((alpha * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
         let upper_idx = (((1.0 - alpha) * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
 
-        (point, resampled_means[lower_idx], resampled_means[upper_idx])
+        (
+            point,
+            resampled_means[lower_idx],
+            resampled_means[upper_idx],
+        )
     }
 
     /// Human-readable edge report.
@@ -270,11 +276,7 @@ impl EdgeTracker {
             return "No edge data".to_string();
         }
 
-        let sig = if self.is_edge_positive() {
-            "YES"
-        } else {
-            "NO"
-        };
+        let sig = if self.is_edge_positive() { "YES" } else { "NO" };
 
         format!(
             "Edge Metrics (n={}):\n  Predicted: {:.2} bps\n  Realized:  {:.2} bps\n  Gross:     {:.2} bps\n  Error:     {:.2} bps\n  Significant at 95%: {}",
@@ -302,7 +304,11 @@ mod tests {
         make_snapshot_with_gross(predicted_bps, realized_bps, realized_bps + 1.5)
     }
 
-    fn make_snapshot_with_gross(predicted_bps: f64, realized_bps: f64, gross_bps: f64) -> EdgeSnapshot {
+    fn make_snapshot_with_gross(
+        predicted_bps: f64,
+        realized_bps: f64,
+        gross_bps: f64,
+    ) -> EdgeSnapshot {
         EdgeSnapshot {
             timestamp_ns: 0,
             predicted_spread_bps: predicted_bps + 1.5,
@@ -461,8 +467,10 @@ mod tests {
     #[test]
     fn test_last_realized_edge_empty() {
         let tracker = EdgeTracker::new();
-        assert!((tracker.last_realized_edge_bps() - 0.0).abs() < 1e-10,
-            "Empty tracker should return 0.0");
+        assert!(
+            (tracker.last_realized_edge_bps() - 0.0).abs() < 1e-10,
+            "Empty tracker should return 0.0"
+        );
     }
 
     #[test]
@@ -472,8 +480,10 @@ mod tests {
         assert!((tracker.last_realized_edge_bps() - 2.0).abs() < 1e-10);
 
         tracker.add_snapshot(make_snapshot(5.0, -1.5));
-        assert!((tracker.last_realized_edge_bps() - (-1.5)).abs() < 1e-10,
-            "Should return most recent, not average");
+        assert!(
+            (tracker.last_realized_edge_bps() - (-1.5)).abs() < 1e-10,
+            "Should return most recent, not average"
+        );
     }
 
     #[test]
@@ -696,7 +706,11 @@ mod tests {
             markout_as_bps: None,
         };
         tracker.add_snapshot(pending);
-        assert_eq!(tracker.edge_count(), 0, "Pending snapshots should not be added");
+        assert_eq!(
+            tracker.edge_count(),
+            0,
+            "Pending snapshots should not be added"
+        );
 
         // Resolved snapshot should be accepted
         let resolved = EdgeSnapshot {
@@ -714,6 +728,10 @@ mod tests {
             markout_as_bps: Some(0.8),
         };
         tracker.add_snapshot(resolved);
-        assert_eq!(tracker.edge_count(), 1, "Resolved snapshots should be added");
+        assert_eq!(
+            tracker.edge_count(),
+            1,
+            "Resolved snapshots should be added"
+        );
     }
 }

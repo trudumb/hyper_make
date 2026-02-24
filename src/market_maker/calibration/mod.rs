@@ -22,18 +22,20 @@ mod brier_score;
 mod coefficient_estimator;
 mod conditional_metrics;
 pub mod derived_constants;
+pub mod gate;
 pub mod historical_calibrator;
 mod information_ratio;
+pub mod meta_calibration;
 pub mod model_gating;
 pub mod parameter_learner;
 mod prediction_log;
-pub mod gate;
-pub mod meta_calibration;
 pub mod signal_decay;
 
 pub use adaptive_binning::AdaptiveBinner;
 pub use brier_score::BrierScoreTracker;
-pub use coefficient_estimator::{CalibrationSample, CoefficientEstimator, CoefficientEstimatorConfig};
+pub use coefficient_estimator::{
+    CalibrationSample, CoefficientEstimator, CoefficientEstimatorConfig,
+};
 pub use conditional_metrics::ConditionalCalibration;
 pub use derived_constants::{
     derive_cascade_threshold, derive_confidence_threshold, derive_depth_spacing_ratio,
@@ -42,15 +44,20 @@ pub use derived_constants::{
     derive_quote_latch_threshold, derive_reduce_only_threshold, derive_spread_floor,
     derive_toxic_hour_multiplier,
 };
+pub use gate::{CalibrationGate, CalibrationGateConfig, PriorStatus};
 pub use historical_calibrator::{
-    CalibrationSummary, FillRecord, HistoricalCalibrator, MarketSnapshot, PowerAnalysis, TradeRecord,
+    CalibrationSummary, FillRecord, HistoricalCalibrator, MarketSnapshot, PowerAnalysis,
+    TradeRecord,
+};
+pub use information_ratio::{
+    BinStats, ExponentialIRTracker, InformationRatioTracker, IrDiagnostics,
 };
 pub use meta_calibration::{MetaCalibrationTracker, ModelCalibrationTracker};
-pub use information_ratio::{BinStats, ExponentialIRTracker, InformationRatioTracker, IrDiagnostics};
 pub use model_gating::{InformedFlowAdjustment, ModelGating, ModelGatingConfig, ModelWeights};
-pub use parameter_learner::{BayesianParam, CalibrationStatus, FillOutcome, LearnedParameters, PriorFamily};
+pub use parameter_learner::{
+    BayesianParam, CalibrationStatus, FillOutcome, LearnedParameters, PriorFamily,
+};
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};
-pub use gate::{CalibrationGate, CalibrationGateConfig, PriorStatus};
 pub use signal_decay::{
     LatencyStats, SignalDecayConfig, SignalDecayTracker, SignalEmission, SignalOutcome,
 };

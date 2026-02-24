@@ -24,6 +24,7 @@
 //! in paper trading mode. All quotes are logged but not submitted to the exchange.
 
 pub mod calibration;
+pub mod cma_es;
 pub mod executor;
 pub mod fill_sim;
 pub mod latency_model;
@@ -31,17 +32,22 @@ pub mod outcome;
 pub mod prediction;
 pub mod quick_mc;
 pub mod replay;
+pub mod shadow_buffer;
+pub mod shadow_tuner;
 
 pub use calibration::{
     BrierDecomposition, CalibrationAnalyzer, CalibrationCurve, ConditionalSlice,
 };
+pub use cma_es::{CmaEsOptimizer, ParamBound};
 pub use executor::SimulationExecutor;
 pub use fill_sim::{FillSimulator, FillSimulatorConfig, QueuePositionEstimator, SimulatedFill};
+pub use latency_model::{LatencyDistribution, LatencyModel};
 pub use outcome::{CycleAttribution, OutcomeTracker, PnLDecomposition};
 pub use prediction::{
     FillOutcome, LevelPrediction, MarketStateSnapshot, ModelPredictions, ObservedOutcomes,
     PredictionLogger, PredictionRecord,
 };
 pub use quick_mc::{MCSimulationResult, QuickMCConfig, QuickMCSimulator};
-pub use latency_model::{LatencyDistribution, LatencyModel};
 pub use replay::{ReplayConfig, ReplayEngine, ReplayEvent, ReplayFill, ReplayReport};
+pub use shadow_buffer::{create_shadow_buffer, ShadowBufferConsumer, ShadowBufferProducer};
+pub use shadow_tuner::{ShadowTuner, ShadowTunerCheckpoint, TunerConfig};

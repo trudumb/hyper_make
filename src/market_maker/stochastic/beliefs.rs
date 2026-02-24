@@ -510,10 +510,7 @@ mod tests {
         }
 
         // Kappa should have been updated
-        assert!(
-            beliefs.n_fills == 30,
-            "Should have 30 fills recorded"
-        );
+        assert!(beliefs.n_fills == 30, "Should have 30 fills recorded");
         assert!(
             beliefs.kappa.total_time >= 90.0,
             "Total time should be >= 90s: {}",

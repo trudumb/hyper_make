@@ -65,8 +65,8 @@ impl Default for BayesianBootstrapConfig {
             // - For IR CI width < 0.2, we need N ≈ (1.96/0.2)² ≈ 96 samples
             // - But bootstrap can exit early if converging, so prior mean is 50
             // - The high variance (σ = 22) reflects uncertainty about true requirement
-            prior_alpha: 5.0,  // Gamma shape: α₀
-            prior_beta: 0.1,   // Gamma rate: β₀ → E[θ] = 50, Var[θ] = 500
+            prior_alpha: 5.0, // Gamma shape: α₀
+            prior_beta: 0.1,  // Gamma rate: β₀ → E[θ] = 50, Var[θ] = 500
 
             // TARGET IR: Information Ratio threshold for "calibrated" model
             // IR > 1.0 means the model adds value over random noise
@@ -85,7 +85,7 @@ impl Default for BayesianBootstrapConfig {
             // - variance: ±10 outcomes uncertainty
             // - expected_remaining: < 5 outcomes to go
             exit_confidence: 0.95,
-            exit_variance: 100.0,        // σ² < 100 → σ < 10
+            exit_variance: 100.0, // σ² < 100 → σ < 10
             exit_expected_remaining: 5.0,
 
             // HARD FLOOR: Minimum outcomes regardless of posterior
@@ -311,9 +311,7 @@ impl BayesianBootstrapTracker {
                 expected_remaining, self.config.exit_expected_remaining
             )
         } else {
-            format!(
-                "Continuing bootstrap (P={p_calibrated:.3}, remaining={expected_remaining:.1})"
-            )
+            format!("Continuing bootstrap (P={p_calibrated:.3}, remaining={expected_remaining:.1})")
         };
 
         BayesianExitDecision {

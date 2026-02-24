@@ -31,5 +31,7 @@ pub(crate) use bipower::SingleScaleBipower;
 
 // Re-export public types for external access
 pub use regime::VolatilityRegime;
-pub use regime::{BlendedParameters, RegimeBeliefState, RegimeParameterBlender, RegimeParameterConfig};
+pub use regime::{
+    BlendedParameters, RegimeBeliefState, RegimeParameterBlender, RegimeParameterConfig,
+};
 pub use stochastic::StochasticVolParams;

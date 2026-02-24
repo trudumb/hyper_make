@@ -24,12 +24,12 @@
 
 pub mod asset_identity;
 pub mod discovery;
-pub mod types;
 pub mod prediction_reader;
 pub mod transfer;
+pub mod types;
 
-pub use types::*;
 pub use transfer::*;
+pub use types::*;
 
 use std::fs;
 use std::io;
@@ -117,10 +117,7 @@ impl CheckpointManager {
 
         let json = fs::read_to_string(&checkpoint_path)?;
         let bundle: CheckpointBundle = serde_json::from_str(&json).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("JSON deserialize: {e}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidData, format!("JSON deserialize: {e}"))
         })?;
 
         info!(
@@ -249,6 +246,7 @@ mod tests {
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
+            shadow_tuner: None,
         }
     }
 
@@ -314,7 +312,10 @@ mod tests {
 
         // .tmp file should not exist after successful save
         let tmp_path = dir.join("latest/checkpoint.json.tmp");
-        assert!(!tmp_path.exists(), ".tmp file should be cleaned up after rename");
+        assert!(
+            !tmp_path.exists(),
+            ".tmp file should be cleaned up after rename"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

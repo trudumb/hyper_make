@@ -69,11 +69,7 @@ impl Default for HJBQueueValueConfig {
 
 impl HJBQueueValueConfig {
     /// Create from HJB config parameters.
-    pub fn from_hjb_config(
-        queue_alpha: f64,
-        queue_beta: f64,
-        queue_modify_cost_bps: f64,
-    ) -> Self {
+    pub fn from_hjb_config(queue_alpha: f64, queue_beta: f64, queue_modify_cost_bps: f64) -> Self {
         Self {
             alpha: queue_alpha,
             beta: queue_beta,

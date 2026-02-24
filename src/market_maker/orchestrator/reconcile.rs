@@ -10,11 +10,11 @@ use crate::prelude::Result;
 
 use crate::EPSILON;
 
-use super::super::{
-    tracking, CancelResult, MarketMaker, ModifySpec, TradingEnvironment, OrderSpec, OrderState, Quote,
-    QuotingStrategy, Side, TrackedOrder,
-};
 use super::super::infra::RejectionErrorType;
+use super::super::{
+    tracking, CancelResult, MarketMaker, ModifySpec, OrderSpec, OrderState, Quote, QuotingStrategy,
+    Side, TrackedOrder, TradingEnvironment,
+};
 use super::{partition_ladder_actions, side_str};
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
@@ -313,7 +313,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     );
                 } else {
                     // Fallback (shouldn't happen with new code)
-                    self.orders.add_pending(side, spec.price, spec.size, mid_price);
+                    self.orders
+                        .add_pending(side, spec.price, spec.size, mid_price);
                 }
             }
 
@@ -416,7 +417,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                 self.latest_mid,
                             )
                         } else {
-                            TrackedOrder::new(result.oid, side, spec.price, spec.size, self.latest_mid)
+                            TrackedOrder::new(
+                                result.oid,
+                                side,
+                                spec.price,
+                                spec.size,
+                                self.latest_mid,
+                            )
                         };
                         tracked.filled = actual_fill;
                         tracked.transition_to(OrderState::FilledImmediately);
@@ -496,7 +503,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // Initialize queue tracking with L2-derived depth estimate.
                     // Depth = total size ahead of us at our price level from the cached L2 book.
                     let is_buy = side == Side::Buy;
-                    let depth_ahead = self.tier1.queue_tracker.estimate_depth_at_price(spec.price, is_buy);
+                    let depth_ahead = self
+                        .tier1
+                        .queue_tracker
+                        .estimate_depth_at_price(spec.price, is_buy);
                     self.tier1.queue_tracker.order_placed(
                         result.oid,
                         spec.price,
@@ -924,7 +934,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             if let Some(last_recovery) = self.last_empty_ladder_recovery {
                 if last_recovery.elapsed().as_secs() < EMPTY_LADDER_COOLDOWN_SECS {
                     debug!(
-                        cooldown_remaining_ms = (EMPTY_LADDER_COOLDOWN_SECS * 1000).saturating_sub(last_recovery.elapsed().as_millis() as u64),
+                        cooldown_remaining_ms = (EMPTY_LADDER_COOLDOWN_SECS * 1000)
+                            .saturating_sub(last_recovery.elapsed().as_millis() as u64),
                         "EMPTY LADDER recovery in cooldown - skipping to reduce churn"
                     );
                     return Ok(());
@@ -984,15 +995,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Uses sqrt scaling: at 25% headroom → ~half levels, at 4% → ~1/5th.
             let max_target_levels = bid_places.len().max(ask_places.len());
             let policy = &self.capital_policy;
-            let allowed_levels = self
-                .stochastic
-                .quota_shadow
-                .continuous_ladder_levels(
-                    max_target_levels,
-                    headroom,
-                    policy.quota_density_scaling,
-                    Some(policy.quota_min_headroom_for_full),
-                );
+            let allowed_levels = self.stochastic.quota_shadow.continuous_ladder_levels(
+                max_target_levels,
+                headroom,
+                policy.quota_density_scaling,
+                Some(policy.quota_min_headroom_for_full),
+            );
             bid_places.truncate(allowed_levels);
             ask_places.truncate(allowed_levels);
             warn!(
@@ -1210,15 +1218,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .unwrap_or(1.0);
             let max_target = bid_levels.len().max(ask_levels.len());
             let policy = &self.capital_policy;
-            let allowed = self
-                .stochastic
-                .quota_shadow
-                .continuous_ladder_levels(
-                    max_target,
-                    headroom,
-                    policy.quota_density_scaling,
-                    Some(policy.quota_min_headroom_for_full),
-                );
+            let allowed = self.stochastic.quota_shadow.continuous_ladder_levels(
+                max_target,
+                headroom,
+                policy.quota_density_scaling,
+                Some(policy.quota_min_headroom_for_full),
+            );
             if allowed < max_target {
                 bid_levels.truncate(allowed);
                 ask_levels.truncate(allowed);
@@ -1448,16 +1453,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             let classify_action = |action: &LadderAction, idx: usize| -> OperationPriority {
                 match action {
-                    LadderAction::Cancel { .. } => {
-                        BudgetPacer::priority_for_cancel(false, false)
-                    }
+                    LadderAction::Cancel { .. } => BudgetPacer::priority_for_cancel(false, false),
                     LadderAction::Modify { .. } => {
                         // Modifies preserve queue position — always at least Normal priority.
                         OperationPriority::Normal
                     }
-                    LadderAction::Place { .. } => {
-                        BudgetPacer::priority_for_placement(idx == 0)
-                    }
+                    LadderAction::Place { .. } => BudgetPacer::priority_for_placement(idx == 0),
                 }
             };
 
@@ -1475,7 +1476,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .filter(|(i, a)| self.infra.budget_pacer.should_spend(classify_action(a, *i)))
                 .map(|(_, a)| a)
                 .collect();
-            budget_suppressed = (budget_pre_bid + budget_pre_ask) - (bid_actions.len() + ask_actions.len());
+            budget_suppressed =
+                (budget_pre_bid + budget_pre_ask) - (bid_actions.len() + ask_actions.len());
             if budget_suppressed > 0 {
                 info!(
                     budget_suppressed,
@@ -1522,7 +1524,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             for oid in &all_cancels {
                 if let Some(order) = self.ws_state.remove_order(*oid) {
                     self.safety.fill_processor.record_cancelled_order(
-                        *oid, order.side, order.price, order.size,
+                        *oid,
+                        order.side,
+                        order.price,
+                        order.size,
                     );
                 }
             }
@@ -1773,7 +1778,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             .register_expected_cloids(std::slice::from_ref(&cloid));
 
                         // Truncate size to exchange precision before placement
-                        let safe_size = truncate_float(spec.new_size, self.config.sz_decimals, false);
+                        let safe_size =
+                            truncate_float(spec.new_size, self.config.sz_decimals, false);
                         if safe_size <= 0.0 {
                             warn!(
                                 original_size = %format!("{:.6}", spec.new_size),
@@ -1995,11 +2001,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         bid_quotes: Vec<Quote>,
         ask_quotes: Vec<Quote>,
     ) -> Result<()> {
-        use crate::market_maker::quoting::LadderLevel;
-        use crate::market_maker::tracking::{
-            score_reconcile_actions, DynamicReconcileConfig,
-        };
         use super::budget_allocator::{allocate, ApiBudget};
+        use crate::market_maker::quoting::LadderLevel;
+        use crate::market_maker::tracking::{score_reconcile_actions, DynamicReconcileConfig};
 
         let reconcile_config = &self.config.reconcile;
 
@@ -2113,9 +2117,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
 
                 if bid_levels.is_empty() && ask_levels.is_empty() {
-                    warn!(
-                        "Skipping quote cycle: ALL levels filtered by BBO crossing"
-                    );
+                    warn!("Skipping quote cycle: ALL levels filtered by BBO crossing");
                     return Ok(());
                 }
             }
@@ -2183,15 +2185,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             let max_target_levels = bid_places.len().max(ask_places.len());
             let policy = &self.capital_policy;
-            let allowed_levels = self
-                .stochastic
-                .quota_shadow
-                .continuous_ladder_levels(
-                    max_target_levels,
-                    headroom,
-                    policy.quota_density_scaling,
-                    Some(policy.quota_min_headroom_for_full),
-                );
+            let allowed_levels = self.stochastic.quota_shadow.continuous_ladder_levels(
+                max_target_levels,
+                headroom,
+                policy.quota_density_scaling,
+                Some(policy.quota_min_headroom_for_full),
+            );
             bid_places.truncate(allowed_levels);
             ask_places.truncate(allowed_levels);
 
@@ -2199,7 +2198,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
             }
             if !ask_places.is_empty() {
-                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+                self.place_bulk_ladder_orders(Side::Sell, ask_places)
+                    .await?;
             }
 
             self.last_empty_ladder_recovery = Some(std::time::Instant::now());
@@ -2272,7 +2272,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
             }
             if !ask_places.is_empty() {
-                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+                self.place_bulk_ladder_orders(Side::Sell, ask_places)
+                    .await?;
             }
 
             return Ok(());
@@ -2295,8 +2296,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             if should_refresh {
                 if let Ok(response) = self.info_client.user_rate_limit(self.user_address).await {
-                    self.infra.cached_rate_limit =
-                        Some(CachedRateLimit::from_response(&response));
+                    self.infra.cached_rate_limit = Some(CachedRateLimit::from_response(&response));
                 }
             }
 
@@ -2324,15 +2324,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .unwrap_or(1.0);
             let max_target = bid_levels.len().max(ask_levels.len());
             let policy = &self.capital_policy;
-            let allowed = self
-                .stochastic
-                .quota_shadow
-                .continuous_ladder_levels(
-                    max_target,
-                    headroom,
-                    policy.quota_density_scaling,
-                    Some(policy.quota_min_headroom_for_full),
-                );
+            let allowed = self.stochastic.quota_shadow.continuous_ladder_levels(
+                max_target,
+                headroom,
+                policy.quota_density_scaling,
+                Some(policy.quota_min_headroom_for_full),
+            );
             if allowed < max_target {
                 bid_levels.truncate(allowed);
                 ask_levels.truncate(allowed);
@@ -2359,10 +2356,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             };
 
             // Sum resting order exposure by side
-            let resting_bid_size: f64 = self.orders.get_all_by_side(Side::Buy)
-                .iter().map(|o| o.remaining()).sum();
-            let resting_ask_size: f64 = self.orders.get_all_by_side(Side::Sell)
-                .iter().map(|o| o.remaining()).sum();
+            let resting_bid_size: f64 = self
+                .orders
+                .get_all_by_side(Side::Buy)
+                .iter()
+                .map(|o| o.remaining())
+                .sum();
+            let resting_ask_size: f64 = self
+                .orders
+                .get_all_by_side(Side::Sell)
+                .iter()
+                .map(|o| o.remaining())
+                .sum();
 
             // Proposed new exposure from target levels
             let proposed_bid_size: f64 = bid_levels.iter().map(|l| l.size).sum();
@@ -2707,7 +2712,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             for oid in &all_cancels {
                 if let Some(order) = self.ws_state.remove_order(*oid) {
                     self.safety.fill_processor.record_cancelled_order(
-                        *oid, order.side, order.price, order.size,
+                        *oid,
+                        order.side,
+                        order.price,
+                        order.size,
                     );
                 }
             }
@@ -2725,11 +2733,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     return true;
                 }
                 if spec.is_buy && spec.new_price >= self.cached_best_ask - safety_margin {
-                    warn!(oid = spec.oid, "Filtering modify: bid would cross exchange ask");
+                    warn!(
+                        oid = spec.oid,
+                        "Filtering modify: bid would cross exchange ask"
+                    );
                     return false;
                 }
                 if !spec.is_buy && spec.new_price <= self.cached_best_bid + safety_margin {
-                    warn!(oid = spec.oid, "Filtering modify: ask would cross exchange bid");
+                    warn!(
+                        oid = spec.oid,
+                        "Filtering modify: ask would cross exchange bid"
+                    );
                     return false;
                 }
                 true
@@ -2767,9 +2781,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             if self.orders.replace_oid(spec.oid, result.oid) {
                                 oid_remap_count += 1;
                             } else {
-                                let side = if spec.is_buy { tracking::Side::Buy } else { tracking::Side::Sell };
+                                let side = if spec.is_buy {
+                                    tracking::Side::Buy
+                                } else {
+                                    tracking::Side::Sell
+                                };
                                 let new_order = tracking::TrackedOrder::new(
-                                    result.oid, side, spec.new_price, spec.new_size, self.latest_mid,
+                                    result.oid,
+                                    side,
+                                    spec.new_price,
+                                    spec.new_size,
+                                    self.latest_mid,
                                 );
                                 self.orders.add_order(new_order);
                                 oid_remap_count += 1;
@@ -2779,7 +2801,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             spec.oid
                         };
 
-                        self.orders.on_modify_success(effective_oid, spec.new_price, spec.new_size);
+                        self.orders
+                            .on_modify_success(effective_oid, spec.new_price, spec.new_size);
                         self.infra.prometheus.record_order_modified();
                         modify_success_count += 1;
                     } else {
@@ -2792,7 +2815,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                         let error_msg = result.error.as_deref().unwrap_or("");
                         let is_already_canceled = error_msg.contains("canceled");
-                        let is_already_filled = !is_already_canceled && error_msg.contains("filled");
+                        let is_already_filled =
+                            !is_already_canceled && error_msg.contains("filled");
 
                         if is_already_canceled {
                             self.orders.remove_order(spec.oid);
@@ -2847,13 +2871,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             .predict_with_regime(&regime_str);
 
                         self.orders.add_pending_with_calibration(
-                            side, spec.new_price, spec.new_size,
-                            cloid.clone(), Some(fill_pred_id), Some(as_pred_id),
-                            Some(depth_bps), mid_price,
+                            side,
+                            spec.new_price,
+                            spec.new_size,
+                            cloid.clone(),
+                            Some(fill_pred_id),
+                            Some(as_pred_id),
+                            Some(depth_bps),
+                            mid_price,
                         );
-                        self.infra.orphan_tracker.register_expected_cloids(std::slice::from_ref(&cloid));
+                        self.infra
+                            .orphan_tracker
+                            .register_expected_cloids(std::slice::from_ref(&cloid));
 
-                        let safe_size = truncate_float(spec.new_size, self.config.sz_decimals, false);
+                        let safe_size =
+                            truncate_float(spec.new_size, self.config.sz_decimals, false);
                         if safe_size <= 0.0 {
                             self.orders.remove_pending_by_cloid(&cloid);
                             self.infra.orphan_tracker.mark_failed(&cloid);
@@ -2863,17 +2895,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         let place_result = self
                             .environment
                             .place_order(
-                                &self.config.asset, spec.new_price, safe_size,
-                                spec.is_buy, Some(cloid.clone()), true,
+                                &self.config.asset,
+                                spec.new_price,
+                                safe_size,
+                                spec.is_buy,
+                                Some(cloid.clone()),
+                                true,
                             )
                             .await;
 
                         if place_result.oid > 0 {
-                            self.infra.orphan_tracker.record_oid_for_cloid(&cloid, place_result.oid);
+                            self.infra
+                                .orphan_tracker
+                                .record_oid_for_cloid(&cloid, place_result.oid);
 
                             if place_result.filled {
                                 self.orders.remove_pending_by_cloid(&cloid);
-                                self.infra.orphan_tracker.mark_finalized(&cloid, place_result.oid);
+                                self.infra
+                                    .orphan_tracker
+                                    .mark_finalized(&cloid, place_result.oid);
 
                                 let resting_size = place_result.resting_size;
                                 let actual_fill = if resting_size < crate::EPSILON {
@@ -2883,11 +2923,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                 };
 
                                 self.position.process_fill(actual_fill, spec.is_buy);
-                                self.safety.fill_processor.pre_register_immediate_fill(place_result.oid, actual_fill);
+                                self.safety
+                                    .fill_processor
+                                    .pre_register_immediate_fill(place_result.oid, actual_fill);
 
                                 let mut tracked = TrackedOrder::with_cloid(
-                                    place_result.oid, cloid, side,
-                                    spec.new_price, spec.new_size, self.latest_mid,
+                                    place_result.oid,
+                                    cloid,
+                                    side,
+                                    spec.new_price,
+                                    spec.new_size,
+                                    self.latest_mid,
                                 );
                                 tracked.filled = actual_fill;
 
@@ -2900,9 +2946,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                 self.orders.add_order(tracked);
                             } else {
                                 self.orders.finalize_pending_by_cloid(
-                                    &cloid, place_result.oid, place_result.resting_size,
+                                    &cloid,
+                                    place_result.oid,
+                                    place_result.resting_size,
                                 );
-                                self.infra.orphan_tracker.mark_finalized(&cloid, place_result.oid);
+                                self.infra
+                                    .orphan_tracker
+                                    .mark_finalized(&cloid, place_result.oid);
                             }
                         } else {
                             self.orders.remove_pending_by_cloid(&cloid);
@@ -2945,7 +2995,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
         }
         if !ask_places.is_empty() {
-            self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+            self.place_bulk_ladder_orders(Side::Sell, ask_places)
+                .await?;
         }
 
         // === IMPULSE CONTROL BUDGET ===
@@ -3000,23 +3051,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                 if let Some(oid) = update.oid {
                     let price_drift_bps = if self.latest_mid > crate::EPSILON {
-                        (update.target_price - update.current_price).abs()
-                            / self.latest_mid
+                        (update.target_price - update.current_price).abs() / self.latest_mid
                             * 10_000.0
                     } else {
                         0.0
                     };
 
-                    self.reconcile_outcome_tracker.record_decision(
-                        ReconcileDecision {
+                    self.reconcile_outcome_tracker
+                        .record_decision(ReconcileDecision {
                             oid,
                             action: action_type,
                             predicted_p_fill: update.p_fill_new,
                             predicted_queue_value_bps: update.value_bps,
                             price_drift_bps,
                             decided_at: std::time::Instant::now(),
-                        },
-                    );
+                        });
                 }
             }
         }
@@ -3025,11 +3074,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Set dynamic fallback interval based on volatility, latch threshold, and headroom.
         {
             use super::event_accumulator::compute_next_cycle_time;
-            let next_interval = compute_next_cycle_time(
-                sigma,
-                dynamic_config.latch_threshold_bps,
-                headroom_pct,
-            );
+            let next_interval =
+                compute_next_cycle_time(sigma, dynamic_config.latch_threshold_bps, headroom_pct);
             self.event_accumulator.set_dynamic_fallback(next_interval);
         }
 
@@ -3167,8 +3213,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // === InventoryGovernor: Hard ceiling check (defense-in-depth) ===
-            if self.inventory_governor.would_exceed(self.position.position(), size, is_buy)
-                && !self.inventory_governor.is_reducing(self.position.position(), is_buy)
+            if self
+                .inventory_governor
+                .would_exceed(self.position.position(), size, is_buy)
+                && !self
+                    .inventory_governor
+                    .is_reducing(self.position.position(), is_buy)
             {
                 orders_blocked_by_governor += 1;
                 if orders_blocked_by_governor == 1 {
@@ -3227,8 +3277,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // losing orders that are just barely above the $10 threshold
             let pre_notional = sizing_result.adjusted_size * price;
             let should_round_up = pre_notional >= MIN_ORDER_NOTIONAL;
-            let mut truncated_size =
-                truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, should_round_up);
+            let mut truncated_size = truncate_float(
+                sizing_result.adjusted_size,
+                self.config.sz_decimals,
+                should_round_up,
+            );
             if truncated_size <= 0.0 {
                 orders_post_truncation_zero += 1;
                 continue;
@@ -3444,7 +3497,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                     // Track order as FilledImmediately for WebSocket deduplication
                     let mut tracked = if let Some(c) = cloid {
-                        TrackedOrder::with_cloid(result.oid, c.clone(), side, spec.price, spec.size, self.latest_mid)
+                        TrackedOrder::with_cloid(
+                            result.oid,
+                            c.clone(),
+                            side,
+                            spec.price,
+                            spec.size,
+                            self.latest_mid,
+                        )
                     } else {
                         TrackedOrder::new(result.oid, side, spec.price, spec.size, self.latest_mid)
                     };
@@ -3518,12 +3578,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         self.latest_mid,
                     )
                 } else {
-                    TrackedOrder::new(result.oid, side, spec.price, result.resting_size, self.latest_mid)
+                    TrackedOrder::new(
+                        result.oid,
+                        side,
+                        spec.price,
+                        result.resting_size,
+                        self.latest_mid,
+                    )
                 };
                 self.ws_state.add_order(tracked);
 
                 // Initialize queue tracking with L2-derived depth estimate.
-                let depth_ahead = self.tier1.queue_tracker.estimate_depth_at_price(spec.price, is_buy);
+                let depth_ahead = self
+                    .tier1
+                    .queue_tracker
+                    .estimate_depth_at_price(spec.price, is_buy);
                 self.tier1.queue_tracker.order_placed(
                     result.oid,
                     spec.price,

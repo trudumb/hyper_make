@@ -546,7 +546,10 @@ impl BayesianKappaEstimator {
     ///
     /// The VecDeque rolling window stays empty — it refills from live fills.
     /// The posterior is recomputed from the restored sufficient statistics.
-    pub(crate) fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::KappaCheckpoint) {
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        cp: &crate::market_maker::checkpoint::KappaCheckpoint,
+    ) {
         self.prior_alpha = cp.prior_alpha;
         self.prior_beta = cp.prior_beta;
         self.observation_count = cp.observation_count;

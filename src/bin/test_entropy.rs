@@ -84,9 +84,7 @@ fn test_with_levels(levels: Vec<LevelOptimizationParams>, min_active_levels: usi
     for (i, &size) in active_sizes.iter().take(5) {
         let notional = size * price;
         let depth = levels[*i].depth_bps;
-        println!(
-            "  Level {i} ({depth}bps): size={size:.6} BTC (${notional:.2})"
-        );
+        println!("  Level {i} ({depth}bps): size={size:.6} BTC (${notional:.2})");
     }
     if active_sizes.len() > 5 {
         println!("  ... ({} more active levels)", active_sizes.len() - 5);

@@ -13,7 +13,9 @@
 //! its defense intent to an alternative mechanism (wider spread).
 
 use crate::market_maker::config::{Quote, SizeQuantum};
-use crate::market_maker::quoting::exchange_rules::{ExchangeRules, ValidatedQuote, ValidationReport};
+use crate::market_maker::quoting::exchange_rules::{
+    ExchangeRules, ValidatedQuote, ValidationReport,
+};
 use crate::market_maker::quoting::ladder::Ladder;
 
 /// Maximum spread widening multiplier from defense-via-spread conversions.
@@ -93,8 +95,8 @@ impl ViableQuoteSide {
             // Convert the intended reduction to spread widening
             // factor=0.82 → widening = 1/0.82 ≈ 1.22x
             let widening = 1.0 / factor;
-            self.defense_spread_mult = (self.defense_spread_mult * widening)
-                .min(MAX_DEFENSE_SPREAD_MULT);
+            self.defense_spread_mult =
+                (self.defense_spread_mult * widening).min(MAX_DEFENSE_SPREAD_MULT);
         }
     }
 
@@ -548,10 +550,7 @@ mod tests {
     #[test]
     fn test_retain_last_level_protection() {
         // If retain would remove ALL quotes, the best (first) is preserved
-        let mut side = ViableQuoteSide::new(vec![
-            Quote::new(30.0, 0.50),
-            Quote::new(29.9, 0.50),
-        ]);
+        let mut side = ViableQuoteSide::new(vec![Quote::new(30.0, 0.50), Quote::new(29.9, 0.50)]);
 
         // Predicate that matches nothing
         side.retain(|_| false);
@@ -583,11 +582,11 @@ mod tests {
         let mut ladder = ViableQuoteLadder {
             bids: ViableQuoteSide::new(vec![Quote::new(
                 mid * (1.0 - 5.0 / 10_000.0), // 5 bps below mid
-                quantum.min_viable_size,       // 0.34 — exactly at minimum
+                quantum.min_viable_size,      // 0.34 — exactly at minimum
             )]),
             asks: ViableQuoteSide::new(vec![Quote::new(
                 mid * (1.0 + 5.0 / 10_000.0), // 5 bps above mid
-                quantum.min_viable_size,       // 0.34
+                quantum.min_viable_size,      // 0.34
             )]),
             quantum,
             mid_px: mid,
@@ -765,20 +764,16 @@ mod tests {
         let quantum = hype_quantum(); // min_viable = 0.34
 
         let mut ladder = Ladder::default();
-        ladder
-            .bids
-            .push(crate::market_maker::quoting::LadderLevel {
-                price: 30.0,
-                size: 0.30, // Below min_viable (0.34)
-                depth_bps: 5.0,
-            });
-        ladder
-            .asks
-            .push(crate::market_maker::quoting::LadderLevel {
-                price: 30.60,
-                size: 0.50, // Above min_viable
-                depth_bps: 5.0,
-            });
+        ladder.bids.push(crate::market_maker::quoting::LadderLevel {
+            price: 30.0,
+            size: 0.30, // Below min_viable (0.34)
+            depth_bps: 5.0,
+        });
+        ladder.asks.push(crate::market_maker::quoting::LadderLevel {
+            price: 30.60,
+            size: 0.50, // Above min_viable
+            depth_bps: 5.0,
+        });
 
         let viable = ViableQuoteLadder::from_ladder(&ladder, quantum, 30.30, None);
 
@@ -800,13 +795,11 @@ mod tests {
         let quantum = hype_quantum();
 
         let mut ladder = Ladder::default();
-        ladder
-            .bids
-            .push(crate::market_maker::quoting::LadderLevel {
-                price: 30.0,
-                size: 0.0, // Zero size — should be dropped
-                depth_bps: 5.0,
-            });
+        ladder.bids.push(crate::market_maker::quoting::LadderLevel {
+            price: 30.0,
+            size: 0.0, // Zero size — should be dropped
+            depth_bps: 5.0,
+        });
 
         let viable = ViableQuoteLadder::from_ladder(&ladder, quantum, 30.30, None);
         assert!(viable.bids.is_empty());
@@ -881,10 +874,18 @@ mod tests {
 
         // All quotes must have valid prices
         for vq in &bids {
-            assert!(rules.is_valid_price(vq.price()), "Bid price {} invalid", vq.price());
+            assert!(
+                rules.is_valid_price(vq.price()),
+                "Bid price {} invalid",
+                vq.price()
+            );
         }
         for vq in &asks {
-            assert!(rules.is_valid_price(vq.price()), "Ask price {} invalid", vq.price());
+            assert!(
+                rules.is_valid_price(vq.price()),
+                "Ask price {} invalid",
+                vq.price()
+            );
         }
     }
 }

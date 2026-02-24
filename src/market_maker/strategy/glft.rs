@@ -37,47 +37,52 @@ pub struct EPnLParams {
 /// Enhanced per-level E[PnL] computation absorbing all former multiplicative overlays.
 pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
     let depth_frac = params.depth_bps / 10_000.0;
-    
+
     // Fill intensity at this depth: λ(δ) = κ × exp(-κ × δ)
     let mut lambda = params.kappa_side * (-params.kappa_side * depth_frac).exp();
-    
+
     // Circuit breaker → staleness discount on lambda
     if params.circuit_breaker_active {
-        lambda *= 0.1; 
+        lambda *= 0.1;
     }
-    
+
     // Drawdown → reduces lambda
     let drawdown_penalty = (1.0 - params.drawdown_frac * 5.0).max(0.1);
     lambda *= drawdown_penalty;
-    
+
     // Toxicity amplifies AS economically
     let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
-    
+
     // Spread capture net of costs
-    let capture = params.depth_bps - params.as_cost_bps - params.fee_bps - params.carry_cost_bps - params.cascade_addon_bps;
-    
+    let capture = params.depth_bps
+        - params.as_cost_bps
+        - params.fee_bps
+        - params.carry_cost_bps
+        - params.cascade_addon_bps;
+
     // Drift contribution: directional, mirrors GLFT ±μ̂×τ/2 asymmetry.
     let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
     let drift_contribution = if params.is_bid { drift_bps } else { -drift_bps };
-    
+
     // Inventory penalty uses continuous gamma(q) = gamma_base × (1 + beta × (q/q_max)²)
     let q_ratio = if params.max_position > 1e-9 {
         (params.position.abs() / params.max_position).min(1.0)
     } else {
         0.0
     };
-    
+
     let gamma_q = params.gamma * (1.0 + params.inventory_beta * q_ratio.powi(2));
-    
-    let is_reducing = (params.is_bid && params.position < 0.0) || (!params.is_bid && params.position > 0.0);
+
+    let is_reducing =
+        (params.is_bid && params.position < 0.0) || (!params.is_bid && params.position > 0.0);
     let inv_penalty_bps = gamma_q * q_ratio * params.sigma.powi(2) * params.time_horizon * 10_000.0;
-    
+
     let inventory_adj = if is_reducing {
         -0.5 * inv_penalty_bps // Bonus for reducing
     } else {
         inv_penalty_bps // Penalty for accumulating
     };
-    
+
     // Total E[PnL] = fill_probability × (capture - toxicity_cost) + drift_contribution - inventory_penalty - impact_cost
     lambda * (capture - toxicity_cost) + drift_contribution - inventory_adj - params.self_impact_bps
 }
@@ -227,8 +232,11 @@ pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagn
 
     let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
 
-    let capture = params.depth_bps - params.as_cost_bps - params.fee_bps
-        - params.carry_cost_bps - params.cascade_addon_bps;
+    let capture = params.depth_bps
+        - params.as_cost_bps
+        - params.fee_bps
+        - params.carry_cost_bps
+        - params.cascade_addon_bps;
 
     let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
     let drift_contribution = if params.is_bid { drift_bps } else { -drift_bps };
@@ -241,10 +249,9 @@ pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagn
 
     let gamma_q = params.gamma * (1.0 + params.inventory_beta * q_ratio.powi(2));
 
-    let is_reducing = (params.is_bid && params.position < 0.0)
-        || (!params.is_bid && params.position > 0.0);
-    let inv_penalty_bps = gamma_q * q_ratio * params.sigma.powi(2)
-        * params.time_horizon * 10_000.0;
+    let is_reducing =
+        (params.is_bid && params.position < 0.0) || (!params.is_bid && params.position > 0.0);
+    let inv_penalty_bps = gamma_q * q_ratio * params.sigma.powi(2) * params.time_horizon * 10_000.0;
 
     let inventory_adj = if is_reducing {
         -0.5 * inv_penalty_bps
@@ -253,7 +260,8 @@ pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagn
     };
 
     let epnl = lambda * (capture - toxicity_cost) + drift_contribution
-        - inventory_adj - params.self_impact_bps;
+        - inventory_adj
+        - params.self_impact_bps;
 
     let diag = EPnLDiagnostics {
         depth_bps: params.depth_bps,
@@ -560,7 +568,8 @@ impl GLFTStrategy {
     /// Record a (spread, fill_rate) observation for taker elasticity estimation.
     /// Call this periodically with the current quoted spread and observed fill rate.
     pub fn record_elasticity_observation(&mut self, spread_bps: f64, fill_rate_per_s: f64) {
-        self.elasticity_estimator.record(spread_bps, fill_rate_per_s);
+        self.elasticity_estimator
+            .record(spread_bps, fill_rate_per_s);
     }
 
     /// Get the current taker elasticity estimator (for diagnostics).
@@ -743,9 +752,9 @@ impl GLFTStrategy {
         //                 → wider ask (higher ask price → protect from selling into uptrend)
         let drift_adjustment = drift_rate * time_horizon / 2.0;
         let adjusted = if is_bid {
-            base - drift_adjustment  // Tighter bid → higher bid → buy into uptrend ✓
+            base - drift_adjustment // Tighter bid → higher bid → buy into uptrend ✓
         } else {
-            base + drift_adjustment  // Wider ask → higher ask → don't sell into uptrend ✓
+            base + drift_adjustment // Wider ask → higher ask → don't sell into uptrend ✓
         };
         // Floor at maker fee to avoid negative-EV quotes
         adjusted.max(self.risk_config.maker_fee_rate)
@@ -779,8 +788,8 @@ impl GLFTStrategy {
 
         // Risk premium: additive bps from regime + risk overlays
         // All widening now routes through E[PnL] gate or additive total_risk_premium_bps.
-        let risk_premium_bps = market_params.regime_risk_premium_bps
-            + market_params.total_risk_premium_bps;
+        let risk_premium_bps =
+            market_params.regime_risk_premium_bps + market_params.total_risk_premium_bps;
 
         // Quota addon: already in bps, capped at 50
         let quota_addon_bps = market_params.quota_shadow_spread_bps.min(50.0);
@@ -885,7 +894,7 @@ impl GLFTStrategy {
         let regime_mult = market_params.regime_probs[0] * 1.2  // Low: trust momentum
             + market_params.regime_probs[1] * 1.0              // Normal: baseline
             + market_params.regime_probs[2] * 0.5              // High: cautious
-            + market_params.regime_probs[3] * 0.2;             // Extreme: very cautious
+            + market_params.regime_probs[3] * 0.2; // Extreme: very cautious
 
         // Lead-lag confidence boost: when we have predictive edge, be more aggressive
         let lead_lag_boost = 1.0 + (lead_lag_conf * 0.5); // Up to 1.5x with full confidence
@@ -981,7 +990,9 @@ impl QuotingStrategy for GLFTStrategy {
         // FIRST PRINCIPLES: Use dynamic max_position derived from equity/volatility
         // Falls back to static max_position if margin state hasn't been refreshed yet.
         // config.max_position (passed as max_position) is ALWAYS the hard ceiling.
-        let effective_max_position = market_params.effective_max_position(max_position).min(max_position);
+        let effective_max_position = market_params
+            .effective_max_position(max_position)
+            .min(max_position);
 
         // === 1. DYNAMIC GAMMA with Tail Risk ===
         // When adaptive spreads enabled: use log-additive shrinkage gamma
@@ -1084,8 +1095,10 @@ impl QuotingStrategy for GLFTStrategy {
         // Use drift-aware half-spreads: μ > 0 → tighter bids (buy into uptrend),
         // wider asks (don't sell into uptrend). Falls back to symmetric when μ=0.
         let drift_rate = market_params.drift_rate_per_sec;
-        let mut half_spread_bid = self.half_spread_with_drift(gamma, kappa_bid, sigma, tau, drift_rate, true);
-        let mut half_spread_ask = self.half_spread_with_drift(gamma, kappa_ask, sigma, tau, drift_rate, false);
+        let mut half_spread_bid =
+            self.half_spread_with_drift(gamma, kappa_bid, sigma, tau, drift_rate, true);
+        let mut half_spread_ask =
+            self.half_spread_with_drift(gamma, kappa_ask, sigma, tau, drift_rate, false);
 
         // Symmetric half-spread for logging (average of bid/ask)
         let mut half_spread = (half_spread_bid + half_spread_ask) / 2.0;
@@ -1199,9 +1212,7 @@ impl QuotingStrategy for GLFTStrategy {
         // Apply a markup inversely proportional to taker price elasticity, scaled by market share.
         // Formula: markup_bps = min(cap, (1/eta) * market_share)
         // where eta is price elasticity of demand for liquidity.
-        if self.risk_config.use_monopolist_pricing
-            && market_params.competitor_count < 1.5
-        {
+        if self.risk_config.use_monopolist_pricing && market_params.competitor_count < 1.5 {
             let eta = if self.elasticity_estimator.is_valid()
                 && self.elasticity_estimator.observation_count()
                     >= self.risk_config.min_observations_for_elasticity
@@ -1352,8 +1363,7 @@ impl QuotingStrategy for GLFTStrategy {
 
         // Floor clamp: safety net only. With unified floor in solve_min_gamma,
         // this should fire <5% of cycles (only during transient parameter changes).
-        let floor_bound = half_spread_bid < effective_floor
-            || half_spread_ask < effective_floor;
+        let floor_bound = half_spread_bid < effective_floor || half_spread_ask < effective_floor;
         if floor_bound {
             debug!(
                 spread_bid_bps = %format!("{:.1}", half_spread_bid * 10000.0),
@@ -1453,7 +1463,8 @@ impl QuotingStrategy for GLFTStrategy {
             // The HJB formula multiplies by q (normalized position), so small q → tiny skew
             // This amplifier ensures meaningful skew even with small positions
             let hjb_skew = market_params.hjb_optimal_skew;
-            let position_amplifier = if inventory_ratio.abs() < 0.1 && inventory_ratio.abs() > 0.01 {
+            let position_amplifier = if inventory_ratio.abs() < 0.1 && inventory_ratio.abs() > 0.01
+            {
                 // 10x amplification for small positions (1-10% of max)
                 // This compensates for the q multiplication in the HJB formula
                 10.0
@@ -1479,7 +1490,8 @@ impl QuotingStrategy for GLFTStrategy {
             // FIX: Position amplifier for small positions (matches HJB path behavior)
             // The base skew formula multiplies by q (inventory_ratio), so small q → tiny skew
             // This amplifier ensures meaningful skew even with small positions to enable balanced fills
-            let position_amplifier = if inventory_ratio.abs() < 0.1 && inventory_ratio.abs() > 0.01 {
+            let position_amplifier = if inventory_ratio.abs() < 0.1 && inventory_ratio.abs() > 0.01
+            {
                 10.0 // 10x amplification for small positions (1-10% of max)
             } else if inventory_ratio.abs() <= 0.01 && inventory_ratio.abs() > 0.001 {
                 5.0 // 5x amplification for very small positions (0.1-1% of max)
@@ -1753,7 +1765,9 @@ impl QuotingStrategy for GLFTStrategy {
             };
 
             // Log when capping occurs
-            if (bid_delta_raw - target_bid).abs() > 1e-6 || (ask_delta_raw - target_ask).abs() > 1e-6 {
+            if (bid_delta_raw - target_bid).abs() > 1e-6
+                || (ask_delta_raw - target_ask).abs() > 1e-6
+            {
                 debug!(
                     asymmetry_bps = %format!("{:.1}", asymmetry * 10000.0),
                     bid_raw_bps = %format!("{:.1}", bid_delta_raw * 10000.0),
@@ -1764,7 +1778,9 @@ impl QuotingStrategy for GLFTStrategy {
                 );
             }
             (target_bid, target_ask.max(0.0))
-        } else if bid_delta_raw.max(ask_delta_raw) / bid_delta_raw.min(ask_delta_raw).max(1e-8) > max_asymmetry_ratio {
+        } else if bid_delta_raw.max(ask_delta_raw) / bid_delta_raw.min(ask_delta_raw).max(1e-8)
+            > max_asymmetry_ratio
+        {
             // Ratio asymmetry too high - use geometric mean and redistribute
             let geo_mean = (bid_delta_raw * ask_delta_raw).sqrt().max(effective_floor);
             let rebalanced_bid = geo_mean + (skew / 2.0);
@@ -2027,8 +2043,7 @@ mod tests {
         mp.pre_fill_toxicity_bid = 0.1;
         mp.pre_fill_toxicity_ask = 0.1;
 
-        let (bid_with_tox, _ask_with_tox) =
-            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+        let (bid_with_tox, _ask_with_tox) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
 
         // Zero toxicity baseline
         let mut mp_zero = test_market_params();
@@ -2064,16 +2079,14 @@ mod tests {
         mp.pre_fill_toxicity_bid = 0.7;
         mp.pre_fill_toxicity_ask = 0.7;
 
-        let (bid_tox, _) =
-            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+        let (bid_tox, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
 
         let mut mp_zero = test_market_params();
         mp_zero.pre_fill_toxicity_bid = 0.0;
         mp_zero.pre_fill_toxicity_ask = 0.0;
         // pre_fill_spread_mult removed — AS defense via log-odds additive path
 
-        let (bid_no, _) =
-            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
+        let (bid_no, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
 
         // Bid price should be lower (wider spread) with toxicity
         if let (Some(b_tox), Some(b_no)) = (&bid_tox, &bid_no) {
@@ -2105,16 +2118,14 @@ mod tests {
         mp.pre_fill_toxicity_bid = 0.95;
         mp.pre_fill_toxicity_ask = 0.95;
 
-        let (bid_tox, _) =
-            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+        let (bid_tox, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
 
         let mut mp_zero = test_market_params();
         mp_zero.pre_fill_toxicity_bid = 0.0;
         mp_zero.pre_fill_toxicity_ask = 0.0;
         // pre_fill_spread_mult removed — AS defense via log-odds additive path
 
-        let (bid_no, _) =
-            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
+        let (bid_no, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
 
         if let (Some(b_tox), Some(b_no)) = (&bid_tox, &bid_no) {
             let mid = config.mid_price;
@@ -2341,12 +2352,10 @@ mod tests {
         let time_horizon = 60.0;
         let drift_rate = 0.0001; // positive drift = price rising
 
-        let bid_half = strategy.half_spread_with_drift(
-            gamma, kappa, sigma, time_horizon, drift_rate, true,
-        );
-        let ask_half = strategy.half_spread_with_drift(
-            gamma, kappa, sigma, time_horizon, drift_rate, false,
-        );
+        let bid_half =
+            strategy.half_spread_with_drift(gamma, kappa, sigma, time_horizon, drift_rate, true);
+        let ask_half =
+            strategy.half_spread_with_drift(gamma, kappa, sigma, time_horizon, drift_rate, false);
         let base = strategy.half_spread(gamma, kappa, sigma, time_horizon);
 
         // Positive drift (price rising): bid should be TIGHTER than base
@@ -2371,12 +2380,10 @@ mod tests {
         let sigma = 0.001;
         let time_horizon = 60.0;
 
-        let bid_half = strategy.half_spread_with_drift(
-            gamma, kappa, sigma, time_horizon, 0.0, true,
-        );
-        let ask_half = strategy.half_spread_with_drift(
-            gamma, kappa, sigma, time_horizon, 0.0, false,
-        );
+        let bid_half =
+            strategy.half_spread_with_drift(gamma, kappa, sigma, time_horizon, 0.0, true);
+        let ask_half =
+            strategy.half_spread_with_drift(gamma, kappa, sigma, time_horizon, 0.0, false);
         let base = strategy.half_spread(gamma, kappa, sigma, time_horizon);
 
         assert!(
@@ -2399,9 +2406,8 @@ mod tests {
         // Very large negative drift to try to push ask below fee
         let drift_rate = -10.0;
 
-        let ask_half = strategy.half_spread_with_drift(
-            gamma, kappa, sigma, time_horizon, drift_rate, false,
-        );
+        let ask_half =
+            strategy.half_spread_with_drift(gamma, kappa, sigma, time_horizon, drift_rate, false);
 
         // Should never go below maker fee rate
         assert!(
@@ -2419,7 +2425,11 @@ mod tests {
         let gamma = solve_min_gamma(0.000742, 3250.0, 0.005, 60.0, 0.00015);
         // gamma should be > 0.15 (current default that produces 2.87 bps)
         assert!(gamma > 0.15, "min_gamma should be > 0.15, got {}", gamma);
-        assert!(gamma < 10.0, "min_gamma should be reasonable, got {}", gamma);
+        assert!(
+            gamma < 10.0,
+            "min_gamma should be reasonable, got {}",
+            gamma
+        );
     }
 
     #[test]
@@ -2504,8 +2514,14 @@ mod tests {
         let (bid_wide, ask_wide) = strategy.calculate_quotes(&config, 0.0, 100.0, 1.0, &mp);
 
         // Both quotes should exist
-        assert!(bid_wide.is_some(), "Bid should exist even with additive widening");
-        assert!(ask_wide.is_some(), "Ask should exist even with additive widening");
+        assert!(
+            bid_wide.is_some(),
+            "Bid should exist even with additive widening"
+        );
+        assert!(
+            ask_wide.is_some(),
+            "Ask should exist even with additive widening"
+        );
 
         // Verify additive composition:
         // base + bandit(10bps) + quota(10bps) + risk_premium(5bps)
@@ -2518,7 +2534,9 @@ mod tests {
             assert!(
                 ratio < 6.0,
                 "Widened spread should be < 6x base (additive), got {:.1}x ({:.1} vs {:.1} bps)",
-                ratio, wide_spread_bps, base_spread_bps
+                ratio,
+                wide_spread_bps,
+                base_spread_bps
             );
         }
     }
@@ -2536,11 +2554,16 @@ mod tests {
         let fee_bps = 1.5;
 
         let epnl = expected_pnl_bps(
-            depth_bps, true, gamma, kappa, sigma, time_horizon,
-            0.0, // no drift
-            0.0, // no position
+            depth_bps,
+            true,
+            gamma,
+            kappa,
+            sigma,
+            time_horizon,
+            0.0,  // no drift
+            0.0,  // no position
             10.0, // max_position
-            2.0, // AS cost
+            2.0,  // AS cost
             fee_bps,
             0.0, // no carry
         );
@@ -2556,13 +2579,18 @@ mod tests {
         // At 80% long, bid E[PnL] should be negative (accumulating side)
         // Need high gamma and sigma so inventory penalty dominates fill capture
         let depth_bps = 8.0;
-        let gamma = 50.0;     // Very high risk aversion (volatile regime)
+        let gamma = 50.0; // Very high risk aversion (volatile regime)
         let kappa = 3000.0;
-        let sigma = 0.02;     // 200 bps vol
+        let sigma = 0.02; // 200 bps vol
         let time_horizon = 10.0;
 
         let epnl = expected_pnl_bps(
-            depth_bps, true, gamma, kappa, sigma, time_horizon,
+            depth_bps,
+            true,
+            gamma,
+            kappa,
+            sigma,
+            time_horizon,
             0.0, // no drift
             8.0, // 80% of max
             10.0,
@@ -2587,7 +2615,12 @@ mod tests {
         let time_horizon = 10.0;
 
         let epnl = expected_pnl_bps(
-            depth_bps, false, gamma, kappa, sigma, time_horizon,
+            depth_bps,
+            false,
+            gamma,
+            kappa,
+            sigma,
+            time_horizon,
             0.0, // no drift
             8.0, // 80% long → ask is reducing
             10.0,
@@ -2613,17 +2646,38 @@ mod tests {
         let drift_rate = -0.001; // bearish drift
 
         let bid_epnl = expected_pnl_bps(
-            depth_bps, true, gamma, kappa, sigma, time_horizon,
-            drift_rate, 0.0, 10.0, 2.0, 1.5, 0.0,
+            depth_bps,
+            true,
+            gamma,
+            kappa,
+            sigma,
+            time_horizon,
+            drift_rate,
+            0.0,
+            10.0,
+            2.0,
+            1.5,
+            0.0,
         );
         let ask_epnl = expected_pnl_bps(
-            depth_bps, false, gamma, kappa, sigma, time_horizon,
-            drift_rate, 0.0, 10.0, 2.0, 1.5, 0.0,
+            depth_bps,
+            false,
+            gamma,
+            kappa,
+            sigma,
+            time_horizon,
+            drift_rate,
+            0.0,
+            10.0,
+            2.0,
+            1.5,
+            0.0,
         );
         assert!(
             bid_epnl < ask_epnl,
             "Bearish drift should make bid E[PnL] ({:.4}) < ask E[PnL] ({:.4})",
-            bid_epnl, ask_epnl
+            bid_epnl,
+            ask_epnl
         );
     }
 
@@ -2637,12 +2691,32 @@ mod tests {
         let time_horizon = 10.0;
 
         let bid_epnl = expected_pnl_bps(
-            depth_bps, true, gamma, kappa, sigma, time_horizon,
-            0.0, 5.0, 10.0, 10.0, 1.5, 0.0,
+            depth_bps,
+            true,
+            gamma,
+            kappa,
+            sigma,
+            time_horizon,
+            0.0,
+            5.0,
+            10.0,
+            10.0,
+            1.5,
+            0.0,
         );
         let ask_epnl = expected_pnl_bps(
-            depth_bps, false, gamma, kappa, sigma, time_horizon,
-            0.0, -5.0, 10.0, 10.0, 1.5, 0.0,
+            depth_bps,
+            false,
+            gamma,
+            kappa,
+            sigma,
+            time_horizon,
+            0.0,
+            -5.0,
+            10.0,
+            10.0,
+            1.5,
+            0.0,
         );
         // Both sides should have negative E[PnL] due to extreme vol + high AS
         assert!(
@@ -2658,7 +2732,7 @@ mod tests {
     }
 
     // --- Enhanced E[PnL] Function Tests ---
-    
+
     #[test]
     fn test_epnl_toxicity_reduces_ev() {
         let mut params = EPnLParams {
@@ -2682,10 +2756,10 @@ mod tests {
             inventory_beta: 7.0,
         };
         let pnl_clean = expected_pnl_bps_enhanced(&params);
-        
+
         params.toxicity_score = 1.0;
         let pnl_toxic = expected_pnl_bps_enhanced(&params);
-        
+
         assert!(pnl_toxic < pnl_clean, "Toxicity should reduce Expected PnL");
     }
 
@@ -2712,11 +2786,14 @@ mod tests {
             inventory_beta: 7.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
-        
+
         params.circuit_breaker_active = true;
         let pnl_cb = expected_pnl_bps_enhanced(&params);
-        
-        assert!(pnl_cb < pnl_normal, "Circuit breaker should apply staleness discount reducing EV");
+
+        assert!(
+            pnl_cb < pnl_normal,
+            "Circuit breaker should apply staleness discount reducing EV"
+        );
     }
 
     #[test]
@@ -2742,11 +2819,14 @@ mod tests {
             inventory_beta: 7.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
-        
+
         params.drawdown_frac = 0.10; // 10% drawdown
         let pnl_drawdown = expected_pnl_bps_enhanced(&params);
-        
-        assert!(pnl_drawdown < pnl_normal, "Drawdown should reduce fill probability confidence");
+
+        assert!(
+            pnl_drawdown < pnl_normal,
+            "Drawdown should reduce fill probability confidence"
+        );
     }
 
     #[test]
@@ -2772,12 +2852,15 @@ mod tests {
             inventory_beta: 7.0,
         };
         let pnl_no_impact = expected_pnl_bps_enhanced(&params);
-        
+
         params.self_impact_bps = 2.0; // Touch quotes have self impact
         let pnl_impact = expected_pnl_bps_enhanced(&params);
-        
+
         // The subtraction is entirely linear in the equation
-        assert!((pnl_impact - (pnl_no_impact - 2.0)).abs() < 1e-9, "Self impact should be exactly subtracted");
+        assert!(
+            (pnl_impact - (pnl_no_impact - 2.0)).abs() < 1e-9,
+            "Self impact should be exactly subtracted"
+        );
     }
 
     #[test]
@@ -2803,17 +2886,22 @@ mod tests {
             inventory_beta: 7.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
-        
+
         params.cascade_addon_bps = 3.0;
         let pnl_cascade = expected_pnl_bps_enhanced(&params);
-        
-        assert!(pnl_cascade < pnl_normal, "Cascade addon should compress spread capture");
+
+        assert!(
+            pnl_cascade < pnl_normal,
+            "Cascade addon should compress spread capture"
+        );
     }
 
     #[test]
     fn test_epnl_struct_matches_legacy() {
-        let legacy = expected_pnl_bps(10.0, true, 0.1, 5.0, 0.001, 10.0, 0.0, 50.0, 100.0, 2.0, -0.5, 0.5);
-        
+        let legacy = expected_pnl_bps(
+            10.0, true, 0.1, 5.0, 0.001, 10.0, 0.0, 50.0, 100.0, 2.0, -0.5, 0.5,
+        );
+
         let params = EPnLParams {
             depth_bps: 10.0,
             is_bid: true,
@@ -2835,8 +2923,11 @@ mod tests {
             inventory_beta: 0.0,
         };
         let enhanced = expected_pnl_bps_enhanced(&params);
-        
-        assert!((legacy - enhanced).abs() < 1e-9, "Legacy wrapper with zeroed struct overlays must match enhanced precisely");
+
+        assert!(
+            (legacy - enhanced).abs() < 1e-9,
+            "Legacy wrapper with zeroed struct overlays must match enhanced precisely"
+        );
     }
 
     #[test]
@@ -2870,18 +2961,28 @@ mod tests {
         assert!(
             (scalar - diag_scalar).abs() < 1e-12,
             "Diagnostics scalar must match enhanced. scalar={}, diag={}",
-            scalar, diag_scalar
+            scalar,
+            diag_scalar
         );
 
         // Verify diagnostics fields are populated
         assert!((diag.depth_bps - 8.0).abs() < 1e-9);
         assert!(diag.is_bid);
         assert!(diag.lambda > 0.0, "Lambda should be positive");
-        assert!(diag.toxicity_cost_bps > 0.0, "Toxicity cost should be positive");
-        assert!(diag.drift_contribution_bps > 0.0, "Bullish drift on bid should be positive");
+        assert!(
+            diag.toxicity_cost_bps > 0.0,
+            "Toxicity cost should be positive"
+        );
+        assert!(
+            diag.drift_contribution_bps > 0.0,
+            "Bullish drift on bid should be positive"
+        );
         assert!(diag.self_impact_bps > 0.0, "Self impact should be positive");
         assert!(!diag.circuit_breaker_active);
-        assert!((diag.drawdown_penalty - 1.0).abs() < 1e-9, "No drawdown → penalty=1.0");
+        assert!(
+            (diag.drawdown_penalty - 1.0).abs() < 1e-9,
+            "No drawdown → penalty=1.0"
+        );
     }
 
     #[test]
@@ -2897,7 +2998,11 @@ mod tests {
         // AS exactly equals vol floor → net is zero
         let as_raw = vol_floor;
         let as_net = (as_raw - vol_floor).max(0.0);
-        assert!(as_net.abs() < 1e-15, "AS net should be 0 when as_raw == vol_floor, got {}", as_net);
+        assert!(
+            as_net.abs() < 1e-15,
+            "AS net should be 0 when as_raw == vol_floor, got {}",
+            as_net
+        );
 
         // AS >> vol_floor → net ≈ as_raw
         let as_raw_large = 0.001; // 10 bps
@@ -2911,7 +3016,10 @@ mod tests {
         // AS < vol_floor → net clamped to zero (no negative addon)
         let as_raw_small = vol_floor * 0.5;
         let as_net_small = (as_raw_small - vol_floor).max(0.0);
-        assert_eq!(as_net_small, 0.0, "AS net should be 0 when as_raw < vol_floor");
+        assert_eq!(
+            as_net_small, 0.0,
+            "AS net should be 0 when as_raw < vol_floor"
+        );
     }
 
     // === Fix 15: reducing_threshold_bps tests ===
@@ -2919,7 +3027,10 @@ mod tests {
     #[test]
     fn test_reducing_threshold_flat_position_is_zero() {
         let t = reducing_threshold_bps(0.0, 10.0, 1.5, 1.0, 1.0);
-        assert!((t - 0.0).abs() < 1e-12, "Flat position → no carve-out, got {t}");
+        assert!(
+            (t - 0.0).abs() < 1e-12,
+            "Flat position → no carve-out, got {t}"
+        );
     }
 
     #[test]
@@ -2927,8 +3038,10 @@ mod tests {
         // q_ratio = 0.8, q_ratio^1.5 ≈ 0.7155, gamma_ratio = 1.0
         // threshold = -1.5 * 1.0 * 0.7155 ≈ -1.073
         let t = reducing_threshold_bps(8.0, 10.0, 1.5, 1.0, 1.0);
-        assert!((t - (-1.5 * 0.8_f64.powf(1.5))).abs() < 0.01,
-            "80% position → ~-1.07 bps, got {t}");
+        assert!(
+            (t - (-1.5 * 0.8_f64.powf(1.5))).abs() < 0.01,
+            "80% position → ~-1.07 bps, got {t}"
+        );
     }
 
     #[test]
@@ -2936,8 +3049,10 @@ mod tests {
         // gamma=3.0, baseline=1.0 → gamma_ratio=3.0
         // threshold = -1.5 * 3.0 * 1.0^1.5 = -4.5
         let t = reducing_threshold_bps(10.0, 10.0, 1.5, 3.0, 1.0);
-        assert!((t - (-4.5)).abs() < 1e-9,
-            "Extreme regime at 100% pos → -4.5 bps (3 fees), got {t}");
+        assert!(
+            (t - (-4.5)).abs() < 1e-9,
+            "Extreme regime at 100% pos → -4.5 bps (3 fees), got {t}"
+        );
     }
 
     #[test]
@@ -2945,28 +3060,36 @@ mod tests {
         // gamma=0.5, baseline=1.0 → gamma_ratio=0.5
         // threshold = -1.5 * 0.5 * 1.0^1.5 = -0.75
         let t = reducing_threshold_bps(10.0, 10.0, 1.5, 0.5, 1.0);
-        assert!((t - (-0.75)).abs() < 1e-9,
-            "Calm regime at 100% pos → -0.75 bps (half fee), got {t}");
+        assert!(
+            (t - (-0.75)).abs() < 1e-9,
+            "Calm regime at 100% pos → -0.75 bps (half fee), got {t}"
+        );
     }
 
     #[test]
     fn test_reducing_threshold_gamma_ratio_clamped() {
         // gamma=10.0, baseline=1.0 → gamma_ratio clamped to 3.0
         let t = reducing_threshold_bps(10.0, 10.0, 1.5, 10.0, 1.0);
-        assert!((t - (-4.5)).abs() < 1e-9,
-            "Gamma ratio should clamp at 3.0, got {t}");
+        assert!(
+            (t - (-4.5)).abs() < 1e-9,
+            "Gamma ratio should clamp at 3.0, got {t}"
+        );
 
         // gamma=0.01, baseline=1.0 → gamma_ratio clamped to 0.5
         let t2 = reducing_threshold_bps(10.0, 10.0, 1.5, 0.01, 1.0);
-        assert!((t2 - (-0.75)).abs() < 1e-9,
-            "Gamma ratio should clamp at 0.5, got {t2}");
+        assert!(
+            (t2 - (-0.75)).abs() < 1e-9,
+            "Gamma ratio should clamp at 0.5, got {t2}"
+        );
     }
 
     #[test]
     fn test_reducing_threshold_zero_max_position() {
         let t = reducing_threshold_bps(5.0, 0.0, 1.5, 1.0, 1.0);
-        assert!((t - 0.0).abs() < 1e-12,
-            "Zero max position → no carve-out, got {t}");
+        assert!(
+            (t - 0.0).abs() < 1e-12,
+            "Zero max position → no carve-out, got {t}"
+        );
     }
 
     #[test]
@@ -2978,16 +3101,20 @@ mod tests {
         let gamma = 1.0;
         let gamma_baseline = 0.15;
 
-        let reducing_thresh = reducing_threshold_bps(
-            position, max_pos, fee_bps, gamma, gamma_baseline,
-        );
+        let reducing_thresh =
+            reducing_threshold_bps(position, max_pos, fee_bps, gamma, gamma_baseline);
         // gamma_ratio = (1.0/0.15).clamp(0.5, 3.0) = 3.0 (clamped)
         // threshold = -1.5 * 3.0 * 0.8^1.5 ≈ -3.22
-        assert!(reducing_thresh < -3.0, "Should be deeply negative: {reducing_thresh}");
+        assert!(
+            reducing_thresh < -3.0,
+            "Should be deeply negative: {reducing_thresh}"
+        );
 
         // Accumulating threshold is always 0
         let accum_thresh = 0.0;
-        assert!(reducing_thresh < accum_thresh,
-            "Reducing threshold ({reducing_thresh}) must be below accumulating ({accum_thresh})");
+        assert!(
+            reducing_thresh < accum_thresh,
+            "Reducing threshold ({reducing_thresh}) must be below accumulating ({accum_thresh})"
+        );
     }
 }

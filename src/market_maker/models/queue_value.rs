@@ -61,12 +61,7 @@ impl QueueValueHeuristic {
     /// - `depth_bps`: Distance from mid to quote level in basis points
     /// - `toxicity`: Current toxicity regime
     /// - `queue_rank`: Position in queue [0, 1] (0 = front)
-    pub fn queue_value(
-        &self,
-        depth_bps: f64,
-        toxicity: ToxicityRegime,
-        queue_rank: f64,
-    ) -> f64 {
+    pub fn queue_value(&self, depth_bps: f64, toxicity: ToxicityRegime, queue_rank: f64) -> f64 {
         let expected_as = match toxicity {
             ToxicityRegime::Benign => AS_COST_BENIGN_BPS,
             ToxicityRegime::Normal => AS_COST_NORMAL_BPS,
@@ -86,12 +81,7 @@ impl QueueValueHeuristic {
     /// During warmup (< 10 observations), uses a lenient threshold of -1.0 bps
     /// to avoid filtering orders before the heuristic has calibrated. This prevents
     /// the "no fills → no calibration → no fills" death spiral.
-    pub fn should_quote(
-        &self,
-        depth_bps: f64,
-        toxicity: ToxicityRegime,
-        queue_rank: f64,
-    ) -> bool {
+    pub fn should_quote(&self, depth_bps: f64, toxicity: ToxicityRegime, queue_rank: f64) -> bool {
         let threshold = if self.outcome_count < 10 { -1.0 } else { 0.0 };
         self.queue_value(depth_bps, toxicity, queue_rank) > threshold
     }

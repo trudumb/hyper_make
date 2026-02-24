@@ -81,10 +81,7 @@ impl DynamicRiskConfig {
             ));
         }
         if self.num_sigmas <= 0.0 {
-            return Err(format!(
-                "num_sigmas must be > 0.0, got {}",
-                self.num_sigmas
-            ));
+            return Err(format!("num_sigmas must be > 0.0, got {}", self.num_sigmas));
         }
         if self.sigma_prior <= 0.0 {
             return Err(format!(
@@ -282,21 +279,30 @@ mod tests {
     fn test_risk_config_validate_rejects_zero_risk_fraction() {
         let cfg = DynamicRiskConfig::default().with_risk_fraction(0.0);
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("risk_fraction"), "error should mention risk_fraction: {err}");
+        assert!(
+            err.contains("risk_fraction"),
+            "error should mention risk_fraction: {err}"
+        );
     }
 
     #[test]
     fn test_risk_config_validate_rejects_excessive_risk_fraction() {
         let cfg = DynamicRiskConfig::default().with_risk_fraction(1.5);
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("risk_fraction"), "error should mention risk_fraction: {err}");
+        assert!(
+            err.contains("risk_fraction"),
+            "error should mention risk_fraction: {err}"
+        );
     }
 
     #[test]
     fn test_risk_config_validate_rejects_zero_max_leverage() {
         let cfg = DynamicRiskConfig::default().with_max_leverage(0.0);
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("max_leverage"), "error should mention max_leverage: {err}");
+        assert!(
+            err.contains("max_leverage"),
+            "error should mention max_leverage: {err}"
+        );
     }
 
     #[test]

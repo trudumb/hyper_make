@@ -133,7 +133,8 @@ impl CancelRaceTracker {
 
         // Prune old entries to prevent unbounded growth
         // Remove cancels older than 10x the window (definitely stale)
-        let stale_cutoff_ms = timestamp_ms.saturating_sub(self.config.cancel_latency_window_ms * 10);
+        let stale_cutoff_ms =
+            timestamp_ms.saturating_sub(self.config.cancel_latency_window_ms * 10);
         self.pending_cancels.retain(|_, ts| *ts > stale_cutoff_ms);
     }
 

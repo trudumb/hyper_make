@@ -393,7 +393,10 @@ impl BinanceFeed {
     }
 
     /// Process a book ticker message.
-    fn process_book_ticker(&self, data: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn process_book_ticker(
+        &self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let msg: BookTickerMessage = serde_json::from_str(data)?;
 
         // Parse prices
@@ -424,7 +427,10 @@ impl BinanceFeed {
     }
 
     /// Process an aggregate trade message.
-    fn process_agg_trade(&self, data: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn process_agg_trade(
+        &self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let msg: AggTradeMessage = serde_json::from_str(data)?;
 
         // Parse trade data
@@ -689,10 +695,7 @@ mod tests {
     #[test]
     fn test_lead_lag_signal_not_actionable_low_mi() {
         let signal = LeadLagSignal::compute_legacy(
-            50100.0,
-            50000.0,
-            100,
-            0.01, // Low MI
+            50100.0, 50000.0, 100, 0.01, // Low MI
             0.05, // Threshold
         );
 
@@ -703,11 +706,8 @@ mod tests {
     #[test]
     fn test_lead_lag_signal_not_actionable_hl_leads() {
         let signal = LeadLagSignal::compute_legacy(
-            50100.0,
-            50000.0,
-            -100, // HL leads (negative lag = target leads signal)
-            0.15,
-            0.05,
+            50100.0, 50000.0, -100, // HL leads (negative lag = target leads signal)
+            0.15, 0.05,
         );
 
         assert!(!signal.is_actionable);
@@ -717,9 +717,7 @@ mod tests {
     fn test_lead_lag_signal_with_stability() {
         // Test with low stability - should not be actionable
         let signal_low_stability = LeadLagSignal::compute(
-            50100.0,
-            50000.0,
-            100,  // Binance leads
+            50100.0, 50000.0, 100,  // Binance leads
             0.15, // Strong MI
             0.05, // Threshold
             0.1,  // Low stability
@@ -728,9 +726,7 @@ mod tests {
 
         // Test with high stability - should be actionable
         let signal_high_stability = LeadLagSignal::compute(
-            50100.0,
-            50000.0,
-            100,  // Binance leads
+            50100.0, 50000.0, 100,  // Binance leads
             0.15, // Strong MI
             0.05, // Threshold
             0.8,  // High stability
@@ -741,17 +737,35 @@ mod tests {
 
     #[test]
     fn test_resolve_binance_symbol_known_assets() {
-        assert_eq!(resolve_binance_symbol("BTC", None), Some("btcusdt".to_string()));
-        assert_eq!(resolve_binance_symbol("ETH", None), Some("ethusdt".to_string()));
-        assert_eq!(resolve_binance_symbol("SOL", None), Some("solusdt".to_string()));
-        assert_eq!(resolve_binance_symbol("DOGE", None), Some("dogeusdt".to_string()));
+        assert_eq!(
+            resolve_binance_symbol("BTC", None),
+            Some("btcusdt".to_string())
+        );
+        assert_eq!(
+            resolve_binance_symbol("ETH", None),
+            Some("ethusdt".to_string())
+        );
+        assert_eq!(
+            resolve_binance_symbol("SOL", None),
+            Some("solusdt".to_string())
+        );
+        assert_eq!(
+            resolve_binance_symbol("DOGE", None),
+            Some("dogeusdt".to_string())
+        );
     }
 
     #[test]
     fn test_resolve_binance_symbol_case_insensitive() {
         // Asset names should work regardless of case
-        assert_eq!(resolve_binance_symbol("btc", None), Some("btcusdt".to_string()));
-        assert_eq!(resolve_binance_symbol("Eth", None), Some("ethusdt".to_string()));
+        assert_eq!(
+            resolve_binance_symbol("btc", None),
+            Some("btcusdt".to_string())
+        );
+        assert_eq!(
+            resolve_binance_symbol("Eth", None),
+            Some("ethusdt".to_string())
+        );
     }
 
     #[test]
@@ -765,8 +779,14 @@ mod tests {
     #[test]
     fn test_resolve_binance_symbol_dex_prefix_stripped() {
         // HIP-3 DEX-prefixed assets should strip prefix
-        assert_eq!(resolve_binance_symbol("hyna:BTC", None), Some("btcusdt".to_string()));
-        assert_eq!(resolve_binance_symbol("hyna:ETH", None), Some("ethusdt".to_string()));
+        assert_eq!(
+            resolve_binance_symbol("hyna:BTC", None),
+            Some("btcusdt".to_string())
+        );
+        assert_eq!(
+            resolve_binance_symbol("hyna:ETH", None),
+            Some("ethusdt".to_string())
+        );
         assert_eq!(resolve_binance_symbol("hyna:HYPE", None), None);
     }
 

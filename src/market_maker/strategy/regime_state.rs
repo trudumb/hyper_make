@@ -32,11 +32,11 @@ pub enum ControllerObjective {
 /// Discrete market regime — drives all regime-dependent parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MarketRegime {
-    Calm,     // Low vol, mean-reverting
+    Calm, // Low vol, mean-reverting
     #[default]
-    Normal,   // Typical conditions
+    Normal, // Typical conditions
     Volatile, // Elevated vol, trending possible
-    Extreme,  // Cascade / liquidation regime
+    Extreme, // Cascade / liquidation regime
 }
 
 impl MarketRegime {
@@ -292,8 +292,7 @@ impl BlendedRegimeParams {
             b * self.max_position_fraction + a * target.max_position_fraction;
         self.emergency_cp_threshold =
             b * self.emergency_cp_threshold + a * target.emergency_cp_threshold;
-        self.reduce_only_fraction =
-            b * self.reduce_only_fraction + a * target.reduce_only_fraction;
+        self.reduce_only_fraction = b * self.reduce_only_fraction + a * target.reduce_only_fraction;
         self.size_multiplier = b * self.size_multiplier + a * target.size_multiplier;
         self.as_expected_bps = b * self.as_expected_bps + a * target.as_expected_bps;
         self.risk_premium_bps = b * self.risk_premium_bps + a * target.risk_premium_bps;
@@ -342,12 +341,7 @@ impl Default for ConvictionState {
 
 impl ConvictionState {
     /// Determine if the label should transition from current to proposed.
-    fn should_transition(
-        &self,
-        proposed: MarketRegime,
-        beliefs: &[f64; 4],
-        now: Instant,
-    ) -> bool {
+    fn should_transition(&self, proposed: MarketRegime, beliefs: &[f64; 4], now: Instant) -> bool {
         if proposed == self.current_label {
             return false;
         }
@@ -544,7 +538,9 @@ impl RegimeState {
 
         // Step 6: Conviction-based label transition
         let proposed = Self::argmax_regime(&beliefs);
-        let transitioned = self.conviction_state.should_transition(proposed, &beliefs, now);
+        let transitioned = self
+            .conviction_state
+            .should_transition(proposed, &beliefs, now);
 
         if transitioned {
             self.conviction_state.transition_to(proposed, now);
@@ -807,7 +803,6 @@ impl RegimeState {
     }
 }
 
-
 /// Unified regime snapshot — single source of truth for all regime-dependent decisions.
 /// Replaces 4 independent regime channels (HMM, RegimeKappa, ThresholdKappa, BOCPD)
 /// with one coherent output.
@@ -889,7 +884,10 @@ mod tests {
         let probs = [0.30, 0.28, 0.22, 0.20];
         for _ in 0..50 {
             let changed = state.update(&probs, 0.0, 0.0, 0.0);
-            assert!(!changed, "Label should NOT change with near-uniform beliefs");
+            assert!(
+                !changed,
+                "Label should NOT change with near-uniform beliefs"
+            );
         }
         assert_eq!(state.regime, MarketRegime::Normal);
 
@@ -898,7 +896,9 @@ mod tests {
         assert!(
             state.blended.kappa > extreme_kappa && state.blended.kappa < calm_kappa,
             "Blended kappa {} should be between Extreme ({}) and Calm ({})",
-            state.blended.kappa, extreme_kappa, calm_kappa
+            state.blended.kappa,
+            extreme_kappa,
+            calm_kappa
         );
     }
 
@@ -909,7 +909,10 @@ mod tests {
 
         let probs = [0.80, 0.05, 0.10, 0.05];
         let changed = state.update(&probs, 0.0, 0.0, 0.0);
-        assert!(changed, "Should transition with strong conviction + sufficient dwell");
+        assert!(
+            changed,
+            "Should transition with strong conviction + sufficient dwell"
+        );
         assert_eq!(state.regime, MarketRegime::Calm);
     }
 
@@ -929,7 +932,10 @@ mod tests {
 
         let probs = [0.05, 0.80, 0.10, 0.05];
         let changed = state.update(&probs, 0.0, 2000.0, 0.5);
-        assert!(!changed, "Should NOT de-escalate from Extreme with only 100s dwell");
+        assert!(
+            !changed,
+            "Should NOT de-escalate from Extreme with only 100s dwell"
+        );
         assert_eq!(state.regime, MarketRegime::Extreme);
 
         let mut state2 = state_with_conviction(MarketRegime::Extreme, 301.0);
@@ -960,7 +966,9 @@ mod tests {
         let after_1 = state.blended.kappa;
         assert!(
             (after_1 - initial_kappa).abs() < (initial_kappa - extreme_kappa).abs() * 0.15,
-            "After 1 update, kappa {} should still be close to initial {}", after_1, initial_kappa
+            "After 1 update, kappa {} should still be close to initial {}",
+            after_1,
+            initial_kappa
         );
 
         for _ in 0..19 {
@@ -968,7 +976,9 @@ mod tests {
         }
         assert!(
             state.blended.kappa < initial_kappa * 0.7,
-            "After 20 updates, kappa {} should be well below initial {}", state.blended.kappa, initial_kappa
+            "After 20 updates, kappa {} should be well below initial {}",
+            state.blended.kappa,
+            initial_kappa
         );
     }
 
@@ -979,7 +989,10 @@ mod tests {
         let uniform = [0.25, 0.25, 0.25, 0.25];
         for _ in 0..20 {
             let changed = state.update(&uniform, 0.0, 0.0, 0.0);
-            assert!(!changed, "Uniform beliefs should never trigger transition (KL=0)");
+            assert!(
+                !changed,
+                "Uniform beliefs should never trigger transition (KL=0)"
+            );
         }
         assert_eq!(state.regime, MarketRegime::Normal);
     }
@@ -991,7 +1004,10 @@ mod tests {
 
         let concentrated = [0.97, 0.01, 0.01, 0.01];
         let kl = kl_from_uniform(&concentrated);
-        assert!(kl > 1.0, "Concentrated beliefs should have high KL, got {kl}");
+        assert!(
+            kl > 1.0,
+            "Concentrated beliefs should have high KL, got {kl}"
+        );
     }
 
     #[test]
@@ -1005,7 +1021,11 @@ mod tests {
         for _ in 0..100 {
             state.update(&normal_probs, 0.0, 0.1, 0.5);
         }
-        assert!(state.blended.kappa >= 1.0, "Kappa clamped to >= 1.0, got {}", state.blended.kappa);
+        assert!(
+            state.blended.kappa >= 1.0,
+            "Kappa clamped to >= 1.0, got {}",
+            state.blended.kappa
+        );
     }
 
     #[test]
@@ -1057,7 +1077,10 @@ mod tests {
         let low_margin = [0.35, 0.30, 0.20, 0.15];
         for _ in 0..20 {
             let changed = state.update(&low_margin, 0.0, 0.0, 0.0);
-            assert!(!changed, "Margin 0.05 < 0.20 threshold should not trigger transition");
+            assert!(
+                !changed,
+                "Margin 0.05 < 0.20 threshold should not trigger transition"
+            );
         }
         assert_eq!(state.regime, MarketRegime::Normal);
     }
@@ -1528,12 +1551,18 @@ mod tests {
         assert_eq!(unified.regime_label, MarketRegime::Extreme);
         // Extreme regime should have higher gamma multiplier and lower position fraction
         let normal = state_with_conviction(MarketRegime::Normal, 100.0).unified_regime();
-        assert!(unified.gamma_multiplier >= normal.gamma_multiplier,
+        assert!(
+            unified.gamma_multiplier >= normal.gamma_multiplier,
             "extreme gamma_mult {} should >= normal {}",
-            unified.gamma_multiplier, normal.gamma_multiplier);
-        assert!(unified.max_position_fraction <= normal.max_position_fraction,
+            unified.gamma_multiplier,
+            normal.gamma_multiplier
+        );
+        assert!(
+            unified.max_position_fraction <= normal.max_position_fraction,
             "extreme position fraction {} should <= normal {}",
-            unified.max_position_fraction, normal.max_position_fraction);
+            unified.max_position_fraction,
+            normal.max_position_fraction
+        );
     }
 
     #[test]
@@ -1603,7 +1632,8 @@ mod tests {
         assert!(
             (state.blended.kappa - after_ewma_only).abs() < 1.0,
             "Zero confidence: kappa {} should match pure EWMA {}",
-            state.blended.kappa, after_ewma_only
+            state.blended.kappa,
+            after_ewma_only
         );
     }
 
@@ -1647,7 +1677,8 @@ mod tests {
         assert!(
             (state.blended.kappa - after_ewma).abs() < 1.0,
             "Zero kappa_effective should skip blend: {} vs {}",
-            state.blended.kappa, after_ewma
+            state.blended.kappa,
+            after_ewma
         );
     }
 }

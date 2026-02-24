@@ -156,9 +156,11 @@ impl ModelTracker {
             return ModelConfidence::None;
         }
 
-        let p_above = self
-            .ir_tracker
-            .posterior_prob_ir_above(config.ir_threshold, config.prior_mean, config.prior_df);
+        let p_above = self.ir_tracker.posterior_prob_ir_above(
+            config.ir_threshold,
+            config.prior_mean,
+            config.prior_df,
+        );
 
         // Check exponential IR for early degradation detection.
         // If exp IR drops below threshold while flat IR is still above,
@@ -229,11 +231,7 @@ impl ModelWeights {
 
     /// Average weight across all models.
     pub fn average_weight(&self) -> f64 {
-        (self.adverse_selection
-            + self.informed_flow
-            + self.lead_lag
-            + self.regime
-            + self.kappa)
+        (self.adverse_selection + self.informed_flow + self.lead_lag + self.regime + self.kappa)
             / 5.0
     }
 }
@@ -391,7 +389,10 @@ impl ModelGating {
         let kp_ir = self.kappa_tracker.ir_tracker.information_ratio();
 
         let as_exp_ir = self.as_tracker.exp_ir_tracker.information_ratio();
-        let if_exp_ir = self.informed_flow_tracker.exp_ir_tracker.information_ratio();
+        let if_exp_ir = self
+            .informed_flow_tracker
+            .exp_ir_tracker
+            .information_ratio();
         let ll_exp_ir = self.lead_lag_tracker.exp_ir_tracker.information_ratio();
         let rg_exp_ir = self.regime_tracker.exp_ir_tracker.information_ratio();
         let kp_exp_ir = self.kappa_tracker.exp_ir_tracker.information_ratio();
@@ -520,7 +521,10 @@ impl ModelGating {
     pub fn model_exp_ir(&self, model: &str) -> f64 {
         match model {
             "adverse_selection" => self.as_tracker.exp_ir_tracker.information_ratio(),
-            "informed_flow" => self.informed_flow_tracker.exp_ir_tracker.information_ratio(),
+            "informed_flow" => self
+                .informed_flow_tracker
+                .exp_ir_tracker
+                .information_ratio(),
             "lead_lag" => self.lead_lag_tracker.exp_ir_tracker.information_ratio(),
             "regime" => self.regime_tracker.exp_ir_tracker.information_ratio(),
             "kappa" => self.kappa_tracker.exp_ir_tracker.information_ratio(),

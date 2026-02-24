@@ -550,7 +550,8 @@ pub(crate) fn allocate_sizes(
             if !result.is_empty() {
                 // Cap per-order size: no single order exceeds 25% of total_size.
                 // Distribute remainder equally across additional levels if possible.
-                let capped_size = total_size.min(total_size * MAX_SINGLE_ORDER_FRACTION)
+                let capped_size = total_size
+                    .min(total_size * MAX_SINGLE_ORDER_FRACTION)
                     .max(min_size);
                 result[0] = capped_size;
                 tracing::info!(
@@ -585,7 +586,8 @@ pub(crate) fn allocate_sizes(
     // Use concentration fallback: cap per-order at 25% of total to prevent max-position fills
     let all_filtered = result.iter().all(|&s| s < EPSILON);
     if all_filtered && total_size >= min_size {
-        let capped_size = total_size.min(total_size * MAX_SINGLE_ORDER_FRACTION)
+        let capped_size = total_size
+            .min(total_size * MAX_SINGLE_ORDER_FRACTION)
             .max(min_size);
         result[0] = capped_size;
         tracing::info!(
@@ -629,8 +631,15 @@ pub(crate) struct RawLadderInput<'a> {
 
 pub(crate) fn build_raw_ladder(input: &RawLadderInput<'_>) -> Ladder {
     let RawLadderInput {
-        depths, sizes, mid, market_mid, exchange_best_bid, exchange_best_ask,
-        decimals, sz_decimals, min_notional,
+        depths,
+        sizes,
+        mid,
+        market_mid,
+        exchange_best_bid,
+        exchange_best_ask,
+        decimals,
+        sz_decimals,
+        min_notional,
     } = input;
     let (mid, market_mid) = (*mid, *market_mid);
     let (exchange_best_bid, exchange_best_ask) = (*exchange_best_bid, *exchange_best_ask);
@@ -657,12 +666,12 @@ pub(crate) fn build_raw_ladder(input: &RawLadderInput<'_>) -> Ladder {
     // When exchange BBO is valid, use it. Otherwise fall back to market_mid.
     let min_tick = 10.0_f64.powi(-(decimals as i32));
     let effective_bid_cap = if exchange_best_ask > 0.0 {
-        exchange_best_ask - min_tick  // Never place bids at or above exchange ask
+        exchange_best_ask - min_tick // Never place bids at or above exchange ask
     } else {
         market_mid
     };
     let effective_ask_floor = if exchange_best_bid > 0.0 {
-        exchange_best_bid + min_tick  // Never place asks at or below exchange bid
+        exchange_best_bid + min_tick // Never place asks at or below exchange bid
     } else {
         market_mid
     };
@@ -715,8 +724,7 @@ pub(crate) fn build_raw_ladder(input: &RawLadderInput<'_>) -> Ladder {
             // Floor: exact ceiling math via SizeQuantum (replaces 1.01x buffer)
             let quantum = SizeQuantum::compute(min_notional, bid_price.max(EPSILON), sz_decimals);
             let min_size_for_notional = quantum.min_viable_size;
-            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
-                .max(min_size_for_notional);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION).max(min_size_for_notional);
             let capped_size_truncated =
                 truncate_float(capped_size.min(total_size), sz_decimals, false);
 
@@ -747,8 +755,7 @@ pub(crate) fn build_raw_ladder(input: &RawLadderInput<'_>) -> Ladder {
             // Floor: exact ceiling math via SizeQuantum (replaces 1.01x buffer)
             let quantum = SizeQuantum::compute(min_notional, ask_price.max(EPSILON), sz_decimals);
             let min_size_for_notional = quantum.min_viable_size;
-            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
-                .max(min_size_for_notional);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION).max(min_size_for_notional);
             let capped_size_truncated =
                 truncate_float(capped_size.min(total_size), sz_decimals, false);
 
@@ -882,8 +889,7 @@ pub(crate) fn build_asymmetric_ladder(
             // Exact ceiling math via SizeQuantum (replaces 1.01x buffer)
             let quantum = SizeQuantum::compute(min_notional, bid_price.max(EPSILON), sz_decimals);
             let min_size_for_notional = quantum.min_viable_size;
-            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
-                .max(min_size_for_notional);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION).max(min_size_for_notional);
             let capped_size_truncated =
                 truncate_float(capped_size.min(total_size), sz_decimals, false);
 
@@ -915,8 +921,7 @@ pub(crate) fn build_asymmetric_ladder(
             // Exact ceiling math via SizeQuantum (replaces 1.01x buffer)
             let quantum = SizeQuantum::compute(min_notional, ask_price.max(EPSILON), sz_decimals);
             let min_size_for_notional = quantum.min_viable_size;
-            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
-                .max(min_size_for_notional);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION).max(min_size_for_notional);
             let capped_size_truncated =
                 truncate_float(capped_size.min(total_size), sz_decimals, false);
 
@@ -1111,7 +1116,11 @@ pub(crate) fn apply_inventory_skew_with_drift(
     if (raw_offset - offset).abs() > 1e-10 {
         let own_floor_bps = own_floor / safe_mid * 10000.0;
         let half_spread_cap = half_spread * 0.8;
-        let capping_source = if half_spread_cap > own_floor { "bbo" } else { "own_depth" };
+        let capping_source = if half_spread_cap > own_floor {
+            "bbo"
+        } else {
+            "own_depth"
+        };
         tracing::warn!(
             raw_offset_bps = %format!("{:.2}", raw_offset / safe_mid * 10000.0),
             capped_offset_bps = %format!("{:.2}", offset / safe_mid * 10000.0),
@@ -1437,9 +1446,15 @@ mod tests {
         let market_mid = 100.0; // No divergence in test
 
         let ladder = build_raw_ladder(&RawLadderInput {
-            depths: &depths, sizes: &sizes, mid, market_mid,
-            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
-            decimals: 2, sz_decimals: 4, min_notional: 10.0,
+            depths: &depths,
+            sizes: &sizes,
+            mid,
+            market_mid,
+            exchange_best_bid: 0.0,
+            exchange_best_ask: 0.0,
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional: 10.0,
         });
 
         assert_eq!(ladder.bids.len(), 3);
@@ -1459,9 +1474,15 @@ mod tests {
         let market_mid = 100.0; // No divergence in test
 
         let ladder = build_raw_ladder(&RawLadderInput {
-            depths: &depths, sizes: &sizes, mid, market_mid,
-            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
-            decimals: 2, sz_decimals: 4, min_notional: 10.0,
+            depths: &depths,
+            sizes: &sizes,
+            mid,
+            market_mid,
+            exchange_best_bid: 0.0,
+            exchange_best_ask: 0.0,
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional: 10.0,
         });
 
         // Only second level should make it (0.5 * $100 = $50 > $10)
@@ -1665,9 +1686,15 @@ mod tests {
         let small_sizes: Vec<f64> = vec![small_total_size / num_levels as f64; num_levels];
 
         let ladder_small = build_raw_ladder(&RawLadderInput {
-            depths: &depths, sizes: &small_sizes, mid, market_mid: mid,
-            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
-            decimals: 2, sz_decimals: 4, min_notional,
+            depths: &depths,
+            sizes: &small_sizes,
+            mid,
+            market_mid: mid,
+            exchange_best_bid: 0.0,
+            exchange_best_ask: 0.0,
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional,
         });
 
         // With small sizes, ALL individual levels fail min_notional
@@ -1682,12 +1709,13 @@ mod tests {
         // Bid price is offset by tightest depth (10 bps for this test)
         let tightest_test_bps = 10.0;
         let bid_price_approx = mid * (1.0 - tightest_test_bps / 10000.0);
-        let expected_cap = (small_total_size * MAX_SINGLE_ORDER_FRACTION)
-            .max(min_notional / bid_price_approx);
+        let expected_cap =
+            (small_total_size * MAX_SINGLE_ORDER_FRACTION).max(min_notional / bid_price_approx);
         assert!(
             total_bid_size <= expected_cap + 0.01,
             "Concentration fallback size {:.4} should be capped at {:.4}",
-            total_bid_size, expected_cap,
+            total_bid_size,
+            expected_cap,
         );
 
         // Scenario 2: Large total_size (like effective_max_position = 66 HYPE)
@@ -1697,9 +1725,15 @@ mod tests {
         let large_sizes: Vec<f64> = vec![large_total_size / num_levels as f64; num_levels];
 
         let ladder_large = build_raw_ladder(&RawLadderInput {
-            depths: &depths, sizes: &large_sizes, mid, market_mid: mid,
-            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
-            decimals: 2, sz_decimals: 4, min_notional,
+            depths: &depths,
+            sizes: &large_sizes,
+            mid,
+            market_mid: mid,
+            exchange_best_bid: 0.0,
+            exchange_best_ask: 0.0,
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional,
         });
 
         // With large sizes, ALL levels should pass min_notional
@@ -1750,7 +1784,10 @@ mod tests {
         let new_min = quantum.min_viable_size;
 
         // SizeQuantum should be LESS conservative than 1.5x
-        assert!(new_min < old_min, "Quantum should be tighter than 1.5x buffer");
+        assert!(
+            new_min < old_min,
+            "Quantum should be tighter than 1.5x buffer"
+        );
 
         // But still meet min_notional
         assert!(new_min * microprice >= min_notional);
@@ -1769,12 +1806,28 @@ mod tests {
     fn test_rl_adjustments_widen_spreads() {
         let mut ladder = Ladder {
             bids: smallvec![
-                LadderLevel { price: 99.95, size: 1.0, depth_bps: 5.0 },
-                LadderLevel { price: 99.90, size: 1.0, depth_bps: 10.0 },
+                LadderLevel {
+                    price: 99.95,
+                    size: 1.0,
+                    depth_bps: 5.0
+                },
+                LadderLevel {
+                    price: 99.90,
+                    size: 1.0,
+                    depth_bps: 10.0
+                },
             ],
             asks: smallvec![
-                LadderLevel { price: 100.05, size: 1.0, depth_bps: 5.0 },
-                LadderLevel { price: 100.10, size: 1.0, depth_bps: 10.0 },
+                LadderLevel {
+                    price: 100.05,
+                    size: 1.0,
+                    depth_bps: 5.0
+                },
+                LadderLevel {
+                    price: 100.10,
+                    size: 1.0,
+                    depth_bps: 10.0
+                },
             ],
         };
 
@@ -1782,35 +1835,47 @@ mod tests {
         apply_rl_adjustments(
             &mut ladder,
             &RlAdjustmentParams {
-                spread_delta_bps: 2.0,  // widen both sides by 2 bps
-                bid_skew_bps: 0.0,      // no bid skew
-                ask_skew_bps: 0.0,      // no ask skew
-                confidence: 0.9,        // 90% confidence
+                spread_delta_bps: 2.0, // widen both sides by 2 bps
+                bid_skew_bps: 0.0,     // no bid skew
+                ask_skew_bps: 0.0,     // no ask skew
+                confidence: 0.9,       // 90% confidence
                 market_mid: 100.0,
                 decimals: 2,
-                warmup_pct: 1.0,        // fully warmed up for test
+                warmup_pct: 1.0, // fully warmed up for test
             },
         );
 
         // Bids should be LOWER (further from mid) after widening
         // 2 bps * 0.9 confidence = 1.8 bps effective widen
         // 99.95 * (1 - 0.00018) ≈ 99.932
-        assert!(ladder.bids[0].price < 99.95, "Bid should move down (widen): {}", ladder.bids[0].price);
+        assert!(
+            ladder.bids[0].price < 99.95,
+            "Bid should move down (widen): {}",
+            ladder.bids[0].price
+        );
 
         // Asks should be HIGHER (further from mid) after widening
         // 100.05 * (1 + 0.00018) ≈ 100.068
-        assert!(ladder.asks[0].price > 100.05, "Ask should move up (widen): {}", ladder.asks[0].price);
+        assert!(
+            ladder.asks[0].price > 100.05,
+            "Ask should move up (widen): {}",
+            ladder.asks[0].price
+        );
     }
 
     #[test]
     fn test_rl_adjustments_asymmetric_skew() {
         let mut ladder = Ladder {
-            bids: smallvec![
-                LadderLevel { price: 99.95, size: 1.0, depth_bps: 5.0 },
-            ],
-            asks: smallvec![
-                LadderLevel { price: 100.05, size: 1.0, depth_bps: 5.0 },
-            ],
+            bids: smallvec![LadderLevel {
+                price: 99.95,
+                size: 1.0,
+                depth_bps: 5.0
+            },],
+            asks: smallvec![LadderLevel {
+                price: 100.05,
+                size: 1.0,
+                depth_bps: 5.0
+            },],
         };
 
         // RL recommends widening bid (positive = widen) and tightening ask (negative = tighten)
@@ -1818,31 +1883,43 @@ mod tests {
         apply_rl_adjustments(
             &mut ladder,
             &RlAdjustmentParams {
-                spread_delta_bps: 0.0,   // no symmetric spread delta
-                bid_skew_bps: 2.0,       // widen bid by 2 bps
-                ask_skew_bps: -2.0,      // tighten ask by 2 bps
-                confidence: 1.0,         // 100% confidence
+                spread_delta_bps: 0.0, // no symmetric spread delta
+                bid_skew_bps: 2.0,     // widen bid by 2 bps
+                ask_skew_bps: -2.0,    // tighten ask by 2 bps
+                confidence: 1.0,       // 100% confidence
                 market_mid: 100.0,
                 decimals: 2,
-                warmup_pct: 1.0,         // fully warmed up for test
+                warmup_pct: 1.0, // fully warmed up for test
             },
         );
 
         // Bid widened = lower price
-        assert!(ladder.bids[0].price < 99.95, "Bid should widen (move down): {}", ladder.bids[0].price);
+        assert!(
+            ladder.bids[0].price < 99.95,
+            "Bid should widen (move down): {}",
+            ladder.bids[0].price
+        );
         // Ask tightened = lower price (closer to mid)
-        assert!(ladder.asks[0].price < 100.05, "Ask should tighten (move down): {}", ladder.asks[0].price);
+        assert!(
+            ladder.asks[0].price < 100.05,
+            "Ask should tighten (move down): {}",
+            ladder.asks[0].price
+        );
     }
 
     #[test]
     fn test_rl_adjustments_low_confidence_ignored() {
         let mut ladder = Ladder {
-            bids: smallvec![
-                LadderLevel { price: 99.95, size: 1.0, depth_bps: 5.0 },
-            ],
-            asks: smallvec![
-                LadderLevel { price: 100.05, size: 1.0, depth_bps: 5.0 },
-            ],
+            bids: smallvec![LadderLevel {
+                price: 99.95,
+                size: 1.0,
+                depth_bps: 5.0
+            },],
+            asks: smallvec![LadderLevel {
+                price: 100.05,
+                size: 1.0,
+                depth_bps: 5.0
+            },],
         };
 
         let original_bid = ladder.bids[0].price;
@@ -1852,50 +1929,70 @@ mod tests {
         apply_rl_adjustments(
             &mut ladder,
             &RlAdjustmentParams {
-                spread_delta_bps: 5.0,  // large spread delta
+                spread_delta_bps: 5.0, // large spread delta
                 bid_skew_bps: 0.0,
                 ask_skew_bps: 0.0,
                 confidence: 0.05, // Only 5% confidence - below 10% threshold
                 market_mid: 100.0,
                 decimals: 2,
-                warmup_pct: 1.0,  // fully warmed up for test
+                warmup_pct: 1.0, // fully warmed up for test
             },
         );
 
         // Prices should be unchanged (low confidence ignored)
-        assert_eq!(ladder.bids[0].price, original_bid, "Bid should be unchanged");
-        assert_eq!(ladder.asks[0].price, original_ask, "Ask should be unchanged");
+        assert_eq!(
+            ladder.bids[0].price, original_bid,
+            "Bid should be unchanged"
+        );
+        assert_eq!(
+            ladder.asks[0].price, original_ask,
+            "Ask should be unchanged"
+        );
     }
 
     #[test]
     fn test_rl_adjustments_safety_guard_bid_crossing() {
         let mut ladder = Ladder {
             bids: smallvec![
-                LadderLevel { price: 99.99, size: 1.0, depth_bps: 1.0 }, // Very close to mid
+                LadderLevel {
+                    price: 99.99,
+                    size: 1.0,
+                    depth_bps: 1.0
+                }, // Very close to mid
             ],
-            asks: smallvec![
-                LadderLevel { price: 100.01, size: 1.0, depth_bps: 1.0 },
-            ],
+            asks: smallvec![LadderLevel {
+                price: 100.01,
+                size: 1.0,
+                depth_bps: 1.0
+            },],
         };
 
         // RL recommends TIGHTENING (negative) which could cross mid
         apply_rl_adjustments(
             &mut ladder,
             &RlAdjustmentParams {
-                spread_delta_bps: -10.0,  // Aggressive tightening
+                spread_delta_bps: -10.0, // Aggressive tightening
                 bid_skew_bps: 0.0,
                 ask_skew_bps: 0.0,
                 confidence: 1.0,
                 market_mid: 100.0, // market_mid = 100
                 decimals: 2,
-                warmup_pct: 1.0,  // fully warmed up for test
+                warmup_pct: 1.0, // fully warmed up for test
             },
         );
 
         // Safety guard: bid should not go above market_mid * 0.9999
-        assert!(ladder.bids[0].price < 100.0, "Bid must stay below mid: {}", ladder.bids[0].price);
+        assert!(
+            ladder.bids[0].price < 100.0,
+            "Bid must stay below mid: {}",
+            ladder.bids[0].price
+        );
         // Safety guard: ask should not go below market_mid * 1.0001
-        assert!(ladder.asks[0].price > 100.0, "Ask must stay above mid: {}", ladder.asks[0].price);
+        assert!(
+            ladder.asks[0].price > 100.0,
+            "Ask must stay above mid: {}",
+            ladder.asks[0].price
+        );
     }
 
     /// Test that no single order exceeds 25% of total_size in concentration fallback paths.
@@ -1923,9 +2020,15 @@ mod tests {
         let sizes: Vec<f64> = vec![total_size / 10.0; 10];
 
         let ladder = build_raw_ladder(&RawLadderInput {
-            depths: &depths, sizes: &sizes, mid, market_mid: mid,
-            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
-            decimals: 2, sz_decimals: 4, min_notional,
+            depths: &depths,
+            sizes: &sizes,
+            mid,
+            market_mid: mid,
+            exchange_best_bid: 0.0,
+            exchange_best_ask: 0.0,
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional,
         });
 
         // Should have a fallback order, but capped at 25% of total_size
@@ -1933,20 +2036,23 @@ mod tests {
         // Bid price is offset from mid by tightest depth (5 bps)
         let tightest_bps = 5.0;
         let bid_price_approx = mid * (1.0 - tightest_bps / 10000.0);
-        let cap = (total_size * MAX_SINGLE_ORDER_FRACTION)
-            .max(min_notional / bid_price_approx);
+        let cap = (total_size * MAX_SINGLE_ORDER_FRACTION).max(min_notional / bid_price_approx);
         for level in &ladder.bids {
             assert!(
                 level.size <= cap + 0.001,
                 "Bid size {:.6} exceeds cap {:.6} (was {:.6} total)",
-                level.size, cap, total_size
+                level.size,
+                cap,
+                total_size
             );
         }
         for level in &ladder.asks {
             assert!(
                 level.size <= cap + 0.001,
                 "Ask size {:.6} exceeds cap {:.6} (was {:.6} total)",
-                level.size, cap, total_size
+                level.size,
+                cap,
+                total_size
             );
         }
 
@@ -1961,14 +2067,15 @@ mod tests {
             assert!(
                 size <= total_size * MAX_SINGLE_ORDER_FRACTION + 0.001,
                 "MV=0 fallback level {} size {:.6} exceeds 25% cap",
-                i, size
+                i,
+                size
             );
         }
 
         // === Scenario 3: allocate_sizes min_size fallback ===
         let intensities = vec![0.01, 0.01, 0.01]; // Very small intensities
         let spreads = vec![1.0, 1.0, 1.0]; // Positive spreads
-        // min_size = 0.6, which is larger than per-level = 1.51/3 ≈ 0.503 → all filtered
+                                           // min_size = 0.6, which is larger than per-level = 1.51/3 ≈ 0.503 → all filtered
         let min_size = 0.6;
         let alloc = allocate_sizes(&intensities, &spreads, total_size, min_size);
 
@@ -1978,14 +2085,17 @@ mod tests {
             assert!(
                 size <= effective_cap + 0.001,
                 "min_size fallback level {} size {:.6} exceeds effective cap {:.6}",
-                i, size, effective_cap
+                i,
+                size,
+                effective_cap
             );
         }
         // Critically: should NOT be full total_size (was 1.51 before the fix)
         assert!(
             alloc[0] < total_size - 0.01,
             "min_size fallback should NOT concentrate full total_size ({:.4}), got {:.4}",
-            total_size, alloc[0]
+            total_size,
+            alloc[0]
         );
 
         // === Scenario 4: Asymmetric ladder concentration fallback ===
@@ -1994,23 +2104,33 @@ mod tests {
         let asym_sizes = vec![total_size / 10.0; 10]; // 0.151 each, notional = $4.98 < $10
 
         let ladder = build_asymmetric_ladder(
-            &asym_depths, &asym_sizes,
-            &asym_depths, &asym_sizes,
-            mid, mid, 0.0, 0.0, 2, 4, min_notional,
+            &asym_depths,
+            &asym_sizes,
+            &asym_depths,
+            &asym_sizes,
+            mid,
+            mid,
+            0.0,
+            0.0,
+            2,
+            4,
+            min_notional,
         );
 
         for level in &ladder.bids {
             assert!(
                 level.size <= cap + 0.001,
                 "Asymmetric bid size {:.6} exceeds cap {:.6}",
-                level.size, cap
+                level.size,
+                cap
             );
         }
         for level in &ladder.asks {
             assert!(
                 level.size <= cap + 0.001,
                 "Asymmetric ask size {:.6} exceeds cap {:.6}",
-                level.size, cap
+                level.size,
+                cap
             );
         }
     }
@@ -2018,11 +2138,31 @@ mod tests {
     #[test]
     fn test_dedup_merge_levels() {
         let mut levels: LadderLevels = smallvec![
-            LadderLevel { price: 100.0, size: 0.5, depth_bps: 2.0 },
-            LadderLevel { price: 100.0, size: 0.3, depth_bps: 3.0 },
-            LadderLevel { price: 101.0, size: 0.2, depth_bps: 5.0 },
-            LadderLevel { price: 101.0, size: 0.1, depth_bps: 6.0 },
-            LadderLevel { price: 102.0, size: 0.4, depth_bps: 8.0 },
+            LadderLevel {
+                price: 100.0,
+                size: 0.5,
+                depth_bps: 2.0
+            },
+            LadderLevel {
+                price: 100.0,
+                size: 0.3,
+                depth_bps: 3.0
+            },
+            LadderLevel {
+                price: 101.0,
+                size: 0.2,
+                depth_bps: 5.0
+            },
+            LadderLevel {
+                price: 101.0,
+                size: 0.1,
+                depth_bps: 6.0
+            },
+            LadderLevel {
+                price: 102.0,
+                size: 0.4,
+                depth_bps: 8.0
+            },
         ];
         dedup_merge_levels(&mut levels);
 
@@ -2040,9 +2180,11 @@ mod tests {
         assert!(empty.is_empty());
 
         // Single
-        let mut single: LadderLevels = smallvec![
-            LadderLevel { price: 50.0, size: 1.0, depth_bps: 5.0 },
-        ];
+        let mut single: LadderLevels = smallvec![LadderLevel {
+            price: 50.0,
+            size: 1.0,
+            depth_bps: 5.0
+        },];
         dedup_merge_levels(&mut single);
         assert_eq!(single.len(), 1);
     }
@@ -2060,9 +2202,15 @@ mod tests {
         let min_notional = 10.0;
 
         let ladder = build_raw_ladder(&RawLadderInput {
-            depths: &depths, sizes: &sizes, mid, market_mid,
-            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
-            decimals, sz_decimals, min_notional,
+            depths: &depths,
+            sizes: &sizes,
+            mid,
+            market_mid,
+            exchange_best_bid: 0.0,
+            exchange_best_ask: 0.0,
+            decimals,
+            sz_decimals,
+            min_notional,
         });
 
         // Check no duplicate prices on either side
@@ -2070,14 +2218,16 @@ mod tests {
             assert!(
                 (ladder.bids[i].price - ladder.bids[i - 1].price).abs() > EPSILON,
                 "duplicate bid price at index {}: {:.4}",
-                i, ladder.bids[i].price
+                i,
+                ladder.bids[i].price
             );
         }
         for i in 1..ladder.asks.len() {
             assert!(
                 (ladder.asks[i].price - ladder.asks[i - 1].price).abs() > EPSILON,
                 "duplicate ask price at index {}: {:.4}",
-                i, ladder.asks[i].price
+                i,
+                ladder.asks[i].price
             );
         }
     }
@@ -2114,10 +2264,10 @@ mod tests {
         // With gamma=8.0: 0.5 * 8.0 * 0.01^2 * 10.0 = 0.0004 → 4.0 bps raw
         apply_inventory_skew_with_drift(
             &mut ladder,
-            0.5,   // inventory_ratio: 50% long
-            8.0,   // gamma: high risk aversion to produce ~4 bps skew
-            0.01,  // sigma: moderate vol
-            10.0,  // time_horizon
+            0.5,  // inventory_ratio: 50% long
+            8.0,  // gamma: high risk aversion to produce ~4 bps skew
+            0.01, // sigma: moderate vol
+            10.0, // time_horizon
             mid,
             mid,
             2,     // decimals
@@ -2143,7 +2293,8 @@ mod tests {
         assert!(
             bid_shift_bps.abs() > 2.0 || ask_shift_bps.abs() > 2.0,
             "BBO cap killed inventory skew: bid_shift={:.2} bps, ask_shift={:.2} bps",
-            bid_shift_bps, ask_shift_bps
+            bid_shift_bps,
+            ask_shift_bps
         );
     }
 
@@ -2163,10 +2314,10 @@ mod tests {
         // The skew cap should use this own_floor, not the old hardcoded 8 bps
         apply_inventory_skew_with_drift(
             &mut ladder,
-            0.5,   // inventory_ratio
-            0.3,   // gamma
-            0.01,  // sigma
-            10.0,  // time_horizon
+            0.5,  // inventory_ratio
+            0.3,  // gamma
+            0.01, // sigma
+            10.0, // time_horizon
             mid,
             mid,
             4,     // decimals (HYPE-like)
@@ -2270,14 +2421,14 @@ mod tests {
         // Pass a very low effective_floor_bps — should clamp to 5.0
         apply_inventory_skew_with_drift(
             &mut ladder,
-            0.5,   // inventory_ratio: strong long
-            8.0,   // gamma: high to produce large skew
-            0.01,  // sigma
-            10.0,  // time_horizon
+            0.5,  // inventory_ratio: strong long
+            8.0,  // gamma: high to produce large skew
+            0.01, // sigma
+            10.0, // time_horizon
             mid,
             mid,
-            4,     // decimals
-            1,     // sz_decimals
+            4, // decimals
+            1, // sz_decimals
             false,
             0.0,
             false,

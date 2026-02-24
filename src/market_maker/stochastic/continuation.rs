@@ -138,11 +138,11 @@ impl ContinuationPosterior {
     /// - **quiet**: Low continuation (mean-reversion dominates), prior mean = 0.3
     pub fn from_regime(regime: &str) -> Self {
         let (alpha, beta) = match regime.to_lowercase().as_str() {
-            "cascade" | "extreme" => (4.0, 1.0),  // Prior mean = 0.8
-            "bursty" | "high" => (3.0, 2.0),       // Prior mean = 0.6
-            "normal" => (2.5, 2.5),                // Prior mean = 0.5
-            "quiet" | "low" => (1.5, 3.5),         // Prior mean = 0.3
-            _ => (2.5, 2.5),                       // Default to neutral
+            "cascade" | "extreme" => (4.0, 1.0), // Prior mean = 0.8
+            "bursty" | "high" => (3.0, 2.0),     // Prior mean = 0.6
+            "normal" => (2.5, 2.5),              // Prior mean = 0.5
+            "quiet" | "low" => (1.5, 3.5),       // Prior mean = 0.3
+            _ => (2.5, 2.5),                     // Default to neutral
         };
         Self {
             alpha,
@@ -246,7 +246,7 @@ impl ContinuationPosterior {
         self.regime_probs[0] * 0.3   // quiet
             + self.regime_probs[1] * 0.5   // normal
             + self.regime_probs[2] * 0.65  // bursty
-            + self.regime_probs[3] * 0.8   // cascade
+            + self.regime_probs[3] * 0.8 // cascade
     }
 
     /// Compute changepoint discount factor.
@@ -258,7 +258,8 @@ impl ContinuationPosterior {
     fn changepoint_discount(&self) -> f64 {
         // Entropy-based confidence: low entropy = concentrated distribution = trust the signal
         // High entropy = spread distribution = uncertain about changepoint
-        let scaled_entropy = self.changepoint_entropy * self.fusion_config.changepoint_entropy_scale;
+        let scaled_entropy =
+            self.changepoint_entropy * self.fusion_config.changepoint_entropy_scale;
         let entropy_confidence = 1.0 / (1.0 + scaled_entropy);
 
         // Discount = probability × confidence
@@ -303,9 +304,9 @@ impl ContinuationPosterior {
             (p_regime, cfg.weight_regime),
         ];
 
-        let (total_weight, weighted_sum) = signals.iter().fold((0.0, 0.0), |(w, s), (p, conf)| {
-            (w + conf, s + p * conf)
-        });
+        let (total_weight, weighted_sum) = signals
+            .iter()
+            .fold((0.0, 0.0), |(w, s), (p, conf)| (w + conf, s + p * conf));
 
         let p_fused = if total_weight > 1e-6 {
             weighted_sum / total_weight
@@ -400,8 +401,8 @@ impl ContinuationPosterior {
     pub fn credible_interval_95(&self) -> (f64, f64) {
         // Use normal approximation for Beta quantiles when α, β > 1
         let mean = self.prob_continuation();
-        let var = (self.alpha * self.beta) /
-            ((self.alpha + self.beta).powi(2) * (self.alpha + self.beta + 1.0));
+        let var = (self.alpha * self.beta)
+            / ((self.alpha + self.beta).powi(2) * (self.alpha + self.beta + 1.0));
         let std = var.sqrt();
 
         // 95% CI ≈ mean ± 1.96 × std
@@ -447,7 +448,11 @@ mod tests {
     fn test_default_is_neutral() {
         let post = ContinuationPosterior::default();
         let p = post.prob_continuation();
-        assert!((p - 0.5).abs() < 0.01, "Default should be neutral, got {}", p);
+        assert!(
+            (p - 0.5).abs() < 0.01,
+            "Default should be neutral, got {}",
+            p
+        );
     }
 
     #[test]
@@ -455,7 +460,10 @@ mod tests {
         let cascade = ContinuationPosterior::from_regime("cascade");
         let quiet = ContinuationPosterior::from_regime("quiet");
 
-        assert!(cascade.prob_continuation() > 0.7, "Cascade prior should be high");
+        assert!(
+            cascade.prob_continuation() > 0.7,
+            "Cascade prior should be high"
+        );
         assert!(quiet.prob_continuation() < 0.4, "Quiet prior should be low");
     }
 
@@ -466,12 +474,18 @@ mod tests {
 
         // Observe aligned fill
         post.observe_fill(true, 1.0);
-        assert!(post.prob_continuation() > initial_p, "Aligned fill should increase p_cont");
+        assert!(
+            post.prob_continuation() > initial_p,
+            "Aligned fill should increase p_cont"
+        );
 
         // Observe adverse fill
         let p_after_aligned = post.prob_continuation();
         post.observe_fill(false, 1.0);
-        assert!(post.prob_continuation() < p_after_aligned, "Adverse fill should decrease p_cont");
+        assert!(
+            post.prob_continuation() < p_after_aligned,
+            "Adverse fill should decrease p_cont"
+        );
     }
 
     #[test]
@@ -483,7 +497,10 @@ mod tests {
             post.observe_fill(true, 1.0);
         }
 
-        assert!(post.confidence() > initial_conf, "Confidence should increase with observations");
+        assert!(
+            post.confidence() > initial_conf,
+            "Confidence should increase with observations"
+        );
     }
 
     #[test]
@@ -516,7 +533,10 @@ mod tests {
         let post = ContinuationPosterior::new(10.0, 10.0);
         let (lower, upper) = post.credible_interval_95();
 
-        assert!(lower < 0.5 && upper > 0.5, "CI should contain 0.5 for symmetric Beta(10,10)");
+        assert!(
+            lower < 0.5 && upper > 0.5,
+            "CI should contain 0.5 for symmetric Beta(10,10)"
+        );
         assert!(lower >= 0.0 && upper <= 1.0, "CI should be in [0,1]");
     }
 
@@ -551,12 +571,12 @@ mod tests {
 
         // Also set supportive signals to get a high baseline
         post.update_signals(
-            0.0,                       // No changepoint initially
-            2.0,                       // Normal entropy
-            0.7,                       // Supportive momentum
-            0.5,                       // Some trend agreement
-            0.5,                       // Some trend confidence
-            [0.1, 0.4, 0.3, 0.2],     // Trending regime (bursty + cascade)
+            0.0,                  // No changepoint initially
+            2.0,                  // Normal entropy
+            0.7,                  // Supportive momentum
+            0.5,                  // Some trend agreement
+            0.5,                  // Some trend confidence
+            [0.1, 0.4, 0.3, 0.2], // Trending regime (bursty + cascade)
         );
 
         let p_before_cp = post.prob_continuation_fused();
@@ -568,12 +588,12 @@ mod tests {
 
         // Simulate changepoint detection (high probability, low entropy)
         post.update_signals(
-            0.9,                       // High changepoint probability
-            0.5,                       // Low entropy (confident)
-            0.5,                       // Neutral momentum
-            0.0,                       // No trend agreement
-            0.0,                       // No trend confidence
-            [0.2, 0.5, 0.2, 0.1],     // Normal regime
+            0.9,                  // High changepoint probability
+            0.5,                  // Low entropy (confident)
+            0.5,                  // Neutral momentum
+            0.0,                  // No trend agreement
+            0.0,                  // No trend confidence
+            [0.2, 0.5, 0.2, 0.1], // Normal regime
         );
 
         let p_after_cp = post.prob_continuation_fused();
@@ -596,12 +616,12 @@ mod tests {
 
         // Add momentum continuation signal
         post.update_signals(
-            0.0,                       // No changepoint
-            2.0,                       // Normal entropy
-            0.8,                       // High momentum continuation
-            0.0,                       // No trend
-            0.0,                       // No trend confidence
-            [0.2, 0.5, 0.2, 0.1],     // Normal regime
+            0.0,                  // No changepoint
+            2.0,                  // Normal entropy
+            0.8,                  // High momentum continuation
+            0.0,                  // No trend
+            0.0,                  // No trend confidence
+            [0.2, 0.5, 0.2, 0.1], // Normal regime
         );
 
         let p_with_momentum = post.prob_continuation_fused();
@@ -620,12 +640,12 @@ mod tests {
 
         // Add strong trend agreement with confidence
         post.update_signals(
-            0.0,                       // No changepoint
-            2.0,                       // Normal entropy
-            0.5,                       // Neutral momentum
-            0.9,                       // Strong trend agreement
-            0.8,                       // High trend confidence
-            [0.2, 0.5, 0.2, 0.1],     // Normal regime
+            0.0,                  // No changepoint
+            2.0,                  // Normal entropy
+            0.5,                  // Neutral momentum
+            0.9,                  // Strong trend agreement
+            0.8,                  // High trend confidence
+            [0.2, 0.5, 0.2, 0.1], // Normal regime
         );
 
         let p_fused = post.prob_continuation_fused();
@@ -644,12 +664,12 @@ mod tests {
 
         // Set cascade regime
         post.update_signals(
-            0.0,                       // No changepoint
-            2.0,                       // Normal entropy
-            0.5,                       // Neutral momentum
-            0.0,                       // No trend
-            0.0,                       // No trend confidence
-            [0.0, 0.0, 0.0, 1.0],     // Pure cascade regime
+            0.0,                  // No changepoint
+            2.0,                  // Normal entropy
+            0.5,                  // Neutral momentum
+            0.0,                  // No trend
+            0.0,                  // No trend confidence
+            [0.0, 0.0, 0.0, 1.0], // Pure cascade regime
         );
 
         let p_fused = post.prob_continuation_fused();
@@ -680,9 +700,11 @@ mod tests {
 
         // Simulate changepoint
         post.update_signals(
-            0.8,                       // High changepoint
-            0.3,                       // Low entropy
-            0.5, 0.0, 0.0,
+            0.8, // High changepoint
+            0.3, // Low entropy
+            0.5,
+            0.0,
+            0.0,
             [0.2, 0.5, 0.2, 0.1],
         );
 
@@ -711,7 +733,10 @@ mod tests {
     #[test]
     fn test_has_signal_updates() {
         let mut post = ContinuationPosterior::default();
-        assert!(!post.has_signal_updates(), "Fresh posterior should not have updates");
+        assert!(
+            !post.has_signal_updates(),
+            "Fresh posterior should not have updates"
+        );
 
         post.update_signals(0.5, 2.0, 0.5, 0.0, 0.0, [0.2, 0.5, 0.2, 0.1]);
         assert!(post.has_signal_updates(), "Should detect signal updates");

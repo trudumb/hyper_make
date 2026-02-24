@@ -19,6 +19,7 @@ mod multi_asset;
 mod regime_profile;
 mod risk;
 mod runtime;
+mod shadow_tuner;
 mod spread_profile;
 mod stochastic;
 
@@ -31,5 +32,6 @@ pub use multi_asset::*;
 pub use regime_profile::*;
 pub use risk::*;
 pub use runtime::*;
+pub use shadow_tuner::ShadowTunerConfig;
 pub use spread_profile::*;
 pub use stochastic::*;

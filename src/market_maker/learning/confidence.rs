@@ -81,7 +81,8 @@ impl EdgeBiasTracker {
             self.ewma_sq_bias = bias * bias;
         } else {
             self.ewma_bias = self.decay_alpha * self.ewma_bias + (1.0 - self.decay_alpha) * bias;
-            self.ewma_sq_bias = self.decay_alpha * self.ewma_sq_bias + (1.0 - self.decay_alpha) * bias * bias;
+            self.ewma_sq_bias =
+                self.decay_alpha * self.ewma_sq_bias + (1.0 - self.decay_alpha) * bias * bias;
         }
         self.n_observations += 1;
     }
@@ -103,9 +104,12 @@ impl EdgeBiasTracker {
             return 0.0;
         }
         let mean = self.mean_bias();
-        let variance = self.recent_bias.iter()
+        let variance = self
+            .recent_bias
+            .iter()
             .map(|b| (b - mean).powi(2))
-            .sum::<f64>() / (self.recent_bias.len() - 1) as f64;
+            .sum::<f64>()
+            / (self.recent_bias.len() - 1) as f64;
         variance.sqrt()
     }
 
@@ -506,7 +510,8 @@ impl ModelConfidenceTracker {
         self.update_edge_metrics();
 
         // Update edge bias safety net tracker
-        self.edge_bias_tracker.record(predicted_edge_bps, realized_pnl_bps);
+        self.edge_bias_tracker
+            .record(predicted_edge_bps, realized_pnl_bps);
 
         // Log recalibration signal if bias is significant
         if let Some(bias_bps) = self.edge_bias_tracker.should_recalibrate() {
@@ -1058,8 +1063,16 @@ mod tests {
         // EWMA with alpha=0.95: converges toward 5.0
         // After 20 steps of constant bias=5.0:
         // ewma = 5.0 * (1 - 0.95^20) ≈ 5.0 * 0.642 = 3.21 at minimum
-        assert!(bias > 3.0, "EWMA bias should converge toward 5.0, got {}", bias);
-        assert!(bias < 5.1, "EWMA bias should not exceed input, got {}", bias);
+        assert!(
+            bias > 3.0,
+            "EWMA bias should converge toward 5.0, got {}",
+            bias
+        );
+        assert!(
+            bias < 5.1,
+            "EWMA bias should not exceed input, got {}",
+            bias
+        );
 
         // Verify EWMA getter works
         assert!((tracker.ewma_bias() - bias).abs() < f64::EPSILON);

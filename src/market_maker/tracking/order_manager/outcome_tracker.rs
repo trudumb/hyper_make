@@ -269,7 +269,11 @@ impl ReconcileOutcomeTracker {
         let all = ReconcileActionType::all();
         let mut fill_rates = [(ReconcileActionType::Latch, 0.0_f64, 0_u64); NUM_ACTION_TYPES];
         for (i, &action) in all.iter().enumerate() {
-            fill_rates[i] = (action, self.fill_rates[i].rate(), self.fill_rates[i].count());
+            fill_rates[i] = (
+                action,
+                self.fill_rates[i].rate(),
+                self.fill_rates[i].count(),
+            );
         }
 
         OutcomeStats {
@@ -298,7 +302,11 @@ impl ReconcileOutcomeTracker {
 mod tests {
     use super::*;
 
-    fn make_decision(oid: u64, action: ReconcileActionType, predicted_p_fill: f64) -> ReconcileDecision {
+    fn make_decision(
+        oid: u64,
+        action: ReconcileActionType,
+        predicted_p_fill: f64,
+    ) -> ReconcileDecision {
         ReconcileDecision {
             oid,
             action,
@@ -365,7 +373,11 @@ mod tests {
         // Bias = EWMA of (predicted - actual) = EWMA of (0.8 - 0.0) = ~0.8
         // With alpha=0.05 and 50 iterations, should converge close to 0.8
         let bias = tracker.calibration_bias();
-        assert!(bias > 0.5, "bias should be positive (over-predicting): {}", bias);
+        assert!(
+            bias > 0.5,
+            "bias should be positive (over-predicting): {}",
+            bias
+        );
         assert!(bias < 0.85, "bias should converge near 0.8: {}", bias);
     }
 
@@ -383,7 +395,11 @@ mod tests {
         assert!(rate > 0.6, "fill rate should be high: {}", rate);
 
         let adj = tracker.suggested_latch_adjustment_bps();
-        assert!(adj > 0.0, "high fill rate should suggest wider latch (positive bps): {}", adj);
+        assert!(
+            adj > 0.0,
+            "high fill rate should suggest wider latch (positive bps): {}",
+            adj
+        );
     }
 
     #[test]
@@ -400,7 +416,11 @@ mod tests {
         assert!(rate < 0.3, "fill rate should be low: {}", rate);
 
         let adj = tracker.suggested_latch_adjustment_bps();
-        assert!(adj < 0.0, "low fill rate should suggest tighter latch (negative bps): {}", adj);
+        assert!(
+            adj < 0.0,
+            "low fill rate should suggest tighter latch (negative bps): {}",
+            adj
+        );
     }
 
     #[test]
@@ -492,9 +512,7 @@ mod tests {
             (tracker.fill_rate_for_action(&ReconcileActionType::CancelPlace) - 1.0).abs() < 1e-9
         );
         // Latch rate should remain at default 0.5
-        assert!(
-            (tracker.fill_rate_for_action(&ReconcileActionType::Latch) - 0.5).abs() < 1e-9
-        );
+        assert!((tracker.fill_rate_for_action(&ReconcileActionType::Latch) - 0.5).abs() < 1e-9);
     }
 
     #[test]

@@ -100,7 +100,8 @@ impl EdgeModel for GLFTEdgeModel {
         };
 
         // Combined uncertainty (sum of variances, capped at reasonable bounds)
-        let edge_std = (sigma_uncertainty.powi(2) + as_uncertainty.powi(2) + kappa_uncertainty.powi(2)).sqrt();
+        let edge_std =
+            (sigma_uncertainty.powi(2) + as_uncertainty.powi(2) + kappa_uncertainty.powi(2)).sqrt();
 
         // Cap at reasonable bounds: min 1 bps, max 50 bps
         // Edge predictions with >50 bps uncertainty are essentially uninformative

@@ -30,9 +30,9 @@ pub mod tracking;
 
 pub mod control;
 pub mod edge;
-pub mod models;
 pub mod latent;
 pub mod learning;
+pub mod models;
 pub mod monitoring;
 pub mod simulation;
 pub mod stochastic;
@@ -55,8 +55,8 @@ pub use edge::{
     ABMetrics, ABTest, ABTestConfig, ABTestManager, ABVariant, EdgeSignalKind, HealthStatus,
     SignalHealth, SignalHealthMonitor, SignalHealthSummary,
 };
-pub use estimator::*;
 pub use estimator::regime_hmm;
+pub use estimator::*;
 pub use execution::{
     CancelAnalysis, FillMetrics, FillRecord, FillStatistics, FillTracker, OrderEvent,
     OrderLifecycle, OrderLifecycleTracker, OrderState as ExecutionOrderState,
@@ -421,7 +421,8 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     last_toxicity_cancel_ask: Option<std::time::Instant>,
 
     // === Phase 14: Information-Gain Cycle Timer === //
-    pub cycle_state_changes: crate::market_maker::orchestrator::event_accumulator::CycleStateChanges,
+    pub cycle_state_changes:
+        crate::market_maker::orchestrator::event_accumulator::CycleStateChanges,
     pub cycle_timer: crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer,
 
     // === Cancel-Race AS Tracking (Sprint 6.3) ===
@@ -441,6 +442,24 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     sampling_bias_tracker: estimator::SamplingBiasTracker,
     /// Fill count at the start of the current quote cycle (for had_fill detection).
     last_bias_fill_count: usize,
+
+    // === Shadow Tuner (Continuous Background Optimization) ===
+    /// Producer for feeding market events to background CMA-ES optimizer.
+    /// Lock-free `flume::try_send` — never blocks the event loop.
+    shadow_buffer_producer: Option<simulation::ShadowBufferProducer>,
+    /// Receiver for hot-swapped dynamic params from Shadow Tuner.
+    /// Checked once per quote cycle via `has_changed()`.
+    dynamic_params_rx: Option<tokio::sync::watch::Receiver<strategy::DynamicParams>>,
+    /// Current blended dynamic params (graduated blend over 10 cycles).
+    dynamic_params_current: Option<strategy::DynamicParams>,
+    /// Cycles since last dynamic params update (for graduated blending).
+    dynamic_params_blend_cycles: u64,
+    /// Signal to Shadow Tuner that calibration gate has passed.
+    shadow_tuner_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Shared live kappa for Shadow Tuner replay evaluation.
+    shadow_tuner_kappa: Option<std::sync::Arc<portable_atomic::AtomicF64>>,
+    /// Shared live sigma for Shadow Tuner replay evaluation.
+    shadow_tuner_sigma: Option<std::sync::Arc<portable_atomic::AtomicF64>>,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -582,7 +601,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 estimator::self_impact::SelfImpactConfig::default(),
             ),
             market_profile: estimator::market_profile::MarketProfile::new(),
-            calibration_coordinator: estimator::calibration_coordinator::CalibrationCoordinator::new(),
+            calibration_coordinator:
+                estimator::calibration_coordinator::CalibrationCoordinator::new(),
             effective_max_position,
             effective_target_liquidity,
             last_ws_open_orders_snapshot: None,
@@ -652,9 +672,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .unwrap_or(0)
             ),
             // Live analytics (enabled by default — Sharpe, signal attribution, logging)
-            live_analytics: analytics::live::LiveAnalytics::new(
-                Some(std::path::PathBuf::from("data/analytics")),
-            ),
+            live_analytics: analytics::live::LiveAnalytics::new(Some(std::path::PathBuf::from(
+                "data/analytics",
+            ))),
             // Phase 5: Quote outcome tracking for unbiased edge estimation
             quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker::new(),
             queue_value_heuristic: models::QueueValueHeuristic::new(),
@@ -679,14 +699,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             echo_estimator: strategy::echo_estimator::EchoEstimator::default(),
             last_toxicity_cancel_bid: None,
             last_toxicity_cancel_ask: None,
-            cycle_state_changes: crate::market_maker::orchestrator::event_accumulator::CycleStateChanges::default(),
-            cycle_timer: crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer::new(),
+            cycle_state_changes:
+                crate::market_maker::orchestrator::event_accumulator::CycleStateChanges::default(),
+            cycle_timer:
+                crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer::new(),
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),
             // Bayesian sigma correction from markout feedback
             covariance_tracker: estimator::covariance_tracker::CovarianceTracker::new(),
             // Q18: Vol sampling bias tracker (diagnostics Phase 1)
             sampling_bias_tracker: estimator::SamplingBiasTracker::new(),
             last_bias_fill_count: 0,
+            // Shadow Tuner (disabled by default, enabled via with_shadow_tuner)
+            shadow_buffer_producer: None,
+            dynamic_params_rx: None,
+            dynamic_params_current: None,
+            dynamic_params_blend_cycles: 0,
+            shadow_tuner_gate: None,
+            shadow_tuner_kappa: None,
+            shadow_tuner_sigma: None,
         }
     }
 
@@ -746,7 +776,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Try to load and restore latest checkpoint
                 match mgr.load_latest() {
                     Ok(Some(bundle)) => {
-                        if checkpoint::asset_identity::assets_match(&bundle.metadata.asset, &self.config.asset) {
+                        if checkpoint::asset_identity::assets_match(
+                            &bundle.metadata.asset,
+                            &self.config.asset,
+                        ) {
                             self.restore_from_bundle(&bundle);
                             info!(
                                 asset = %bundle.metadata.asset,
@@ -792,15 +825,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Seed margin sizer
         self.infra.margin_sizer.update_state(
             paper_balance_usd,
-            0.0,  // no margin used initially
-            0.0,  // no notional initially
+            0.0, // no margin used initially
+            0.0, // no notional initially
         );
 
         // Seed exchange limits so place_bulk_ladder_orders doesn't block on
         // limits_initialized=false. Use a generous position limit derived from
         // the paper balance, leverage, and a fallback price.
         let leverage = self.infra.margin_sizer.max_leverage().max(1.0);
-        let price = if self.latest_mid > 0.0 { self.latest_mid } else { 1.0 };
+        let price = if self.latest_mid > 0.0 {
+            self.latest_mid
+        } else {
+            1.0
+        };
         let paper_max_position = (paper_balance_usd * leverage / price).max(1.0);
         self.infra
             .exchange_limits
@@ -843,7 +880,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// reducing false changepoints from noisy thin-book data.
     pub fn set_changepoint_regime_thin_dex(&mut self) {
         use crate::market_maker::config::RegimeProfile;
-        self.stochastic.controller.set_changepoint_regime_profile(&RegimeProfile::thin_dex());
+        self.stochastic
+            .controller
+            .set_changepoint_regime_profile(&RegimeProfile::thin_dex());
     }
 
     /// Enable experience logging for RL SARSA tuples.
@@ -875,11 +914,155 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self
     }
 
+    /// Enable the Shadow Tuner: continuous background CMA-ES optimization.
+    ///
+    /// Creates a lock-free producer/consumer pair (via flume), a watch channel for
+    /// hot-swapping `DynamicParams`, and shared atomics for live kappa/sigma.
+    /// Returns the `ShadowTuner` instance which the caller must spawn on a dedicated
+    /// OS thread via `std::thread::spawn`.
+    ///
+    /// # Returns
+    /// `(self, ShadowTuner)` — the tuner must be moved into `std::thread::spawn(move || tuner.run())`
+    pub fn with_shadow_tuner(
+        mut self,
+        config: config::ShadowTunerConfig,
+        initial_params: Option<strategy::DynamicParams>,
+    ) -> (Self, simulation::ShadowTuner) {
+        let max_duration_ns = config.buffer_duration_min * 60 * 1_000_000_000;
+        let (producer, consumer) =
+            simulation::create_shadow_buffer(config.max_buffer_events, max_duration_ns);
+
+        let initial = initial_params.clone().unwrap_or_default();
+        let (params_tx, params_rx) = tokio::sync::watch::channel(initial);
+
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let kappa = std::sync::Arc::new(portable_atomic::AtomicF64::new(2000.0));
+        let sigma = std::sync::Arc::new(portable_atomic::AtomicF64::new(0.001));
+
+        let tuner_config = simulation::TunerConfig {
+            cycle_interval_s: config.cycle_interval_s,
+            min_events_for_replay: config.min_events_for_replay,
+            improvement_threshold: config.improvement_threshold,
+            convergence_sigma: config.convergence_sigma,
+            max_generations_before_reset: config.max_generations_before_reset,
+            param_bounds: crate::market_maker::simulation::shadow_tuner::default_param_bounds(),
+            rayon_threads: config.rayon_threads,
+            replay_max_position: self.config.max_position,
+        };
+
+        let tuner = simulation::ShadowTuner::new(
+            consumer,
+            params_tx,
+            tuner_config,
+            gate.clone(),
+            kappa.clone(),
+            sigma.clone(),
+            initial_params,
+        );
+
+        self.shadow_buffer_producer = Some(producer);
+        self.dynamic_params_rx = Some(params_rx);
+        self.shadow_tuner_gate = Some(gate);
+        self.shadow_tuner_kappa = Some(kappa);
+        self.shadow_tuner_sigma = Some(sigma);
+
+        info!(
+            "Shadow Tuner enabled (cycle={}s, buffer={}min)",
+            config.cycle_interval_s, config.buffer_duration_min
+        );
+
+        (self, tuner)
+    }
+
+    /// Feed a market event to the Shadow Tuner's buffer (lock-free, non-blocking).
+    ///
+    /// Called from event loop handlers on L2Book and Trade events.
+    /// Returns silently if the shadow tuner is not enabled.
+    #[inline]
+    fn feed_shadow_buffer(&self, event: simulation::ReplayEvent) {
+        if let Some(ref producer) = self.shadow_buffer_producer {
+            let _ = producer.push(event);
+        }
+    }
+
+    /// Signal the Shadow Tuner that calibration gate has passed.
+    fn signal_shadow_tuner_gate(&self) {
+        if let Some(ref gate) = self.shadow_tuner_gate {
+            if !gate.load(std::sync::atomic::Ordering::Relaxed) {
+                gate.store(true, std::sync::atomic::Ordering::Relaxed);
+                info!("Shadow Tuner calibration gate activated");
+            }
+        }
+    }
+
+    /// Update shared live kappa/sigma atomics for Shadow Tuner replay evaluation.
+    fn update_shadow_tuner_estimators(&self) {
+        if let Some(ref kappa) = self.shadow_tuner_kappa {
+            kappa.store(self.estimator.kappa(), portable_atomic::Ordering::Relaxed);
+        }
+        if let Some(ref sigma) = self.shadow_tuner_sigma {
+            sigma.store(
+                self.estimator.sigma_clean(),
+                portable_atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Check for new DynamicParams from Shadow Tuner and apply with graduated blending.
+    fn check_dynamic_params(&mut self) {
+        let rx = match self.dynamic_params_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        if rx.has_changed().unwrap_or(false) {
+            let new_params = rx.borrow_and_update().clone();
+            if let Err(e) = new_params.validate() {
+                warn!("Shadow Tuner sent invalid params, rejecting: {e}");
+                return;
+            }
+            info!(
+                version = new_params.version,
+                gamma = new_params.gamma_base,
+                inv_beta = new_params.inventory_beta,
+                floor = new_params.spread_floor_bps,
+                "Shadow Tuner params update received, starting blend"
+            );
+            self.dynamic_params_current = Some(new_params);
+            self.dynamic_params_blend_cycles = 0;
+        }
+
+        // Graduated blend over 10 cycles
+        if let Some(ref target) = self.dynamic_params_current.clone() {
+            if self.dynamic_params_blend_cycles < 10 {
+                self.dynamic_params_blend_cycles += 1;
+                let alpha = self.dynamic_params_blend_cycles as f64 / 10.0;
+                let position_ratio = (self.position.position().abs()
+                    / self.effective_max_position.max(0.001))
+                .clamp(0.0, 1.0);
+                let blended = strategy::DynamicParams::blend(
+                    &strategy::DynamicParams::default(),
+                    target,
+                    alpha,
+                    position_ratio,
+                );
+                self.dynamic_params_current = Some(blended);
+            }
+        }
+    }
 
     /// Assemble a checkpoint bundle from current state.
     fn assemble_checkpoint_bundle(&self) -> checkpoint::CheckpointBundle {
-        let (mut vol_filter, informed_flow, fill_rate, kappa_own, kappa_bid, kappa_ask, momentum, kappa_orchestrator_cp) =
-            self.estimator.to_checkpoint();
+        let (
+            mut vol_filter,
+            informed_flow,
+            fill_rate,
+            kappa_own,
+            kappa_bid,
+            kappa_ask,
+            momentum,
+            kappa_orchestrator_cp,
+        ) = self.estimator.to_checkpoint();
 
         // Q18: Populate bias tracker fields on vol_filter checkpoint
         vol_filter.bias_fill_intervals = self.sampling_bias_tracker.fill_intervals();
@@ -940,6 +1123,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             kappa_orchestrator: kappa_orchestrator_cp,
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
+            shadow_tuner: None,
         }
     }
 
@@ -985,18 +1169,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 }
 
 /// φ: S → P — extract learned priors.
-impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorExtract
-    for MarketMaker<S, Env>
-{
+impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorExtract for MarketMaker<S, Env> {
     fn extract_prior(&self) -> checkpoint::CheckpointBundle {
         self.assemble_checkpoint_bundle()
     }
 }
 
 /// ψ: P × S → S — inject priors with configurable blending.
-impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
-    for MarketMaker<S, Env>
-{
+impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject for MarketMaker<S, Env> {
     fn inject_prior(
         &mut self,
         prior: &checkpoint::CheckpointBundle,
@@ -1006,10 +1186,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
 
         // Validate asset match (using base symbol for cross-DEX compatibility).
         if config.require_asset_match
-            && !checkpoint::asset_identity::assets_match(
-                &prior.metadata.asset,
-                &self.config.asset,
-            )
+            && !checkpoint::asset_identity::assets_match(&prior.metadata.asset, &self.config.asset)
         {
             warn!(
                 prior_asset = %prior.metadata.asset,
@@ -1025,8 +1202,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let age_s = (now_ms.saturating_sub(prior.metadata.timestamp_ms)) as f64 / 1000.0;
-        let age_confidence =
-            checkpoint::transfer::prior_age_confidence(age_s, &config.age_policy);
+        let age_confidence = checkpoint::transfer::prior_age_confidence(age_s, &config.age_policy);
 
         if age_confidence <= 0.0 {
             warn!(
@@ -1244,7 +1420,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             account_value: margin_state.account_value,
             leverage: self.infra.margin_sizer.max_leverage(),
             // Ladder depth updated separately via set_ladder_depth()
-            max_ladder_one_side_contracts: self.safety.kill_switch.state().max_ladder_one_side_contracts,
+            max_ladder_one_side_contracts: self
+                .safety
+                .kill_switch
+                .state()
+                .max_ladder_one_side_contracts,
             // Preserve initial position from startup for runaway exemption
             initial_position: self.safety.kill_switch.state().initial_position,
             // Q20: Stuck inventory state (preserved from kill switch state)
@@ -1365,7 +1545,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Compute velocity: max position swing in window / max_position
         if self.position_history.len() >= 2 {
-            let oldest_pos = self.position_history.front().map(|&(_, p)| p).unwrap_or(current_pos);
+            let oldest_pos = self
+                .position_history
+                .front()
+                .map(|&(_, p)| p)
+                .unwrap_or(current_pos);
             let max_pos = self.effective_max_position.max(0.001); // avoid div by zero
             self.position_velocity_1m = (current_pos - oldest_pos).abs() / max_pos;
         }
@@ -1615,7 +1799,11 @@ mod fill_cascade_tests {
         let mut tracker = FillCascadeTracker::new();
         // ALL same-side fills counted regardless of position
         for i in 0..4 {
-            assert!(tracker.record_fill(Side::Sell, 5.0).is_none(), "fill {} should not trigger", i + 1);
+            assert!(
+                tracker.record_fill(Side::Sell, 5.0).is_none(),
+                "fill {} should not trigger",
+                i + 1
+            );
         }
         let event = tracker.record_fill(Side::Sell, 5.0); // 5th sell -> WIDEN
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Sell)));
@@ -1623,7 +1811,11 @@ mod fill_cascade_tests {
 
         let mut tracker2 = FillCascadeTracker::new();
         for i in 0..4 {
-            assert!(tracker2.record_fill(Side::Buy, -5.0).is_none(), "fill {} should not trigger", i + 1);
+            assert!(
+                tracker2.record_fill(Side::Buy, -5.0).is_none(),
+                "fill {} should not trigger",
+                i + 1
+            );
         }
         let event2 = tracker2.record_fill(Side::Buy, -5.0); // 5th buy -> WIDEN
         assert_eq!(event2, Some(CascadeEvent::Widen(Side::Buy)));
@@ -1674,7 +1866,10 @@ mod fill_cascade_tests {
         // But quote_engine checks position: if position > 0, skip widen for sells
         let position = 5.0; // long
         let should_widen_sells = addon > 0.0 && position <= 0.0;
-        assert!(!should_widen_sells, "Should NOT widen sells when long (reducing)");
+        assert!(
+            !should_widen_sells,
+            "Should NOT widen sells when long (reducing)"
+        );
     }
 
     #[test]
@@ -1694,7 +1889,7 @@ mod fill_cascade_tests {
         tracker.record_fill(Side::Sell, 1.0); // 2 sells
         tracker.record_fill(Side::Buy, 0.0); // 3 buys
         tracker.record_fill(Side::Buy, 0.0); // 4 buys
-        // 5th buy -> WIDEN
+                                             // 5th buy -> WIDEN
         let event = tracker.record_fill(Side::Buy, 0.0);
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
     }

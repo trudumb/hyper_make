@@ -638,8 +638,10 @@ mod tests {
 
     #[test]
     fn test_quantum_property_all_sz_decimals() {
-        let prices = [0.001, 0.01, 0.05, 0.50, 1.0, 5.0, 10.0, 30.90, 100.0,
-                      500.0, 1000.0, 5000.0, 50_000.0, 100_000.0];
+        let prices = [
+            0.001, 0.01, 0.05, 0.50, 1.0, 5.0, 10.0, 30.90, 100.0, 500.0, 1000.0, 5000.0, 50_000.0,
+            100_000.0,
+        ];
 
         for &price in &prices {
             for sz_dec in 0..=5 {
@@ -650,7 +652,10 @@ mod tests {
                 assert!(
                     notional >= 10.0 - 1e-9, // Allow tiny float epsilon
                     "NOTIONAL FAIL: price={}, sz_dec={}, min_viable={}, notional={}",
-                    price, sz_dec, quantum.min_viable_size, notional,
+                    price,
+                    sz_dec,
+                    quantum.min_viable_size,
+                    notional,
                 );
 
                 // Property 2: truncation-stable
@@ -658,7 +663,10 @@ mod tests {
                 assert!(
                     (truncated - quantum.min_viable_size).abs() < 1e-12,
                     "TRUNCATION FAIL: price={}, sz_dec={}, min_viable={}, truncated={}",
-                    price, sz_dec, quantum.min_viable_size, truncated,
+                    price,
+                    sz_dec,
+                    quantum.min_viable_size,
+                    truncated,
                 );
 
                 // Property 3: minimal — one step less would NOT meet notional
@@ -668,7 +676,10 @@ mod tests {
                     assert!(
                         one_less_notional < 10.0 + 1e-9,
                         "NOT MINIMAL: price={}, sz_dec={}, one_less={} meets notional={}",
-                        price, sz_dec, one_less, one_less_notional,
+                        price,
+                        sz_dec,
+                        one_less,
+                        one_less_notional,
                     );
                 }
             }
@@ -692,7 +703,9 @@ mod tests {
                 assert!(
                     clamped * 30.90 >= 10.0 - 1e-9,
                     "Notional fail after clamp: raw={}, clamped={}, notional={}",
-                    raw, clamped, clamped * 30.90,
+                    raw,
+                    clamped,
+                    clamped * 30.90,
                 );
             }
         }
@@ -706,13 +719,13 @@ mod tests {
     fn test_viability_not_viable_zero_capacity() {
         // Position already at max — no capacity on either side
         let budget = CapacityBudget::compute(
-            100.0,  // account_value
-            30.90,  // mark_px
-            10.0,   // min_notional
-            2,      // sz_decimals
-            0.388,  // effective_max_position
-            0.388,  // position (at max)
-            0.33,   // target_liquidity
+            100.0, // account_value
+            30.90, // mark_px
+            10.0,  // min_notional
+            2,     // sz_decimals
+            0.388, // effective_max_position
+            0.388, // position (at max)
+            0.33,  // target_liquidity
         );
 
         // With position == max, bid_capacity = 0, ask_capacity = 0.776
@@ -723,18 +736,21 @@ mod tests {
     #[test]
     fn test_viability_not_viable_tiny_account() {
         let budget = CapacityBudget::compute(
-            3.0,    // account_value ($3 — way too small)
-            30.90,  // mark_px
-            10.0,   // min_notional
-            2,      // sz_decimals
-            0.01,   // effective_max_position (tiny)
-            0.0,    // position
-            0.01,   // target_liquidity
+            3.0,   // account_value ($3 — way too small)
+            30.90, // mark_px
+            10.0,  // min_notional
+            2,     // sz_decimals
+            0.01,  // effective_max_position (tiny)
+            0.0,   // position
+            0.01,  // target_liquidity
         );
 
         assert!(!budget.should_quote());
         match &budget.viability {
-            Viability::NotViable { min_capital_needed_usd, .. } => {
+            Viability::NotViable {
+                min_capital_needed_usd,
+                ..
+            } => {
                 assert!(*min_capital_needed_usd > 0.0);
             }
             _ => panic!("Expected NotViable, got {:?}", budget.viability),
@@ -745,13 +761,13 @@ mod tests {
     fn test_viability_concentrated_small_capital() {
         // $25 capital on HYPE — just barely viable
         let budget = CapacityBudget::compute(
-            25.0,   // account_value
-            30.90,  // mark_px
-            10.0,   // min_notional
-            2,      // sz_decimals
-            0.80,   // effective_max_position (~$24 notional)
-            0.0,    // position
-            0.33,   // target_liquidity
+            25.0,  // account_value
+            30.90, // mark_px
+            10.0,  // min_notional
+            2,     // sz_decimals
+            0.80,  // effective_max_position (~$24 notional)
+            0.0,   // position
+            0.33,  // target_liquidity
         );
 
         assert!(budget.should_quote());
@@ -781,13 +797,13 @@ mod tests {
     fn test_budget_hype_100_dollar_scenario() {
         // THE scenario: $100 capital, HYPE $30.90
         let budget = CapacityBudget::compute(
-            100.0,  // account_value
-            30.90,  // mark_px
-            10.0,   // min_notional
-            2,      // sz_decimals
-            0.388,  // effective_max_position (from $100 / leverage)
-            0.0,    // position
-            0.33,   // target_liquidity
+            100.0, // account_value
+            30.90, // mark_px
+            10.0,  // min_notional
+            2,     // sz_decimals
+            0.388, // effective_max_position (from $100 / leverage)
+            0.0,   // position
+            0.33,  // target_liquidity
         );
 
         // MUST be viable — this is the whole point of the fix
@@ -802,9 +818,7 @@ mod tests {
 
     #[test]
     fn test_budget_viable_size_delegates_to_quantum() {
-        let budget = CapacityBudget::compute(
-            100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33,
-        );
+        let budget = CapacityBudget::compute(100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33);
         // Above min
         assert_eq!(budget.viable_size(0.50), Some(0.50));
         // Below min — rounds up
@@ -817,10 +831,9 @@ mod tests {
     fn test_budget_capacity_with_position() {
         // Long position reduces bid capacity, increases ask capacity
         let budget = CapacityBudget::compute(
-            1000.0, 30.90, 10.0, 2,
-            5.0,   // effective_max_position
-            2.0,   // long position
-            1.0,   // target_liquidity
+            1000.0, 30.90, 10.0, 2, 5.0, // effective_max_position
+            2.0, // long position
+            1.0, // target_liquidity
         );
 
         assert!((budget.bid_capacity - 3.0).abs() < 1e-10); // 5 - 2
@@ -830,10 +843,9 @@ mod tests {
     #[test]
     fn test_budget_capacity_with_short_position() {
         let budget = CapacityBudget::compute(
-            1000.0, 30.90, 10.0, 2,
-            5.0,   // effective_max_position
-            -2.0,  // short position
-            1.0,   // target_liquidity
+            1000.0, 30.90, 10.0, 2, 5.0,  // effective_max_position
+            -2.0, // short position
+            1.0,  // target_liquidity
         );
 
         assert!((budget.bid_capacity - 7.0).abs() < 1e-10); // 5 + 2
@@ -850,9 +862,7 @@ mod tests {
 
     #[test]
     fn test_capacity_budget_has_min_viable_depth() {
-        let budget = CapacityBudget::compute(
-            100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33,
-        );
+        let budget = CapacityBudget::compute(100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33);
         // min_viable_depth_bps must be >= 5.0 (QueueValue breakeven in Normal)
         assert!(
             budget.min_viable_depth_bps >= 5.0,
@@ -864,9 +874,7 @@ mod tests {
     #[test]
     fn test_viable_levels_100_usd_hype() {
         // $100 capital, HYPE at $30.90
-        let budget = CapacityBudget::compute(
-            100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33,
-        );
+        let budget = CapacityBudget::compute(100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33);
         // 0.388 / 0.33 = 1.17 → 1 level per side → Micro tier
         // This is correct for the CapacityBudget calculation
         assert!(
@@ -878,16 +886,15 @@ mod tests {
 
     #[test]
     fn test_min_viable_depth_survives_queue_value() {
-        let budget = CapacityBudget::compute(
-            100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33,
-        );
+        let budget = CapacityBudget::compute(100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33);
         // At min_viable_depth_bps with Normal toxicity and front of queue:
         // value = 5.0 - 3.0(AS) - 0(queue) - 1.5(fee) = 0.5 > 0
         let value = budget.min_viable_depth_bps - 3.0 - 0.0 - 1.5;
         assert!(
             value > 0.0,
             "QueueValue at min_viable_depth_bps={}: {} must be > 0",
-            budget.min_viable_depth_bps, value,
+            budget.min_viable_depth_bps,
+            value,
         );
     }
 
@@ -975,9 +982,7 @@ mod tests {
 
     #[test]
     fn test_budget_policy_matches_tier() {
-        let budget = CapacityBudget::compute(
-            100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33,
-        );
+        let budget = CapacityBudget::compute(100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33);
         let policy = budget.policy();
         assert_eq!(policy.tier, budget.capital_tier);
     }

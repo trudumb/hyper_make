@@ -79,7 +79,9 @@ pub mod hjb_solver;
 // Re-export key types
 pub use beliefs::{BeliefSummary, MarketBeliefs, Regime};
 pub use conjugate::{FillIntensityPosterior, NormalInverseGamma};
-pub use continuation::{ContinuationFusionConfig, ContinuationPosterior, ContinuationSignalSummary};
+pub use continuation::{
+    ContinuationFusionConfig, ContinuationPosterior, ContinuationSignalSummary,
+};
 pub use hjb_solver::{HJBDiagnostics, HJBQuotes, HJBSolver, HJBSolverConfig};
 
 /// Configuration for the stochastic control system.
@@ -256,12 +258,7 @@ impl StochasticControlBuilder {
     }
 
     /// Compute optimal quotes.
-    pub fn optimal_quotes(
-        &self,
-        position: f64,
-        max_position: f64,
-        target_size: f64,
-    ) -> HJBQuotes {
+    pub fn optimal_quotes(&self, position: f64, max_position: f64, target_size: f64) -> HJBQuotes {
         if !self.config.enable_hjb_quotes {
             return HJBQuotes::default();
         }
@@ -277,8 +274,12 @@ impl StochasticControlBuilder {
         max_position: f64,
         target_size: f64,
     ) -> (HJBQuotes, HJBDiagnostics) {
-        self.solver
-            .optimal_quotes_with_diagnostics(&self.beliefs, position, max_position, target_size)
+        self.solver.optimal_quotes_with_diagnostics(
+            &self.beliefs,
+            position,
+            max_position,
+            target_size,
+        )
     }
 
     /// Get predictive bias for external use.

@@ -169,7 +169,9 @@ fn compute_spacing_ticks(config: &TickGridConfig) -> u32 {
     let natural_spacing_bps = range_bps / (config.max_levels - 1) as f64;
     let min_spacing_bps = config.tick_bps * config.min_tick_spacing_mult;
 
-    let spacing_bps = natural_spacing_bps.max(min_spacing_bps).max(config.tick_bps);
+    let spacing_bps = natural_spacing_bps
+        .max(min_spacing_bps)
+        .max(config.tick_bps);
     let spacing_ticks = (spacing_bps / config.tick_bps).ceil() as u32;
 
     spacing_ticks.max(1)
@@ -212,15 +214,17 @@ pub struct TickScoringParams {
 /// Fill probability: `P_fill(δ) = 2Φ(-δ / (σ√τ))` from first-passage Brownian motion.
 /// AS decay: `AS(δ) = as_at_touch × exp(-δ / as_decay_bps)`.
 pub fn score_ticks(levels: &mut [TickLevel], params: &TickScoringParams) {
-    debug_assert!(params.fee_bps > 0.0, "fee_bps must be positive for unit consistency");
+    debug_assert!(
+        params.fee_bps > 0.0,
+        "fee_bps must be positive for unit consistency"
+    );
 
     let sigma_sqrt_tau = params.sigma * params.tau.sqrt();
     let sigma_bps = params.sigma * 10_000.0;
 
     // Volatility-based minimum spread capture: ensures levels aren't scored as zero
     // in low-vol regimes where depth barely exceeds AS + fee.
-    let spread_floor_vol_bps =
-        sigma_bps * (params.tau / (2.0 * std::f64::consts::PI)).sqrt();
+    let spread_floor_vol_bps = sigma_bps * (params.tau / (2.0 * std::f64::consts::PI)).sqrt();
 
     for level in levels.iter_mut() {
         let depth = level.depth_bps;
@@ -261,11 +265,8 @@ pub fn select_optimal_ticks(levels: &[TickLevel], max_levels: usize) -> Vec<Tick
     }
 
     // Filter to positive utility
-    let mut candidates: Vec<TickLevel> = levels
-        .iter()
-        .filter(|l| l.utility > 0.0)
-        .copied()
-        .collect();
+    let mut candidates: Vec<TickLevel> =
+        levels.iter().filter(|l| l.utility > 0.0).copied().collect();
 
     // Always include touch (first level) even if utility is slightly negative
     if candidates.is_empty() && !levels.is_empty() {
@@ -273,13 +274,21 @@ pub fn select_optimal_ticks(levels: &[TickLevel], max_levels: usize) -> Vec<Tick
     }
 
     // Sort by utility descending
-    candidates.sort_by(|a, b| b.utility.partial_cmp(&a.utility).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.utility
+            .partial_cmp(&a.utility)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Take top max_levels
     candidates.truncate(max_levels);
 
     // Re-sort by depth ascending (closest to mid first)
-    candidates.sort_by(|a, b| a.depth_bps.partial_cmp(&b.depth_bps).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        a.depth_bps
+            .partial_cmp(&b.depth_bps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     candidates
 }
@@ -296,10 +305,8 @@ fn std_normal_cdf(x: f64) -> f64 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x_abs = x.abs();
     let t = 1.0 / (1.0 + P * x_abs);
-    let y = 1.0
-        - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1)
-            * t
-            * (-x_abs * x_abs / 2.0).exp();
+    let y =
+        1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-x_abs * x_abs / 2.0).exp();
 
     0.5 * (1.0 + sign * y)
 }
@@ -311,13 +318,11 @@ mod tests {
     fn hype_config() -> TickGridConfig {
         // HYPE at $29.63, tick_size=0.0001 (4 price decimals)
         TickGridConfig::compute(
-            29.63,
-            0.0001,
-            8.0,   // touch at 8 bps
-            50.0,   // max depth 50 bps
-            10,     // 10 levels
-            2,      // sz_decimals
-            1.0,    // min 1 tick spacing
+            29.63, 0.0001, 8.0,  // touch at 8 bps
+            50.0, // max depth 50 bps
+            10,   // 10 levels
+            2,    // sz_decimals
+            1.0,  // min 1 tick spacing
         )
     }
 
@@ -326,8 +331,11 @@ mod tests {
         let cfg = hype_config();
         assert!(cfg.tick_bps > 0.0);
         // tick_bps = 0.0001 / 29.63 * 10000 ≈ 0.0338
-        assert!((cfg.tick_bps - 0.0338).abs() < 0.001,
-            "tick_bps={}", cfg.tick_bps);
+        assert!(
+            (cfg.tick_bps - 0.0338).abs() < 0.001,
+            "tick_bps={}",
+            cfg.tick_bps
+        );
         assert_eq!(cfg.max_levels, 10);
     }
 
@@ -340,15 +348,23 @@ mod tests {
 
         // All prices must be unique
         for i in 1..bids.len() {
-            assert!(bids[i].price < bids[i - 1].price,
+            assert!(
+                bids[i].price < bids[i - 1].price,
                 "Bid prices must be strictly decreasing: [{i}]={} >= [{prev}]={}",
-                bids[i].price, bids[i - 1].price, prev = i - 1);
+                bids[i].price,
+                bids[i - 1].price,
+                prev = i - 1
+            );
         }
 
         // All prices below mid
         for level in &bids {
-            assert!(level.price < cfg.mark_price,
-                "Bid price {} should be below mid {}", level.price, cfg.mark_price);
+            assert!(
+                level.price < cfg.mark_price,
+                "Bid price {} should be below mid {}",
+                level.price,
+                cfg.mark_price
+            );
         }
     }
 
@@ -361,15 +377,23 @@ mod tests {
 
         // All prices must be unique
         for i in 1..asks.len() {
-            assert!(asks[i].price > asks[i - 1].price,
+            assert!(
+                asks[i].price > asks[i - 1].price,
                 "Ask prices must be strictly increasing: [{i}]={} <= [{prev}]={}",
-                asks[i].price, asks[i - 1].price, prev = i - 1);
+                asks[i].price,
+                asks[i - 1].price,
+                prev = i - 1
+            );
         }
 
         // All prices above mid
         for level in &asks {
-            assert!(level.price > cfg.mark_price,
-                "Ask price {} should be above mid {}", level.price, cfg.mark_price);
+            assert!(
+                level.price > cfg.mark_price,
+                "Ask price {} should be above mid {}",
+                level.price,
+                cfg.mark_price
+            );
         }
     }
 
@@ -377,7 +401,11 @@ mod tests {
     fn test_enumerate_respects_max_levels() {
         let cfg = TickGridConfig::compute(29.63, 0.0001, 8.0, 200.0, 5, 2, 1.0);
         let bids = enumerate_bid_ticks(&cfg);
-        assert!(bids.len() <= 5, "Should respect max_levels=5, got {}", bids.len());
+        assert!(
+            bids.len() <= 5,
+            "Should respect max_levels=5, got {}",
+            bids.len()
+        );
     }
 
     #[test]
@@ -385,8 +413,11 @@ mod tests {
         let cfg = TickGridConfig::compute(29.63, 0.0001, 8.0, 15.0, 100, 2, 1.0);
         let bids = enumerate_bid_ticks(&cfg);
         for level in &bids {
-            assert!(level.depth_bps <= 15.0 + 0.1,
-                "depth_bps {} should be <= max_depth 15.0", level.depth_bps);
+            assert!(
+                level.depth_bps <= 15.0 + 0.1,
+                "depth_bps {} should be <= max_depth 15.0",
+                level.depth_bps
+            );
         }
     }
 
@@ -398,8 +429,11 @@ mod tests {
         if bids.len() >= 2 {
             for i in 1..bids.len() {
                 let tick_diff = bids[i - 1].tick_offset.abs_diff(bids[i].tick_offset);
-                assert!(tick_diff >= 3,
-                    "Levels should be at least 3 ticks apart, got {}", tick_diff);
+                assert!(
+                    tick_diff >= 3,
+                    "Levels should be at least 3 ticks apart, got {}",
+                    tick_diff
+                );
             }
         }
     }
@@ -407,8 +441,18 @@ mod tests {
     #[test]
     fn test_score_ticks_positive_utility_at_depth() {
         let mut levels = vec![
-            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: 0.0 },
-            TickLevel { price: 29.55, depth_bps: 27.0, tick_offset: 800, utility: 0.0 },
+            TickLevel {
+                price: 29.60,
+                depth_bps: 10.0,
+                tick_offset: 300,
+                utility: 0.0,
+            },
+            TickLevel {
+                price: 29.55,
+                depth_bps: 27.0,
+                tick_offset: 800,
+                utility: 0.0,
+            },
         ];
         let params = TickScoringParams {
             sigma: 0.0003,
@@ -421,20 +465,46 @@ mod tests {
         score_ticks(&mut levels, &params);
 
         // Both should have positive utility at reasonable depth
-        assert!(levels[0].utility > 0.0,
-            "10 bps depth should have positive utility: {}", levels[0].utility);
+        assert!(
+            levels[0].utility > 0.0,
+            "10 bps depth should have positive utility: {}",
+            levels[0].utility
+        );
         // Deeper level should have lower fill prob but higher edge
-        assert!(levels[1].utility > 0.0 || levels[1].utility <= levels[0].utility,
-            "27 bps level utility={}", levels[1].utility);
+        assert!(
+            levels[1].utility > 0.0 || levels[1].utility <= levels[0].utility,
+            "27 bps level utility={}",
+            levels[1].utility
+        );
     }
 
     #[test]
     fn test_select_optimal_ticks_filters_negative() {
         let levels = vec![
-            TickLevel { price: 29.62, depth_bps: 3.0, tick_offset: 100, utility: -0.5 },
-            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: 2.5 },
-            TickLevel { price: 29.58, depth_bps: 17.0, tick_offset: 500, utility: 1.8 },
-            TickLevel { price: 29.55, depth_bps: 27.0, tick_offset: 800, utility: 0.3 },
+            TickLevel {
+                price: 29.62,
+                depth_bps: 3.0,
+                tick_offset: 100,
+                utility: -0.5,
+            },
+            TickLevel {
+                price: 29.60,
+                depth_bps: 10.0,
+                tick_offset: 300,
+                utility: 2.5,
+            },
+            TickLevel {
+                price: 29.58,
+                depth_bps: 17.0,
+                tick_offset: 500,
+                utility: 1.8,
+            },
+            TickLevel {
+                price: 29.55,
+                depth_bps: 27.0,
+                tick_offset: 800,
+                utility: 0.3,
+            },
         ];
 
         let selected = select_optimal_ticks(&levels, 3);
@@ -442,25 +512,46 @@ mod tests {
         // Should exclude the negative-utility level
         assert!(selected.len() <= 3);
         for level in &selected {
-            assert!(level.utility > 0.0, "Selected level should have positive utility");
+            assert!(
+                level.utility > 0.0,
+                "Selected level should have positive utility"
+            );
         }
     }
 
     #[test]
     fn test_select_optimal_ticks_sorted_by_depth() {
         let levels = vec![
-            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: 2.5 },
-            TickLevel { price: 29.55, depth_bps: 27.0, tick_offset: 800, utility: 1.0 },
-            TickLevel { price: 29.58, depth_bps: 17.0, tick_offset: 500, utility: 1.8 },
+            TickLevel {
+                price: 29.60,
+                depth_bps: 10.0,
+                tick_offset: 300,
+                utility: 2.5,
+            },
+            TickLevel {
+                price: 29.55,
+                depth_bps: 27.0,
+                tick_offset: 800,
+                utility: 1.0,
+            },
+            TickLevel {
+                price: 29.58,
+                depth_bps: 17.0,
+                tick_offset: 500,
+                utility: 1.8,
+            },
         ];
 
         let selected = select_optimal_ticks(&levels, 3);
 
         // Should be sorted by depth ascending
         for i in 1..selected.len() {
-            assert!(selected[i].depth_bps >= selected[i - 1].depth_bps,
+            assert!(
+                selected[i].depth_bps >= selected[i - 1].depth_bps,
                 "Should be sorted by depth: {}bps >= {}bps",
-                selected[i].depth_bps, selected[i - 1].depth_bps);
+                selected[i].depth_bps,
+                selected[i - 1].depth_bps
+            );
         }
     }
 
@@ -468,8 +559,18 @@ mod tests {
     fn test_select_includes_touch_fallback() {
         // All negative utility — should still include touch as fallback
         let levels = vec![
-            TickLevel { price: 29.62, depth_bps: 3.0, tick_offset: 100, utility: -0.5 },
-            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: -1.0 },
+            TickLevel {
+                price: 29.62,
+                depth_bps: 3.0,
+                tick_offset: 100,
+                utility: -0.5,
+            },
+            TickLevel {
+                price: 29.60,
+                depth_bps: 10.0,
+                tick_offset: 300,
+                utility: -1.0,
+            },
         ];
 
         let selected = select_optimal_ticks(&levels, 5);
@@ -489,13 +590,12 @@ mod tests {
         // End-to-end: $100 capital on HYPE at $29.63, 10x leverage
         // After WS0 fix: max_position ≈ 16.87, should produce 8+ levels
         let cfg = TickGridConfig::compute(
-            29.63,
-            0.0001,  // 4-decimal tick
-            8.0,     // touch at 8 bps
-            50.0,    // max depth 50 bps
-            15,      // up to 15 levels
-            2,       // sz_decimals
-            1.0,     // min 1 tick spacing
+            29.63, 0.0001, // 4-decimal tick
+            8.0,    // touch at 8 bps
+            50.0,   // max depth 50 bps
+            15,     // up to 15 levels
+            2,      // sz_decimals
+            1.0,    // min 1 tick spacing
         );
 
         let mut bids = enumerate_bid_ticks(&cfg);
@@ -516,19 +616,31 @@ mod tests {
         let selected_asks = select_optimal_ticks(&asks, 10);
 
         // Should have multiple distinct levels on each side
-        assert!(selected_bids.len() >= 3,
-            "Should have >=3 bid levels, got {}", selected_bids.len());
-        assert!(selected_asks.len() >= 3,
-            "Should have >=3 ask levels, got {}", selected_asks.len());
+        assert!(
+            selected_bids.len() >= 3,
+            "Should have >=3 bid levels, got {}",
+            selected_bids.len()
+        );
+        assert!(
+            selected_asks.len() >= 3,
+            "Should have >=3 ask levels, got {}",
+            selected_asks.len()
+        );
 
         // Verify all prices are unique
         for i in 1..selected_bids.len() {
-            assert_ne!(selected_bids[i].price, selected_bids[i - 1].price,
-                "Bid prices must be unique");
+            assert_ne!(
+                selected_bids[i].price,
+                selected_bids[i - 1].price,
+                "Bid prices must be unique"
+            );
         }
         for i in 1..selected_asks.len() {
-            assert_ne!(selected_asks[i].price, selected_asks[i - 1].price,
-                "Ask prices must be unique");
+            assert_ne!(
+                selected_asks[i].price,
+                selected_asks[i - 1].price,
+                "Ask prices must be unique"
+            );
         }
     }
 
@@ -536,13 +648,10 @@ mod tests {
     fn test_btc_tick_grid() {
         // BTC at $100k, tick_size=0.1 (1 decimal), sz_decimals=5
         let cfg = TickGridConfig::compute(
-            100_000.0,
-            0.1,     // $0.10 ticks
-            5.0,     // touch at 5 bps = $5
-            30.0,    // max depth 30 bps = $30
-            8,
-            5,
-            1.0,
+            100_000.0, 0.1,  // $0.10 ticks
+            5.0,  // touch at 5 bps = $5
+            30.0, // max depth 30 bps = $30
+            8, 5, 1.0,
         );
 
         let bids = enumerate_bid_ticks(&cfg);
@@ -568,10 +677,30 @@ mod tests {
         // - Intermediate depths → AS decays but fill prob still reasonable → higher SC/AS
         // - Deep levels → fill prob drops → tapers
         let mut levels = vec![
-            TickLevel { price: 29.62, depth_bps: 3.0, tick_offset: 90, utility: 0.0 },   // Near touch: high AS
-            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: 0.0 },  // Intermediate
-            TickLevel { price: 29.57, depth_bps: 20.0, tick_offset: 600, utility: 0.0 },  // Intermediate-deep
-            TickLevel { price: 29.55, depth_bps: 27.0, tick_offset: 800, utility: 0.0 },  // Deep
+            TickLevel {
+                price: 29.62,
+                depth_bps: 3.0,
+                tick_offset: 90,
+                utility: 0.0,
+            }, // Near touch: high AS
+            TickLevel {
+                price: 29.60,
+                depth_bps: 10.0,
+                tick_offset: 300,
+                utility: 0.0,
+            }, // Intermediate
+            TickLevel {
+                price: 29.57,
+                depth_bps: 20.0,
+                tick_offset: 600,
+                utility: 0.0,
+            }, // Intermediate-deep
+            TickLevel {
+                price: 29.55,
+                depth_bps: 27.0,
+                tick_offset: 800,
+                utility: 0.0,
+            }, // Deep
         ];
         let params = TickScoringParams {
             sigma: 0.0003,
@@ -585,24 +714,40 @@ mod tests {
 
         // All should have positive utility
         for level in &levels {
-            assert!(level.utility > 0.0,
+            assert!(
+                level.utility > 0.0,
                 "Level at {:.1} bps should have positive SC/AS utility: {}",
-                level.depth_bps, level.utility);
+                level.depth_bps,
+                level.utility
+            );
         }
 
         // Touch (3 bps) should have lower utility than the intermediate level (10 bps)
         // because at touch, AS is high relative to spread capture
-        assert!(levels[0].utility < levels[1].utility,
+        assert!(
+            levels[0].utility < levels[1].utility,
             "Touch ({:.4}) should have lower SC/AS utility than 10bps ({:.4})",
-            levels[0].utility, levels[1].utility);
+            levels[0].utility,
+            levels[1].utility
+        );
     }
 
     #[test]
     fn test_sc_as_ratio_vs_legacy_ordering() {
         // With SC/AS ratio, touch should be penalized more than in legacy mode
         let mut levels_ratio = vec![
-            TickLevel { price: 29.62, depth_bps: 3.0, tick_offset: 90, utility: 0.0 },
-            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: 0.0 },
+            TickLevel {
+                price: 29.62,
+                depth_bps: 3.0,
+                tick_offset: 90,
+                utility: 0.0,
+            },
+            TickLevel {
+                price: 29.60,
+                depth_bps: 10.0,
+                tick_offset: 300,
+                utility: 0.0,
+            },
         ];
         let mut levels_legacy = levels_ratio.clone();
 
@@ -628,22 +773,27 @@ mod tests {
         let legacy_touch_to_mid = levels_legacy[0].utility / levels_legacy[1].utility;
         assert!(legacy_touch_to_mid > 0.0 && legacy_touch_to_mid < 1.0);
 
-        assert!(ratio_touch_to_mid > 0.0 && ratio_touch_to_mid < 1.0,
+        assert!(
+            ratio_touch_to_mid > 0.0 && ratio_touch_to_mid < 1.0,
             "SC/AS ratio ({:.4}) should penalize touch relative to intermediate level",
-            ratio_touch_to_mid);
+            ratio_touch_to_mid
+        );
     }
 
     #[test]
     fn test_sc_as_spread_floor_vol() {
         // When depth barely exceeds AS + fee, the volatility floor should prevent
         // utility from being zero/negative
-        let mut levels = vec![
-            TickLevel { price: 29.62, depth_bps: 4.0, tick_offset: 120, utility: 0.0 },
-        ];
+        let mut levels = vec![TickLevel {
+            price: 29.62,
+            depth_bps: 4.0,
+            tick_offset: 120,
+            utility: 0.0,
+        }];
         // AS=3 bps at touch, fee=1.5 bps → edge = 4.0 - 3.0 - 1.5 = -0.5 (negative)
         // But spread_floor_vol should provide a positive floor
         let params = TickScoringParams {
-            sigma: 0.001,  // Higher vol → larger floor
+            sigma: 0.001, // Higher vol → larger floor
             tau: 10.0,
             as_at_touch_bps: 3.0,
             as_decay_bps: 10.0,
@@ -655,8 +805,11 @@ mod tests {
         // sigma_bps = 0.001 * 10000 = 10 bps
         // spread_floor_vol = 10 * sqrt(10 / (2*PI)) = 10 * 1.262 = 12.62 bps
         // The floor should make utility positive even when raw SC is negative
-        assert!(levels[0].utility > 0.0,
-            "Vol floor should make utility positive: {}", levels[0].utility);
+        assert!(
+            levels[0].utility > 0.0,
+            "Vol floor should make utility positive: {}",
+            levels[0].utility
+        );
     }
 
     #[test]
@@ -670,7 +823,9 @@ mod tests {
             "fee_bps": 1.5
         }"#;
         let params: TickScoringParams = serde_json::from_str(json).unwrap();
-        assert!(params.use_sc_as_ratio,
-            "use_sc_as_ratio should default to true when not specified");
+        assert!(
+            params.use_sc_as_ratio,
+            "use_sc_as_ratio should default to true when not specified"
+        );
     }
 }

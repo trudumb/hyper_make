@@ -32,6 +32,7 @@ pub mod binance_flow;
 pub mod bocpd_kappa;
 mod book_kappa;
 mod calibration_controller;
+pub mod calibration_coordinator;
 mod covariance;
 pub mod covariance_tracker;
 pub mod cross_venue;
@@ -46,8 +47,8 @@ mod kappa;
 mod kappa_orchestrator;
 pub mod lag_analysis;
 pub mod latent_filter;
+pub mod market_profile;
 mod microprice;
-pub mod threshold_kappa;
 mod mock;
 mod momentum;
 pub mod mutual_info;
@@ -55,18 +56,17 @@ mod parameter_estimator;
 pub mod regime_hmm;
 pub mod regime_kappa;
 mod robust_kappa;
+pub mod self_impact;
 mod soft_jump;
 pub mod temporal;
+pub mod threshold_kappa;
 pub(crate) mod tick_ewma;
+pub mod trade_flow_tracker;
 mod trend_persistence;
 mod volatility;
 pub mod volatility_filter;
 mod volume;
-pub mod self_impact;
-pub mod trade_flow_tracker;
 pub mod vpin;
-pub mod market_profile;
-pub mod calibration_coordinator;
 
 // V2 re-exports (will be used when integrated)
 #[allow(unused_imports)]
@@ -92,15 +92,15 @@ pub use calibration_controller::{CalibrationController, CalibrationControllerCon
 pub use directional_risk::{
     DirectionalRiskConfig, DirectionalRiskEstimator, DirectionalRiskOutput,
 };
-pub use fill_rate_model::{
-    FillObservation, FillRateConfig, FillRateModel, FillRateStatistics,
-    MarketState as FillRateMarketState,
-};
 pub use enhanced_flow::{
     BookLevel, BuyPressureTracker, CumulativeOFI, CumulativeOFIConfig, EnhancedFlowConfig,
     EnhancedFlowContext, EnhancedFlowEstimator, EnhancedFlowResult, LiquidityEvaporationConfig,
     LiquidityEvaporationDetector, TradeData, TradeSizeDistribution, TradeSizeDistributionConfig,
     TradeSizeStats,
+};
+pub use fill_rate_model::{
+    FillObservation, FillRateConfig, FillRateModel, FillRateStatistics,
+    MarketState as FillRateMarketState,
 };
 pub use informed_flow::{
     ComponentParams, FlowDecomposition, InformedFlowConfig, InformedFlowEstimator, TradeFeatures,
@@ -133,8 +133,8 @@ pub use temporal::{
 
 // Lag analysis for cross-exchange signals
 pub use lag_analysis::{
-    CusumDetector, LagAnalyzer, LagAnalyzerConfig, LagDecayTracker,
-    LeadLagStabilityDiagnostics, LeadLagStabilityGate, TimestampRange,
+    CusumDetector, LagAnalyzer, LagAnalyzerConfig, LagDecayTracker, LeadLagStabilityDiagnostics,
+    LeadLagStabilityGate, TimestampRange,
 };
 
 // HMM-based regime detection
@@ -164,7 +164,9 @@ pub use binance_flow::{BinanceFlowAnalyzer, BinanceFlowConfig, FlowFeatureVec};
 pub use trade_flow_tracker::TradeFlowTracker;
 
 // Cross-venue analysis (joint Binance + Hyperliquid signals)
-pub use cross_venue::{CrossVenueAnalyzer, CrossVenueConfig, CrossVenueFeatures, BivariateFlowObservation};
+pub use cross_venue::{
+    BivariateFlowObservation, CrossVenueAnalyzer, CrossVenueConfig, CrossVenueFeatures,
+};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability

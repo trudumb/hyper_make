@@ -5,9 +5,9 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use super::attribution::SignalPnLAttributor;
-use super::edge_metrics::EdgeSnapshot;
 #[cfg(test)]
 use super::edge_metrics::EdgePhase;
+use super::edge_metrics::EdgeSnapshot;
 use super::sharpe::{EquityCurveSummary, SharpeSummary};
 use super::CycleContributions;
 
@@ -35,10 +35,7 @@ impl AnalyticsLogger {
 
         let open_append = |name: &str| -> std::io::Result<BufWriter<File>> {
             let path = dir.join(name);
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
             Ok(BufWriter::new(file))
         };
 
@@ -95,7 +92,10 @@ impl AnalyticsLogger {
     }
 
     /// Log a per-fill gamma calibration record for offline regression.
-    pub fn log_gamma_calibration(&mut self, record: &GammaCalibrationRecord) -> std::io::Result<()> {
+    pub fn log_gamma_calibration(
+        &mut self,
+        record: &GammaCalibrationRecord,
+    ) -> std::io::Result<()> {
         let json = serde_json::to_string(record)?;
         writeln!(self.gamma_calibration_writer, "{json}")
     }

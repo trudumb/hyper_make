@@ -94,7 +94,7 @@ impl AdaptiveHazard {
             self.base_hazard * multiplier
         }
     }
-    
+
     /// Reset the observation tracker (e.g., when changepoint is confirmed)
     pub fn on_changepoint_confirmed(&mut self) {
         self.last_observation = None;
@@ -218,7 +218,11 @@ impl RunStatistics {
             // Use prior-based Student-t (same distributional family as r>0).
             // A flat constant (0.1) for r=0 creates structural bias: r=0 gets 0.1
             // while r>0 gets ~0.01 for noisy data, causing spurious changepoints.
-            let prior_mean = if prior.n > 0.0 { prior.sum / prior.n } else { 0.0 };
+            let prior_mean = if prior.n > 0.0 {
+                prior.sum / prior.n
+            } else {
+                0.0
+            };
             let prior_var = if prior.n > 0.0 {
                 (prior.sum_sq / prior.n - prior_mean * prior_mean).max(1e-10)
             } else {
@@ -536,12 +540,13 @@ impl ChangepointDetector {
         // early observations. The damping factor ramps linearly from 0→1 over
         // warmup_observations, so early cycles have near-zero effective cp_prob.
         let raw_cp_prob = self.changepoint_probability(5);
-        let damped_cp_prob = if self.warmup_observations > 0 && self.observation_count < self.warmup_observations {
-            let warmup_frac = self.observation_count as f64 / self.warmup_observations as f64;
-            raw_cp_prob * warmup_frac
-        } else {
-            raw_cp_prob
-        };
+        let damped_cp_prob =
+            if self.warmup_observations > 0 && self.observation_count < self.warmup_observations {
+                let warmup_frac = self.observation_count as f64 / self.warmup_observations as f64;
+                raw_cp_prob * warmup_frac
+            } else {
+                raw_cp_prob
+            };
         let threshold = self.effective_threshold();
         if damped_cp_prob > threshold {
             self.consecutive_high_prob += 1;
@@ -920,7 +925,7 @@ mod tests {
     #[test]
     fn test_adaptive_hazard_cadence() {
         let mut hazard = AdaptiveHazard::new(0.01, 1.0, 5.0);
-        
+
         // Initial call sets observation and returns base
         assert_eq!(hazard.current_hazard(), 0.01);
 
@@ -933,11 +938,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(3000));
         let cur = hazard.current_hazard();
         assert!(cur > 0.02 && cur < 0.04);
-        
+
         // Extreme cadence (> force extreme)
         std::thread::sleep(std::time::Duration::from_millis(5500));
         assert_eq!(hazard.current_hazard(), 0.05); // 0.01 * 5.0
-        
+
         // Reset
         hazard.on_changepoint_confirmed();
         assert_eq!(hazard.current_hazard(), 0.01);

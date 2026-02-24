@@ -53,9 +53,8 @@ use hyperliquid_rust_sdk::market_maker::regime_hmm::{Observation as RegimeObserv
 
 // Import lead-lag infrastructure
 use hyperliquid_rust_sdk::market_maker::{
-    BinanceFeed, BinanceFlowConfig, BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate,
-    FlowFeatureVec, LagAnalyzerConfig, SignalIntegrator, SignalIntegratorConfig,
-    resolve_binance_symbol,
+    resolve_binance_symbol, BinanceFeed, BinanceFlowConfig, BinancePriceUpdate, BinanceTradeUpdate,
+    BinanceUpdate, FlowFeatureVec, LagAnalyzerConfig, SignalIntegrator, SignalIntegratorConfig,
 };
 
 // Import logging infrastructure
@@ -210,13 +209,13 @@ impl ValidatorPredictionType {
 
     pub fn markout_ms(&self) -> u64 {
         match self {
-            ValidatorPredictionType::InformedFlow => 1000,      // 1s
-            ValidatorPredictionType::PreFillToxicity => 1000,   // 1s
-            ValidatorPredictionType::EnhancedToxicity => 1000,  // 1s
-            ValidatorPredictionType::RegimeHighVol => 30000,    // 30s
-            ValidatorPredictionType::Momentum => 5000,          // 5s
-            ValidatorPredictionType::BuyPressure => 0,          // Next trade (special case)
-            ValidatorPredictionType::LeadLag => 500,            // 500ms - typical lead-lag window
+            ValidatorPredictionType::InformedFlow => 1000,    // 1s
+            ValidatorPredictionType::PreFillToxicity => 1000, // 1s
+            ValidatorPredictionType::EnhancedToxicity => 1000, // 1s
+            ValidatorPredictionType::RegimeHighVol => 30000,  // 30s
+            ValidatorPredictionType::Momentum => 5000,        // 5s
+            ValidatorPredictionType::BuyPressure => 0,        // Next trade (special case)
+            ValidatorPredictionType::LeadLag => 500,          // 500ms - typical lead-lag window
             // Cross-venue: 1s markout to measure prediction quality
             ValidatorPredictionType::CrossVenueAgreement => 1000,
             ValidatorPredictionType::CrossVenueToxicity => 1000,
@@ -340,7 +339,7 @@ impl ModelTracker {
     pub fn update(&mut self, predicted: f64, outcome: bool, regime: usize) {
         self.brier.update(predicted, outcome);
         self.ir.update(predicted, outcome);
-        
+
         let regime_idx = regime.min(3);
         self.by_regime[regime_idx].update(predicted, outcome);
     }
@@ -480,15 +479,15 @@ impl ObservationBuffers {
         if self.mids.len() < 2 {
             return 0.0;
         }
-        
+
         let recent: Vec<_> = self.mids.iter().rev().take(window.max(2)).collect();
         if recent.len() < 2 {
             return 0.0;
         }
-        
+
         let latest = recent[0].1;
         let oldest = recent[recent.len() - 1].1;
-        
+
         if oldest > 0.0 {
             (latest - oldest) / oldest * 10_000.0 // Return in bps
         } else {
@@ -501,10 +500,10 @@ impl ObservationBuffers {
         if self.trades.is_empty() {
             return 0.5;
         }
-        
+
         let recent: Vec<_> = self.trades.iter().rev().take(window).collect();
         let buys = recent.iter().filter(|t| t.is_buy).count();
-        
+
         buys as f64 / recent.len() as f64
     }
 
@@ -518,10 +517,10 @@ impl ObservationBuffers {
         }
 
         let recent: Vec<_> = self.trades.iter().rev().take(window).collect();
-        
+
         let mut buy_volume = 0.0;
         let mut total_volume = 0.0;
-        
+
         for trade in &recent {
             total_volume += trade.size;
             if trade.is_buy {
@@ -546,7 +545,7 @@ impl ObservationBuffers {
         }
 
         let recent: Vec<_> = self.trades.iter().rev().take(window).collect();
-        
+
         // Volume-weighted ratio
         let vw_ratio = self.buy_ratio_volume_weighted(window);
 
@@ -650,7 +649,10 @@ impl ObservationBuffers {
     /// Compute trade intensity (trades per second) in a window.
     fn intensity_in_window(&self, now_ms: u64, window_ms: u64) -> f64 {
         let cutoff = now_ms.saturating_sub(window_ms);
-        let count = self.trades.iter().rev()
+        let count = self
+            .trades
+            .iter()
+            .rev()
             .take_while(|t| t.timestamp_ms >= cutoff)
             .count();
 
@@ -674,8 +676,16 @@ impl ObservationBuffers {
             }
         }
 
-        let avg_buy = if buy_count > 0 { buy_sum / buy_count as f64 } else { 0.0 };
-        let avg_sell = if sell_count > 0 { sell_sum / sell_count as f64 } else { 0.0 };
+        let avg_buy = if buy_count > 0 {
+            buy_sum / buy_count as f64
+        } else {
+            0.0
+        };
+        let avg_sell = if sell_count > 0 {
+            sell_sum / sell_count as f64
+        } else {
+            0.0
+        };
 
         (avg_buy, avg_sell)
     }
@@ -713,7 +723,7 @@ impl ValidatorStats {
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0)
     }
-    
+
     pub fn uptime_formatted(&self) -> String {
         let secs = self.uptime_secs() as u64;
         let hours = secs / 3600;
@@ -835,10 +845,10 @@ impl PredictionValidator {
         // KEY: Buckets must be large enough to contain multiple trades for meaningful
         // imbalance. Adaptive sizing will adjust based on actual volume rate.
         let initial_bucket_volume = match asset.to_uppercase().as_str() {
-            "BTC" => 1.0,            // BTC: ~$100k/bucket, ~20-60 trades per bucket
-            "ETH" => 5.0,            // ETH: similar trade density per bucket
-            "SOL" | "AVAX" | "MATIC" | "ARB" | "OP" => 2.0,  // Mid-cap
-            _ => 0.5,  // Small-cap - adaptive will adjust
+            "BTC" => 1.0, // BTC: ~$100k/bucket, ~20-60 trades per bucket
+            "ETH" => 5.0, // ETH: similar trade density per bucket
+            "SOL" | "AVAX" | "MATIC" | "ARB" | "OP" => 2.0, // Mid-cap
+            _ => 0.5,     // Small-cap - adaptive will adjust
         };
 
         // Use adaptive VPIN configuration - the principled approach
@@ -943,7 +953,8 @@ impl PredictionValidator {
             if last_price > 0.0 {
                 let ret = (price / last_price).ln();
                 let dt = if self.last_trade_time_ms > 0 {
-                    (timestamp_ms.saturating_sub(self.last_trade_time_ms) as f64 / 1000.0).max(0.001)
+                    (timestamp_ms.saturating_sub(self.last_trade_time_ms) as f64 / 1000.0)
+                        .max(0.001)
                 } else {
                     1.0
                 };
@@ -976,7 +987,8 @@ impl PredictionValidator {
 
         // Update pre-fill classifier with trade flow
         let buy_ratio = self.buffers.buy_ratio(20);
-        self.pre_fill_classifier.update_trade_flow(buy_ratio, 1.0 - buy_ratio);
+        self.pre_fill_classifier
+            .update_trade_flow(buy_ratio, 1.0 - buy_ratio);
 
         // Update enhanced microstructure classifier
         self.enhanced_classifier.on_trade(MicroTradeObs {
@@ -1077,10 +1089,17 @@ impl PredictionValidator {
         self.stats.last_spread_bps = Some(spread_bps);
 
         // Update pre-fill classifier
-        self.pre_fill_classifier.update_orderbook(bid_depth, ask_depth);
+        self.pre_fill_classifier
+            .update_orderbook(bid_depth, ask_depth);
 
         // Update enhanced microstructure classifier
-        self.enhanced_classifier.on_book_update(best_bid, best_ask, bid_depth, ask_depth, timestamp_ms);
+        self.enhanced_classifier.on_book_update(
+            best_bid,
+            best_ask,
+            bid_depth,
+            ask_depth,
+            timestamp_ms,
+        );
 
         // Update regime HMM
         // CRITICAL: RegimeObservation expects volatility in FRACTIONAL units (e.g., 0.0031 for 31 bps)
@@ -1119,7 +1138,7 @@ impl PredictionValidator {
     ) -> Option<SyntheticFill> {
         let book = self.buffers.books.back()?;
         let spread_bps = self.stats.last_spread_bps?;
-        
+
         // Compute theoretical quotes based on current mid and typical spread
         let theoretical_half_spread_bps = spread_bps / 2.0 + 1.5; // +1.5 bps for maker rebate
         let mid = book.mid;
@@ -1171,7 +1190,9 @@ impl PredictionValidator {
             fill_side: Some(fill.side),
             reference_price: mid,
             timestamp_ms,
-            markout_ms: self.markout_ms.max(ValidatorPredictionType::InformedFlow.markout_ms()),
+            markout_ms: self
+                .markout_ms
+                .max(ValidatorPredictionType::InformedFlow.markout_ms()),
             regime,
         });
 
@@ -1179,7 +1200,8 @@ impl PredictionValidator {
         // Pipe blended toxicity from IntegratedSignals (includes VPIN when valid)
         if let Some(ref integrator) = self.signal_integrator {
             let signals = integrator.get_signals();
-            self.pre_fill_classifier.set_blended_toxicity(signals.toxicity_score);
+            self.pre_fill_classifier
+                .set_blended_toxicity(signals.toxicity_score);
         }
         let p_toxic = match fill.side {
             Side::Bid => self.pre_fill_classifier.predict_toxicity(true),
@@ -1191,7 +1213,9 @@ impl PredictionValidator {
             fill_side: Some(fill.side),
             reference_price: mid,
             timestamp_ms,
-            markout_ms: self.markout_ms.max(ValidatorPredictionType::PreFillToxicity.markout_ms()),
+            markout_ms: self
+                .markout_ms
+                .max(ValidatorPredictionType::PreFillToxicity.markout_ms()),
             regime,
         });
 
@@ -1206,15 +1230,17 @@ impl PredictionValidator {
             fill_side: Some(fill.side),
             reference_price: mid,
             timestamp_ms,
-            markout_ms: self.markout_ms.max(ValidatorPredictionType::EnhancedToxicity.markout_ms()),
+            markout_ms: self
+                .markout_ms
+                .max(ValidatorPredictionType::EnhancedToxicity.markout_ms()),
             regime,
         });
 
         // 4. RegimeHighVol prediction
         let regime_probs = self.regime_hmm.regime_probabilities();
         // P(high vol) = P(volatile) + P(cascade) - assuming regime indices 2 and 3 are volatile/extreme
-        let p_high_vol = regime_probs.get(2).copied().unwrap_or(0.0) 
-                       + regime_probs.get(3).copied().unwrap_or(0.0);
+        let p_high_vol = regime_probs.get(2).copied().unwrap_or(0.0)
+            + regime_probs.get(3).copied().unwrap_or(0.0);
         self.record_pending_outcome(PendingOutcomeInput {
             prediction_type: ValidatorPredictionType::RegimeHighVol,
             predicted_prob: p_high_vol,
@@ -1232,7 +1258,11 @@ impl PredictionValidator {
         self.record_pending_outcome(PendingOutcomeInput {
             prediction_type: ValidatorPredictionType::Momentum,
             predicted_prob: p_continues,
-            fill_side: if momentum_bps >= 0.0 { Some(Side::Ask) } else { Some(Side::Bid) },
+            fill_side: if momentum_bps >= 0.0 {
+                Some(Side::Ask)
+            } else {
+                Some(Side::Bid)
+            },
             reference_price: mid,
             timestamp_ms,
             markout_ms: ValidatorPredictionType::Momentum.markout_ms(),
@@ -1338,11 +1368,12 @@ impl PredictionValidator {
     fn resolve_buy_pressure_predictions(&mut self, trade_is_buy: bool, now_ms: u64) {
         // Find and resolve BuyPressure predictions
         let mut to_resolve = Vec::new();
-        
+
         for (idx, pending) in self.pending_outcomes.iter().enumerate() {
-            if pending.prediction_type == ValidatorPredictionType::BuyPressure 
-               && pending.markout_ms == 0 
-               && now_ms > pending.timestamp_ms {
+            if pending.prediction_type == ValidatorPredictionType::BuyPressure
+                && pending.markout_ms == 0
+                && now_ms > pending.timestamp_ms
+            {
                 to_resolve.push((idx, pending.predicted_prob, pending.regime));
             }
         }
@@ -1350,10 +1381,10 @@ impl PredictionValidator {
         // Process in reverse order to maintain indices
         for (idx, predicted_prob, regime) in to_resolve.into_iter().rev() {
             self.pending_outcomes.remove(idx);
-            
+
             // Outcome: was next trade a buy?
             let outcome = trade_is_buy;
-            
+
             if let Some(tracker) = self.trackers.get_mut(&ValidatorPredictionType::BuyPressure) {
                 tracker.update(predicted_prob, outcome, regime);
             }
@@ -1382,7 +1413,7 @@ impl PredictionValidator {
             }
 
             let pending = self.pending_outcomes.pop_front().unwrap();
-            
+
             // Calculate price movement using mid price (not trade price)
             // This avoids bid-ask bounce bias in outcome measurement
             let price_move_bps = if pending.reference_price > 0.0 {
@@ -1514,15 +1545,19 @@ impl PredictionValidator {
     pub fn print_report(&self) {
         println!();
         println!("┌─────────────────────────────────────────────────────────────────┐");
-        println!("│             PREDICTION VALIDATOR - {:<10}                   │", self.asset);
-        println!("│             Runtime: {} | Samples: {:>7}                   │",
+        println!(
+            "│             PREDICTION VALIDATOR - {:<10}                   │",
+            self.asset
+        );
+        println!(
+            "│             Runtime: {} | Samples: {:>7}                   │",
             self.stats.uptime_formatted(),
             self.stats.predictions_resolved
         );
         if !self.is_warmed_up() {
-            println!("│  ⏳ WARMUP: {}/{} observations (predictions not recorded)   │",
-                self.total_observations,
-                self.warmup_samples
+            println!(
+                "│  ⏳ WARMUP: {}/{} observations (predictions not recorded)   │",
+                self.total_observations, self.warmup_samples
             );
         }
         println!("├─────────────────────────────────────────────────────────────────┤");
@@ -1565,7 +1600,7 @@ impl PredictionValidator {
 
     fn print_regime_breakdown(&self) {
         let regime_names = ["Calm", "Normal", "Volatile", "Cascade"];
-        
+
         println!("├─────────────────────────────────────────────────────────────────┤");
         println!("│  BY REGIME:                                                     │");
         println!("│                                                                 │");
@@ -1603,12 +1638,7 @@ impl PredictionValidator {
             };
             println!(
                 "│  {:8} (n={:>5})    │ Brier: {:.3}  IR: {:.2}  {} {:20} │",
-                regime_names[i],
-                regime_n[i],
-                regime_brier[i],
-                regime_ir[i],
-                indicator,
-                note
+                regime_names[i], regime_n[i], regime_brier[i], regime_ir[i], indicator, note
             );
         }
 
@@ -1655,7 +1685,11 @@ impl PredictionValidator {
 
                     // Check for bin concentration (>80% in one bin is suspicious)
                     let max_bin = *bin_counts.iter().max().unwrap_or(&0);
-                    let concentration = if n > 0 { max_bin as f64 / n as f64 } else { 0.0 };
+                    let concentration = if n > 0 {
+                        max_bin as f64 / n as f64
+                    } else {
+                        0.0
+                    };
 
                     let warning = if n < 500 {
                         " ⚠️ <500 samples"
@@ -1665,7 +1699,8 @@ impl PredictionValidator {
                         ""
                     };
 
-                    println!("  {:16} base={:.3} res={:.4} unc={:.4} conc={:.0}%{}",
+                    println!(
+                        "  {:16} base={:.3} res={:.4} unc={:.4} conc={:.0}%{}",
                         pred_type.name(),
                         base_rate,
                         resolution,
@@ -1685,21 +1720,35 @@ impl PredictionValidator {
             &learning_diag.default_weights
         };
         println!();
-        println!("PreFill Learning: {}/{} samples | weights: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}]{}",
+        println!(
+            "PreFill Learning: {}/{} samples | weights: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}]{}",
             learning_diag.samples,
             learning_diag.min_samples,
-            weights[0], weights[1], weights[2], weights[3], weights[4],
-            if learning_diag.is_using_learned { " (LEARNED)" } else { " (default)" }
+            weights[0],
+            weights[1],
+            weights[2],
+            weights[3],
+            weights[4],
+            if learning_diag.is_using_learned {
+                " (LEARNED)"
+            } else {
+                " (default)"
+            }
         );
 
         // Print EnhancedASClassifier diagnostics
         let enhanced_diag = self.enhanced_classifier.diagnostics();
-        println!("Enhanced Learning: {}/{} samples | acc={:.1}% | top features: {}{}",
+        println!(
+            "Enhanced Learning: {}/{} samples | acc={:.1}% | top features: {}{}",
             enhanced_diag.learning_samples,
             500,
             enhanced_diag.accuracy * 100.0,
             enhanced_diag.feature_summary(),
-            if enhanced_diag.is_using_learned { " (LEARNED)" } else { " (default)" }
+            if enhanced_diag.is_using_learned {
+                " (LEARNED)"
+            } else {
+                " (default)"
+            }
         );
 
         // Print lead-lag diagnostics if enabled
@@ -1708,7 +1757,8 @@ impl PredictionValidator {
             let status = integrator.lag_analyzer_status();
             let ((sig_first, sig_last), (tgt_first, tgt_last)) = status.sample_timestamps;
             println!();
-            println!("LeadLag: ready={} | signal_obs={} target_obs={} | lag={:?}ms mi={:.3?}",
+            println!(
+                "LeadLag: ready={} | signal_obs={} target_obs={} | lag={:?}ms mi={:.3?}",
                 status.is_ready,
                 status.observation_counts.0,
                 status.observation_counts.1,
@@ -1716,16 +1766,26 @@ impl PredictionValidator {
                 status.mi_bits,
             );
             println!("  timestamps: signal=[{sig_first:?}..{sig_last:?}] target=[{tgt_first:?}..{tgt_last:?}]");
-            if let (Some(sf), Some(sl), Some(tf), Some(tl)) = (sig_first, sig_last, tgt_first, tgt_last) {
+            if let (Some(sf), Some(sl), Some(tf), Some(tl)) =
+                (sig_first, sig_last, tgt_first, tgt_last)
+            {
                 let overlap = sl >= tf && tl >= sf;
-                println!("  overlap={} | signal_range={}ms target_range={}ms gap={}ms",
+                println!(
+                    "  overlap={} | signal_range={}ms target_range={}ms gap={}ms",
                     overlap,
                     sl - sf,
                     tl - tf,
-                    if tf > sl { tf - sl } else if sf > tl { sf - tl } else { 0 },
+                    if tf > sl {
+                        tf - sl
+                    } else if sf > tl {
+                        sf - tl
+                    } else {
+                        0
+                    },
                 );
             }
-            println!("  last_signal: actionable={} diff={:.1}bps skew_dir={} skew_mag={:.1}bps",
+            println!(
+                "  last_signal: actionable={} diff={:.1}bps skew_dir={} skew_mag={:.1}bps",
                 status.last_signal.is_actionable,
                 status.last_signal.diff_bps,
                 status.last_signal.skew_direction,
@@ -1734,12 +1794,14 @@ impl PredictionValidator {
 
             // Print cross-venue diagnostics
             if signals.cross_venue_valid {
-                println!("CrossVenue: valid=true | dir={:.2} conf={:.2} agree={:.2}",
+                println!(
+                    "CrossVenue: valid=true | dir={:.2} conf={:.2} agree={:.2}",
                     signals.cross_venue_direction,
                     signals.cross_venue_confidence,
                     signals.cross_venue_agreement,
                 );
-                println!("  toxicity: max={:.2} avg={:.2} | intensity_ratio={:.2} divergence={:.2}",
+                println!(
+                    "  toxicity: max={:.2} avg={:.2} | intensity_ratio={:.2} divergence={:.2}",
                     signals.cross_venue_max_toxicity,
                     signals.cross_venue_avg_toxicity,
                     signals.cross_venue_intensity_ratio,
@@ -1752,49 +1814,57 @@ impl PredictionValidator {
             // === New Signal Integration Diagnostics (post-degenerate-fix) ===
             println!();
             println!("Signal Fix Diagnostics:");
-            println!("  VPIN: value={:.3} velocity={:.3} (blended into toxicity={:.3})",
-                signals.hl_vpin,
-                signals.hl_vpin_velocity,
-                signals.toxicity_score,
+            println!(
+                "  VPIN: value={:.3} velocity={:.3} (blended into toxicity={:.3})",
+                signals.hl_vpin, signals.hl_vpin_velocity, signals.toxicity_score,
             );
-            println!("  BuyPressure: z={:.2} | skew_contribution={:.2}bps",
+            println!(
+                "  BuyPressure: z={:.2} | skew_contribution={:.2}bps",
                 signals.buy_pressure_z,
-                signals.combined_skew_bps - if signals.lead_lag_actionable {
-                    signals.lead_lag_skew_bps * signals.skew_direction as f64
-                } else {
-                    0.0
-                },
+                signals.combined_skew_bps
+                    - if signals.lead_lag_actionable {
+                        signals.lead_lag_skew_bps * signals.skew_direction as f64
+                    } else {
+                        0.0
+                    },
             );
-            println!("  Gating: lead_lag_w={:.2} informed_flow_w={:.2} | model_conf={:.2}",
+            println!(
+                "  Gating: lead_lag_w={:.2} informed_flow_w={:.2} | model_conf={:.2}",
                 signals.lead_lag_gating_weight,
                 signals.informed_flow_gating_weight,
                 signals.model_confidence,
             );
-            println!("  LeadLag MI: significant={} null_p95={:.4}",
-                signals.lead_lag_significant,
-                signals.lead_lag_null_p95,
+            println!(
+                "  LeadLag MI: significant={} null_p95={:.4}",
+                signals.lead_lag_significant, signals.lead_lag_null_p95,
             );
         }
 
         // Print HMM calibration status
         {
             let regime_probs = self.regime_hmm.regime_probabilities();
-            println!("RegimeHMM: calibrated={} recalibrations={} | belief=[{:.2},{:.2},{:.2},{:.2}]",
+            println!(
+                "RegimeHMM: calibrated={} recalibrations={} | belief=[{:.2},{:.2},{:.2},{:.2}]",
                 self.regime_hmm.is_calibrated(),
                 self.regime_hmm.recalibration_count(),
-                regime_probs[0], regime_probs[1], regime_probs[2], regime_probs[3],
+                regime_probs[0],
+                regime_probs[1],
+                regime_probs[2],
+                regime_probs[3],
             );
         }
 
         // Print stats
         println!();
-        println!("Stats: {} trades | {} L2 updates | {} synthetic fills | {} pending",
+        println!(
+            "Stats: {} trades | {} L2 updates | {} synthetic fills | {} pending",
             self.stats.trades_processed,
             self.stats.books_processed,
             self.stats.synthetic_fills,
             self.pending_outcomes.len()
         );
-        println!("Config: threshold={:.1}bps (vol-scaled) | warmup={}/{}",
+        println!(
+            "Config: threshold={:.1}bps (vol-scaled) | warmup={}/{}",
             self.adverse_threshold_bps,
             self.total_observations.min(self.warmup_samples),
             self.warmup_samples
@@ -1809,13 +1879,19 @@ impl PredictionValidator {
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim().to_lowercase();
     if let Some(hours) = s.strip_suffix('h') {
-        let h: u64 = hours.parse().map_err(|_| format!("Invalid hours: {hours}"))?;
+        let h: u64 = hours
+            .parse()
+            .map_err(|_| format!("Invalid hours: {hours}"))?;
         Ok(Duration::from_secs(h * 3600))
     } else if let Some(mins) = s.strip_suffix('m') {
-        let m: u64 = mins.parse().map_err(|_| format!("Invalid minutes: {mins}"))?;
+        let m: u64 = mins
+            .parse()
+            .map_err(|_| format!("Invalid minutes: {mins}"))?;
         Ok(Duration::from_secs(m * 60))
     } else if let Some(secs) = s.strip_suffix('s') {
-        let sec: u64 = secs.parse().map_err(|_| format!("Invalid seconds: {secs}"))?;
+        let sec: u64 = secs
+            .parse()
+            .map_err(|_| format!("Invalid seconds: {secs}"))?;
         Ok(Duration::from_secs(sec))
     } else {
         let sec: u64 = s.parse().map_err(|_| format!("Invalid duration: {s}"))?;
@@ -1833,7 +1909,10 @@ fn get_current_timestamp_ms() -> u64 {
 fn print_startup_banner(asset: &str, network: &str, duration: &Duration, dex: &Option<String>) {
     eprintln!();
     eprintln!("╔═══════════════════════════════════════════════════════════╗");
-    eprintln!("║          Prediction Validator v{}                    ║", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "║          Prediction Validator v{}                    ║",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!("╠═══════════════════════════════════════════════════════════╣");
     eprintln!("║  Asset: {asset:<15}  Network: {network:<17} ║");
     if let Some(d) = dex {
@@ -1947,10 +2026,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HL-native tokens (HYPE, PURR, etc.) will get None and skip the feed.
     let mut binance_receiver: Option<tokio::sync::mpsc::Receiver<BinanceUpdate>> = None;
     if !cli.disable_binance_feed {
-        let binance_symbol = resolve_binance_symbol(
-            &cli.asset,
-            cli.binance_symbol.as_deref(),
-        );
+        let binance_symbol = resolve_binance_symbol(&cli.asset, cli.binance_symbol.as_deref());
         if let Some(ref sym) = binance_symbol {
             let (tx, rx) = tokio::sync::mpsc::channel(1000);
             let feed = BinanceFeed::for_symbol(sym, tx);
@@ -2198,10 +2274,10 @@ mod tests {
         let validator = PredictionValidator::new(
             "BTC".to_string(),
             1000,
-            8.0,  // Updated default threshold
+            8.0, // Updated default threshold
             false,
             30,
-            100,  // warmup_samples
+            100, // warmup_samples
         );
 
         assert_eq!(validator.asset, "BTC");
@@ -2213,17 +2289,17 @@ mod tests {
     #[test]
     fn test_model_tracker_health_status() {
         let mut tracker = ModelTracker::new(ValidatorPredictionType::InformedFlow);
-        
+
         // Warming up
         assert_eq!(tracker.health_status(), "WARMING");
-        
+
         // Add some samples
         for i in 0..100 {
             let predicted = (i as f64) / 100.0;
             let outcome = i % 2 == 0;
             tracker.update(predicted, outcome, 0);
         }
-        
+
         // Should have a status now
         assert_ne!(tracker.health_status(), "WARMING");
     }
@@ -2231,7 +2307,7 @@ mod tests {
     #[test]
     fn test_observation_buffers() {
         let mut buffers = ObservationBuffers::new(100);
-        
+
         // Add trades
         buffers.add_trade(TradeObservation {
             timestamp_ms: 1000,
@@ -2245,9 +2321,9 @@ mod tests {
             size: 1.0,
             is_buy: false,
         });
-        
+
         assert_eq!(buffers.trades.len(), 2);
-        
+
         // Buy ratio should be 0.5
         let ratio = buffers.buy_ratio(10);
         assert!((ratio - 0.5).abs() < 0.01);

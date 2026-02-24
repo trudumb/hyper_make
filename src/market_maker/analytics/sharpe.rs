@@ -104,7 +104,9 @@ impl SharpeTracker {
             let mut sample = Vec::with_capacity(n);
             for _ in 0..n {
                 // Simple LCG PRNG (good enough for bootstrap index selection)
-                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let idx = ((rng_state >> 33) as usize) % n;
                 sample.push(self.returns[idx].clone());
             }
@@ -119,7 +121,11 @@ impl SharpeTracker {
         let lower_idx = ((alpha * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
         let upper_idx = (((1.0 - alpha) * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
 
-        (point, resampled_sharpes[lower_idx], resampled_sharpes[upper_idx])
+        (
+            point,
+            resampled_sharpes[lower_idx],
+            resampled_sharpes[upper_idx],
+        )
     }
 
     /// Whether n_fills is sufficient for meaningful Sharpe estimation.
@@ -357,11 +363,7 @@ impl EquityCurveSharpe {
             sharpe_1h: self.rolling_sharpe(3600),
             max_drawdown_bps: self.max_drawdown_bps(),
             snapshot_count: self.snapshots.len(),
-            latest_equity_usd: self
-                .snapshots
-                .back()
-                .map(|(_, eq)| *eq)
-                .unwrap_or(0.0),
+            latest_equity_usd: self.snapshots.back().map(|(_, eq)| *eq).unwrap_or(0.0),
         }
     }
 
@@ -410,8 +412,11 @@ fn compute_sharpe(returns: &[ReturnObs]) -> f64 {
 
     let n = returns.len() as f64;
     let mean = returns.iter().map(|r| r.ret_bps).sum::<f64>() / n;
-    let variance =
-        returns.iter().map(|r| (r.ret_bps - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let variance = returns
+        .iter()
+        .map(|r| (r.ret_bps - mean).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
     let std = variance.sqrt();
 
     if std < 1e-12 {
@@ -436,8 +441,11 @@ fn std_dev(returns: &[ReturnObs]) -> f64 {
     }
     let n = returns.len() as f64;
     let mean = returns.iter().map(|r| r.ret_bps).sum::<f64>() / n;
-    let variance =
-        returns.iter().map(|r| (r.ret_bps - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let variance = returns
+        .iter()
+        .map(|r| (r.ret_bps - mean).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
     variance.sqrt()
 }
 
@@ -610,7 +618,10 @@ mod tests {
         }
         assert_eq!(ec.snapshot_count(), 10);
         let sharpe = ec.sharpe_ratio();
-        assert!(sharpe > 0.0, "Positive equity growth should give positive Sharpe, got {sharpe}");
+        assert!(
+            sharpe > 0.0,
+            "Positive equity growth should give positive Sharpe, got {sharpe}"
+        );
     }
 
     #[test]
@@ -669,10 +680,7 @@ mod tests {
     fn test_equity_curve_summary() {
         let mut ec = EquityCurveSharpe::with_interval_secs(1, 100);
         for i in 0..20 {
-            ec.maybe_snapshot(
-                (i as u64) * 1_000_000_000,
-                1000.0 + (i as f64) * 2.0,
-            );
+            ec.maybe_snapshot((i as u64) * 1_000_000_000, 1000.0 + (i as f64) * 2.0);
         }
         let summary = ec.summary();
         assert_eq!(summary.snapshot_count, 20);

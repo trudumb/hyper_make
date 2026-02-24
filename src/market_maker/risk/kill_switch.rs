@@ -1400,7 +1400,7 @@ mod tests {
     #[test]
     fn test_drawdown_trigger() {
         let config = KillSwitchConfig {
-            max_drawdown: 0.10, // 10%
+            max_drawdown: 0.10,              // 10%
             max_absolute_drawdown: f64::MAX, // Bypass absolute check to test percentage
             ..Default::default()
         };
@@ -2068,9 +2068,7 @@ mod tests {
 
         let checkpoint = KillSwitchCheckpoint {
             triggered: true,
-            trigger_reasons: vec![
-                "Stale data: no update for 51.9s > 30.0s threshold".to_string(),
-            ],
+            trigger_reasons: vec!["Stale data: no update for 51.9s > 30.0s threshold".to_string()],
             daily_pnl: -2.0,
             peak_pnl: 10.0,
             triggered_at_ms: now_ms - 60_000, // 1 minute ago (within 24h)
@@ -2163,7 +2161,9 @@ mod tests {
         assert!(ks.is_triggered());
 
         let reasons = ks.trigger_reasons();
-        assert!(reasons.iter().any(|r| matches!(r, KillReason::LiquidationDetected { .. })));
+        assert!(reasons
+            .iter()
+            .any(|r| matches!(r, KillReason::LiquidationDetected { .. })));
     }
 
     #[test]
@@ -2240,7 +2240,10 @@ mod tests {
         // ladder_floor = 3.33 * 1.5 = 4.995, hard_limit = max(3.32, 4.995) = 4.995
         // 3.321 < 4.995 => no trigger
         let reason = ks.check(&state_just_over);
-        assert!(reason.is_none(), "Ladder-aware threshold should prevent false positive for full sweep");
+        assert!(
+            reason.is_none(),
+            "Ladder-aware threshold should prevent false positive for full sweep"
+        );
     }
 
     #[test]
@@ -2265,7 +2268,10 @@ mod tests {
         };
 
         let reason = ks.check(&state);
-        assert!(reason.is_some(), "Extreme position should still trigger kill switch");
+        assert!(
+            reason.is_some(),
+            "Extreme position should still trigger kill switch"
+        );
         match reason.unwrap() {
             KillReason::PositionRunaway { contracts, limit } => {
                 assert!((contracts - 6.66).abs() < 1e-6);
@@ -2297,7 +2303,10 @@ mod tests {
             last_data_time: Instant::now(),
             ..Default::default()
         };
-        assert!(ks.check(&state_under).is_none(), "Under limit should not trigger");
+        assert!(
+            ks.check(&state_under).is_none(),
+            "Under limit should not trigger"
+        );
 
         let state_over = KillSwitchState {
             position: 2.01,
@@ -2308,32 +2317,62 @@ mod tests {
             ..Default::default()
         };
         let reason = ks.check(&state_over);
-        assert!(reason.is_some(), "Over margin-based limit should trigger with default ladder depth");
-        assert!(matches!(reason.unwrap(), KillReason::PositionRunaway { .. }));
+        assert!(
+            reason.is_some(),
+            "Over margin-based limit should trigger with default ladder depth"
+        );
+        assert!(matches!(
+            reason.unwrap(),
+            KillReason::PositionRunaway { .. }
+        ));
     }
 
     #[test]
     fn test_for_capital_100_usd() {
         let config = KillSwitchConfig::for_capital(100.0);
-        assert!((config.max_daily_loss - 5.0).abs() < 0.01, "5% of $100 = $5");
-        assert!((config.max_absolute_drawdown - 3.0).abs() < 0.01, "3% of $100 = $3");
-        assert!((config.min_peak_for_drawdown - 0.50).abs() < 0.01, "0.5% of $100 = $0.50");
-        assert!((config.max_position_value - 300.0).abs() < 0.01, "3x leverage on $100");
+        assert!(
+            (config.max_daily_loss - 5.0).abs() < 0.01,
+            "5% of $100 = $5"
+        );
+        assert!(
+            (config.max_absolute_drawdown - 3.0).abs() < 0.01,
+            "3% of $100 = $3"
+        );
+        assert!(
+            (config.min_peak_for_drawdown - 0.50).abs() < 0.01,
+            "0.5% of $100 = $0.50"
+        );
+        assert!(
+            (config.max_position_value - 300.0).abs() < 0.01,
+            "3x leverage on $100"
+        );
     }
 
     #[test]
     fn test_for_capital_10000_usd() {
         let config = KillSwitchConfig::for_capital(10000.0);
-        assert!((config.max_daily_loss - 500.0).abs() < 0.01, "5% of $10K = $500");
-        assert!((config.max_absolute_drawdown - 300.0).abs() < 0.01, "3% of $10K = $300");
-        assert!((config.min_peak_for_drawdown - 50.0).abs() < 0.01, "0.5% of $10K = $50");
+        assert!(
+            (config.max_daily_loss - 500.0).abs() < 0.01,
+            "5% of $10K = $500"
+        );
+        assert!(
+            (config.max_absolute_drawdown - 300.0).abs() < 0.01,
+            "3% of $10K = $300"
+        );
+        assert!(
+            (config.min_peak_for_drawdown - 50.0).abs() < 0.01,
+            "0.5% of $10K = $50"
+        );
     }
 
     #[test]
     fn test_for_capital_very_small() {
         let config = KillSwitchConfig::for_capital(5.0);
         assert!(config.max_daily_loss >= 1.0, "Min $1 daily loss");
-        assert!(config.max_absolute_drawdown >= 0.50, "Min $0.50 absolute drawdown");
+        assert!(
+            config.max_absolute_drawdown >= 0.50,
+            "Min $0.50 absolute drawdown"
+        );
         assert!(config.min_peak_for_drawdown >= 0.50, "Min $0.50 peak");
     }
 
@@ -2421,8 +2460,8 @@ mod tests {
             max_position_value: 100.0,
             max_stuck_cycles: 30,
             stuck_warning_cycles: 10,
-            unrealized_as_warn_fraction: 0.01,  // $1 warn
-            unrealized_as_kill_fraction: 0.05,   // $5 kill
+            unrealized_as_warn_fraction: 0.01, // $1 warn
+            unrealized_as_kill_fraction: 0.05, // $5 kill
             ..Default::default()
         };
         let ks = KillSwitch::new(config);

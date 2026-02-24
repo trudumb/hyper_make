@@ -150,7 +150,6 @@ pub struct DriftVolatilityBeliefs {
     pub n_observations: u64,
 
     // === Fat-Tail Skewness Fields (Phase 2A: Statistical Refinements) ===
-
     /// Skewness of the sigma posterior distribution.
     ///
     /// Positive = right-skewed (vol spike risk).
@@ -181,9 +180,9 @@ impl Default for DriftVolatilityBeliefs {
             confidence: 0.0,
             n_observations: 0,
             // Phase 2A: Fat-tail skewness (neutral defaults)
-            sigma_skewness: 0.5,   // Slight positive (typical for vol)
-            sigma_kurtosis: 0.0,   // Gaussian
-            drift_skewness: 0.0,   // Symmetric
+            sigma_skewness: 0.5, // Slight positive (typical for vol)
+            sigma_kurtosis: 0.0, // Gaussian
+            drift_skewness: 0.0, // Symmetric
         }
     }
 }
@@ -261,7 +260,6 @@ pub struct KappaBeliefs {
     pub n_own_fills: usize,
 
     // === Uncertainty Fields (Phase 2: Alpha-generating) ===
-
     /// Standard deviation of kappa posterior.
     ///
     /// Higher values indicate more uncertainty in fill intensity.
@@ -285,7 +283,6 @@ pub struct KappaBeliefs {
     pub kappa_sigma_corr: f64,
 
     // === Skew-Adjusted CIs (Phase 2A: Statistical Refinements) ===
-
     /// Skew-adjusted lower bound of spread CI.
     ///
     /// Tighter than spread_ci_lower when sigma is left-skewed (vol drop likely).
@@ -310,8 +307,8 @@ impl Default for KappaBeliefs {
             is_warmup: true,
             n_own_fills: 0,
             // Uncertainty defaults
-            kappa_std: 500.0, // High uncertainty initially
-            spread_ci_lower: 3.0, // ~3 bps min
+            kappa_std: 500.0,      // High uncertainty initially
+            spread_ci_lower: 3.0,  // ~3 bps min
             spread_ci_upper: 10.0, // ~10 bps max
             kappa_sigma_corr: 0.0, // Unknown correlation
             // Phase 2A: Skew-adjusted CIs (default = same as base CI)
@@ -631,7 +628,7 @@ impl Default for EdgeBeliefs {
             expected_edge: 0.0,
             toxicity_adjusted_edge: 0.0,
             toxicity_score: 0.0,
-            uncertainty: 2.0, // 2 bps uncertainty
+            uncertainty: 2.0,            // 2 bps uncertainty
             by_regime: [1.0, 0.5, -0.5], // Positive in calm, negative in volatile
             p_positive: 0.5,
             p_positive_adjusted: 0.5,

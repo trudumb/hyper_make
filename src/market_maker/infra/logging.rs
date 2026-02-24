@@ -289,9 +289,7 @@ pub fn init_logging(
             .with(file_layer)
             .init();
 
-        eprintln!(
-            "Logging to file: {log_file} (using JSON format for both stdout and file)"
-        );
+        eprintln!("Logging to file: {log_file} (using JSON format for both stdout and file)");
     } else {
         // Stdout only mode
         match config.stdout_format {

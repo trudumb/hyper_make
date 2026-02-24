@@ -238,7 +238,10 @@ impl MomentumModel {
     }
 
     /// Restore learned state from a checkpoint.
-    pub(crate) fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::MomentumCheckpoint) {
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        cp: &crate::market_maker::checkpoint::MomentumCheckpoint,
+    ) {
         self.continuation_by_magnitude = cp.continuation_by_magnitude;
         self.counts_by_magnitude = cp.counts_by_magnitude;
         self.prior_continuation = cp.prior_continuation;

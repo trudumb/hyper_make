@@ -8,10 +8,8 @@
 //! - `types`: Core market data event types (AllMids, Trades, L2Book)
 //! - `quote_trigger`: Event-driven quote update triggers (Phase 3: Churn Reduction)
 
-mod types;
 pub mod quote_trigger;
+mod types;
 
-pub use quote_trigger::{
-    EventDrivenConfig, QuoteUpdateEvent, QuoteUpdateTrigger, ReconcileScope,
-};
+pub use quote_trigger::{EventDrivenConfig, QuoteUpdateEvent, QuoteUpdateTrigger, ReconcileScope};
 pub use types::*;

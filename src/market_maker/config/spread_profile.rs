@@ -47,9 +47,9 @@ impl SpreadProfile {
     /// Returns 0.0 for Default (no profile floor).
     pub fn profile_min_half_spread_bps(&self) -> f64 {
         match self {
-            Self::Default => 0.0,     // No profile floor for liquid perps
-            Self::Hip3 => 7.5,        // 15 bps total minimum for HIP-3
-            Self::Aggressive => 5.0,  // 10 bps total minimum
+            Self::Default => 0.0,    // No profile floor for liquid perps
+            Self::Hip3 => 7.5,       // 15 bps total minimum for HIP-3
+            Self::Aggressive => 5.0, // 10 bps total minimum
         }
     }
 }
@@ -69,7 +69,10 @@ mod tests {
     fn test_from_str_parsing() {
         assert_eq!(SpreadProfile::from_str("hip3"), SpreadProfile::Hip3);
         assert_eq!(SpreadProfile::from_str("hip-3"), SpreadProfile::Hip3);
-        assert_eq!(SpreadProfile::from_str("aggressive"), SpreadProfile::Aggressive);
+        assert_eq!(
+            SpreadProfile::from_str("aggressive"),
+            SpreadProfile::Aggressive
+        );
         assert_eq!(SpreadProfile::from_str("tight"), SpreadProfile::Aggressive);
         assert_eq!(SpreadProfile::from_str("anything"), SpreadProfile::Default);
     }

@@ -12,6 +12,7 @@ cargo fmt -- --check
 cargo clippy -- -D warnings
 
 # Run tests
-cargo test
+export CARGO_BUILD_JOBS=4
+cargo nextest run
 
 echo "CI checks passed successfully."

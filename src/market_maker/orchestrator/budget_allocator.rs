@@ -164,12 +164,12 @@ pub(crate) fn allocate(
     // Allow 1-2 call overrun to satisfy this guarantee.
     if budget.max_calls >= 4 {
         use crate::market_maker::tracking::Side;
-        let has_bid_action = bid_actions.iter().any(|a| matches!(a,
-            LadderAction::Place { .. } | LadderAction::Modify { .. }
-        ));
-        let has_ask_action = ask_actions.iter().any(|a| matches!(a,
-            LadderAction::Place { .. } | LadderAction::Modify { .. }
-        ));
+        let has_bid_action = bid_actions
+            .iter()
+            .any(|a| matches!(a, LadderAction::Place { .. } | LadderAction::Modify { .. }));
+        let has_ask_action = ask_actions
+            .iter()
+            .any(|a| matches!(a, LadderAction::Place { .. } | LadderAction::Modify { .. }));
 
         // Find best unallocated action for the starved side
         for (i, update) in budgeted.iter().enumerate() {
@@ -328,7 +328,14 @@ mod tests {
     fn test_greedy_selection_picks_highest_value() {
         let mut scored = vec![
             make_scored(Some(1), ActionType::ModifyPrice, 5.0, Side::Buy, 100.0, 1.0),
-            make_scored(Some(2), ActionType::ModifyPrice, 10.0, Side::Buy, 101.0, 1.0),
+            make_scored(
+                Some(2),
+                ActionType::ModifyPrice,
+                10.0,
+                Side::Buy,
+                101.0,
+                1.0,
+            ),
             make_scored(Some(3), ActionType::ModifyPrice, 2.0, Side::Buy, 102.0, 1.0),
         ];
         let budget = ApiBudget {
@@ -349,7 +356,14 @@ mod tests {
     fn test_emergency_bypasses_budget() {
         let mut scored = vec![
             // Emergency stale cancel (value > 10)
-            make_scored(Some(1), ActionType::StaleCancel, 15.0, Side::Buy, 100.0, 1.0),
+            make_scored(
+                Some(1),
+                ActionType::StaleCancel,
+                15.0,
+                Side::Buy,
+                100.0,
+                1.0,
+            ),
             // Normal action
             make_scored(Some(2), ActionType::ModifyPrice, 5.0, Side::Buy, 101.0, 1.0),
         ];
@@ -363,15 +377,33 @@ mod tests {
         // Emergency should execute even with 0 budget
         assert!(!result.bid_actions.is_empty());
         // The stale cancel is emergency, the modify is suppressed
-        let cancel_count = result.bid_actions.iter().filter(|a| matches!(a, LadderAction::Cancel { .. })).count();
+        let cancel_count = result
+            .bid_actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Cancel { .. }))
+            .count();
         assert_eq!(cancel_count, 1);
     }
 
     #[test]
     fn test_negative_value_never_selected() {
         let mut scored = vec![
-            make_scored(Some(1), ActionType::CancelPlace, -5.0, Side::Buy, 100.0, 1.0),
-            make_scored(Some(2), ActionType::ModifyPrice, -2.0, Side::Buy, 101.0, 1.0),
+            make_scored(
+                Some(1),
+                ActionType::CancelPlace,
+                -5.0,
+                Side::Buy,
+                100.0,
+                1.0,
+            ),
+            make_scored(
+                Some(2),
+                ActionType::ModifyPrice,
+                -2.0,
+                Side::Buy,
+                101.0,
+                1.0,
+            ),
         ];
         let budget = ApiBudget {
             max_calls: 100, // Plenty of budget
@@ -420,9 +452,14 @@ mod tests {
 
     #[test]
     fn test_cancel_place_costs_two_calls() {
-        let mut scored = vec![
-            make_scored(Some(1), ActionType::CancelPlace, 20.0, Side::Buy, 100.0, 1.0),
-        ];
+        let mut scored = vec![make_scored(
+            Some(1),
+            ActionType::CancelPlace,
+            20.0,
+            Side::Buy,
+            100.0,
+            1.0,
+        )];
         let budget = ApiBudget {
             max_calls: 1, // Only 1 call — not enough for cancel+place (2)
             headroom_pct: 0.5,
@@ -456,10 +493,14 @@ mod tests {
         let result = allocate(&mut scored, &budget, 2);
 
         // Should have at least one Sell action from side balance
-        let has_sell = result.ask_actions.iter().any(|a| matches!(a,
-            LadderAction::Place { .. }
-        ));
-        assert!(has_sell, "Side balance should ensure at least one sell action");
+        let has_sell = result
+            .ask_actions
+            .iter()
+            .any(|a| matches!(a, LadderAction::Place { .. }));
+        assert!(
+            has_sell,
+            "Side balance should ensure at least one sell action"
+        );
     }
 
     #[test]

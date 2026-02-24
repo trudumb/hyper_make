@@ -279,11 +279,7 @@ impl RegimeProfile {
     /// - Average fill rate
     /// - Book depth
     /// - Volatility
-    pub fn detect(
-        avg_fills_per_hour: f64,
-        avg_book_depth_usd: f64,
-        volatility_bps: f64,
-    ) -> Self {
+    pub fn detect(avg_fills_per_hour: f64, avg_book_depth_usd: f64, volatility_bps: f64) -> Self {
         // Cascade detection: high volatility + thin book
         if volatility_bps > 100.0 && avg_book_depth_usd < 20_000.0 {
             return Self::cascade();

@@ -356,13 +356,13 @@ impl RegimeKappaEstimator {
         let mut kappa = 0.0;
 
         for (i, estimator) in self.regime_estimators.iter().enumerate() {
-            let regime_kappa = if estimator.observation_count() >= self.config.min_regime_observations
-            {
-                estimator.posterior_mean()
-            } else {
-                // Fall back to prior for this regime
-                self.config.prior_for_regime(i)
-            };
+            let regime_kappa =
+                if estimator.observation_count() >= self.config.min_regime_observations {
+                    estimator.posterior_mean()
+                } else {
+                    // Fall back to prior for this regime
+                    self.config.prior_for_regime(i)
+                };
 
             kappa += self.regime_probs[i] * regime_kappa;
         }

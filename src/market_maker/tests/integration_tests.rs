@@ -711,9 +711,9 @@ mod tests {
 
         let (bid, ask) = strategy.calculate_quotes(
             &quote_config,
-            0.0,   // position = 0 (flat)
-            10.0,  // max_position
-            1.0,   // target_liquidity
+            0.0,  // position = 0 (flat)
+            10.0, // max_position
+            1.0,  // target_liquidity
             &market_params,
         );
 
@@ -801,7 +801,10 @@ mod tests {
 
         // Verify normal regime baseline
         assert!(
-            matches!(regime_before, VolatilityRegime::Low | VolatilityRegime::Normal),
+            matches!(
+                regime_before,
+                VolatilityRegime::Low | VolatilityRegime::Normal
+            ),
             "Phase 1: Regime should be Low or Normal, got {:?}",
             regime_before
         );
@@ -966,9 +969,9 @@ mod tests {
         let regimes: Vec<(&str, MarketParams)> = vec![
             ("quiet", {
                 let mut p = MarketParams::default();
-                p.sigma = 0.0001;         // Low volatility
+                p.sigma = 0.0001; // Low volatility
                 p.sigma_effective = 0.0001;
-                p.kappa = 200.0;                // Deep book (easy to get filled)
+                p.kappa = 200.0; // Deep book (easy to get filled)
                 p.kappa_bid = 200.0;
                 p.kappa_ask = 200.0;
                 p.microprice = mid;
@@ -981,7 +984,7 @@ mod tests {
                 p.sigma = 0.0005;
                 p.sigma_effective = 0.0005;
                 p.kappa = 150.0;
-                p.momentum_bps = 5.0;     // Moderate momentum
+                p.momentum_bps = 5.0; // Moderate momentum
                 p.microprice = mid;
                 p.market_mid = mid;
                 p.arrival_intensity = 0.5;
@@ -989,9 +992,9 @@ mod tests {
             }),
             ("volatile", {
                 let mut p = MarketParams::default();
-                p.sigma = 0.003;          // High volatility
+                p.sigma = 0.003; // High volatility
                 p.sigma_effective = 0.003;
-                p.kappa = 80.0;           // Thinner book
+                p.kappa = 80.0; // Thinner book
                 p.microprice = mid;
                 p.market_mid = mid;
                 p.arrival_intensity = 1.0;
@@ -999,9 +1002,9 @@ mod tests {
             }),
             ("cascade", {
                 let mut p = MarketParams::default();
-                p.sigma = 0.01;           // Very high volatility
+                p.sigma = 0.01; // Very high volatility
                 p.sigma_effective = 0.01;
-                p.kappa = 30.0;           // Very thin book
+                p.kappa = 30.0; // Very thin book
                 p.kappa_bid = 30.0;
                 p.kappa_ask = 30.0;
                 p.is_toxic_regime = true;
@@ -1020,23 +1023,15 @@ mod tests {
         for (name, params) in &regimes {
             let (bid, ask) = strategy.calculate_quotes(
                 &quote_config,
-                0.0,   // flat position
+                0.0, // flat position
                 10.0,
                 1.0,
                 params,
             );
 
             // Assert: both sides should produce quotes
-            assert!(
-                bid.is_some(),
-                "Regime '{}': should produce bid quote",
-                name
-            );
-            assert!(
-                ask.is_some(),
-                "Regime '{}': should produce ask quote",
-                name
-            );
+            assert!(bid.is_some(), "Regime '{}': should produce bid quote", name);
+            assert!(ask.is_some(), "Regime '{}': should produce ask quote", name);
 
             let bid_price = bid.unwrap().price;
             let ask_price = ask.unwrap().price;
@@ -1081,12 +1076,10 @@ mod tests {
         let quiet_params = &regimes[0].1;
         let cascade_params = &regimes[3].1;
 
-        let (quiet_bid, quiet_ask) = strategy.calculate_quotes(
-            &quote_config, 0.0, 10.0, 1.0, quiet_params,
-        );
-        let (cascade_bid, cascade_ask) = strategy.calculate_quotes(
-            &quote_config, 0.0, 10.0, 1.0, cascade_params,
-        );
+        let (quiet_bid, quiet_ask) =
+            strategy.calculate_quotes(&quote_config, 0.0, 10.0, 1.0, quiet_params);
+        let (cascade_bid, cascade_ask) =
+            strategy.calculate_quotes(&quote_config, 0.0, 10.0, 1.0, cascade_params);
 
         let quiet_spread = quiet_ask.unwrap().price - quiet_bid.unwrap().price;
         let cascade_spread = cascade_ask.unwrap().price - cascade_bid.unwrap().price;
@@ -1107,14 +1100,12 @@ mod tests {
     fn test_cascade_triggers_circuit_breaker_then_kill_switch() {
         // Verifies the full escalation chain:
         // moderate cascade -> WidenSpreads -> high cascade -> PullQuotes -> extreme -> Kill
-        use crate::market_maker::risk::{
-            RiskAction, RiskAggregator, RiskSeverity, RiskState,
-        };
         use crate::market_maker::risk::monitors::CascadeMonitor;
+        use crate::market_maker::risk::{RiskAction, RiskAggregator, RiskSeverity, RiskState};
 
         // Build aggregator with a cascade monitor: pull at 0.8, kill at 5.0
-        let aggregator = RiskAggregator::new()
-            .with_monitor(Box::new(CascadeMonitor::new(0.8, 5.0)));
+        let aggregator =
+            RiskAggregator::new().with_monitor(Box::new(CascadeMonitor::new(0.8, 5.0)));
 
         // Step 1: Moderate cascade (severity 0.5) -> should widen spreads
         // Default widen_threshold = pull_threshold * 0.5 = 0.4
@@ -1186,9 +1177,7 @@ mod tests {
         // Verifies that PositionGuard blocks position-increasing orders
         // while allowing position-reducing orders, independent of whether
         // the aggregator says WidenSpreads or PauseTrading.
-        use crate::market_maker::risk::{
-            OrderEntryCheck, PositionGuard, PositionGuardConfig,
-        };
+        use crate::market_maker::risk::{OrderEntryCheck, PositionGuard, PositionGuardConfig};
         use crate::market_maker::tracking::Side;
 
         let guard = PositionGuard::with_config(PositionGuardConfig {
@@ -1206,11 +1195,17 @@ mod tests {
             !check_buy.is_allowed(),
             "Position-increasing order should be rejected near limit"
         );
-        if let OrderEntryCheck::Rejected { worst_case_position, hard_limit, .. } = &check_buy {
+        if let OrderEntryCheck::Rejected {
+            worst_case_position,
+            hard_limit,
+            ..
+        } = &check_buy
+        {
             assert!(
                 *worst_case_position > *hard_limit,
                 "Worst case {} should exceed hard limit {}",
-                worst_case_position, hard_limit
+                worst_case_position,
+                hard_limit
             );
         }
 
@@ -1240,17 +1235,15 @@ mod tests {
     fn test_risk_aggregator_takes_max_severity_across_monitors() {
         // Verifies the fundamental invariant: one Critical monitor overrides
         // all Normal monitors, and the kill action propagates correctly.
-        use crate::market_maker::risk::{
-            RiskAggregator, RiskSeverity, RiskState,
-        };
         use crate::market_maker::risk::monitors::{
             CascadeMonitor, DrawdownMonitor, LossMonitor, PositionMonitor,
         };
+        use crate::market_maker::risk::{RiskAggregator, RiskSeverity, RiskState};
 
         // Set up aggregator with multiple monitors
         let aggregator = RiskAggregator::new()
-            .with_monitor(Box::new(LossMonitor::new(500.0)))       // max loss $500
-            .with_monitor(Box::new(DrawdownMonitor::new(0.05)))    // max 5% dd
+            .with_monitor(Box::new(LossMonitor::new(500.0))) // max loss $500
+            .with_monitor(Box::new(DrawdownMonitor::new(0.05))) // max 5% dd
             .with_monitor(Box::new(PositionMonitor::new()))
             .with_monitor(Box::new(CascadeMonitor::new(0.8, 5.0)));
 
@@ -1258,13 +1251,13 @@ mod tests {
         // P&L: daily=10, peak=10 means 0% drawdown (at peak).
         // Position: 30% utilized. Cascade: 6.0 (extreme).
         let state = RiskState {
-            daily_pnl: 10.0,         // In profit
-            peak_pnl: 10.0,          // At peak, 0% drawdown
-            position: 0.3,           // Well within limits
+            daily_pnl: 10.0, // In profit
+            peak_pnl: 10.0,  // At peak, 0% drawdown
+            position: 0.3,   // Well within limits
             max_position: 1.0,
             position_value: 3000.0,
             max_position_value: 10000.0,
-            cascade_severity: 6.0,   // EXTREME: above kill threshold of 5.0
+            cascade_severity: 6.0, // EXTREME: above kill threshold of 5.0
             ..Default::default()
         };
 
@@ -1279,13 +1272,12 @@ mod tests {
         );
 
         // Kill switch should be triggered
-        assert!(
-            result.should_kill(),
-            "Critical cascade should trigger kill"
-        );
+        assert!(result.should_kill(), "Critical cascade should trigger kill");
 
         // Other monitors should be OK (profit, small drawdown, within position limits)
-        let non_critical_count = result.assessments.iter()
+        let non_critical_count = result
+            .assessments
+            .iter()
             .filter(|a| a.severity == RiskSeverity::None)
             .count();
         assert!(
@@ -1299,7 +1291,9 @@ mod tests {
     fn test_kill_switch_blocks_after_cascade() {
         // Verifies that KillSwitch correctly triggers on extreme cascade severity
         // and remains triggered on subsequent checks (latching behavior).
-        use crate::market_maker::risk::{KillReason, KillSwitch, KillSwitchConfig, KillSwitchState};
+        use crate::market_maker::risk::{
+            KillReason, KillSwitch, KillSwitchConfig, KillSwitchState,
+        };
         use std::time::Instant;
 
         let config = KillSwitchConfig {
@@ -1349,10 +1343,7 @@ mod tests {
 
         // Trigger reasons should be preserved
         let reasons = ks.trigger_reasons();
-        assert!(
-            !reasons.is_empty(),
-            "Trigger reasons should be preserved"
-        );
+        assert!(!reasons.is_empty(), "Trigger reasons should be preserved");
     }
 
     #[test]
@@ -1360,16 +1351,14 @@ mod tests {
         // Verifies correct aggregation when MULTIPLE conditions are bad simultaneously:
         // high drawdown + high position + elevated cascade.
         // Max severity wins, spread_factor is maximum, reduce_only propagates.
-        use crate::market_maker::risk::{
-            RiskAggregator, RiskSeverity, RiskState,
-        };
         use crate::market_maker::risk::monitors::{
             CascadeMonitor, DrawdownMonitor, LossMonitor, PositionMonitor,
         };
+        use crate::market_maker::risk::{RiskAggregator, RiskSeverity, RiskState};
 
         let aggregator = RiskAggregator::new()
-            .with_monitor(Box::new(LossMonitor::new(50.0)))        // $50 limit
-            .with_monitor(Box::new(DrawdownMonitor::new(0.05)))    // 5% dd limit
+            .with_monitor(Box::new(LossMonitor::new(50.0))) // $50 limit
+            .with_monitor(Box::new(DrawdownMonitor::new(0.05))) // 5% dd limit
             .with_monitor(Box::new(PositionMonitor::new()))
             .with_monitor(Box::new(
                 CascadeMonitor::new(0.8, 5.0).with_widen_threshold(0.4, 0.5),
@@ -1416,7 +1405,9 @@ mod tests {
         );
 
         // Multiple assessments should be actionable
-        let actionable_count = result.assessments.iter()
+        let actionable_count = result
+            .assessments
+            .iter()
             .filter(|a| a.is_actionable())
             .count();
         assert!(

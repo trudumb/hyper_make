@@ -602,10 +602,7 @@ impl OrderExecutor for HyperliquidExecutor {
                         .iter()
                         .zip(cloids.iter())
                         .map(|(_, cloid)| {
-                            OrderResult::failed_with_cloid_and_error(
-                                cloid.clone(),
-                                e.clone(),
-                            )
+                            OrderResult::failed_with_cloid_and_error(cloid.clone(), e.clone())
                         })
                         .collect();
                 }
@@ -618,10 +615,7 @@ impl OrderExecutor for HyperliquidExecutor {
                     .iter()
                     .zip(cloids.iter())
                     .map(|(_, cloid)| {
-                        OrderResult::failed_with_cloid_and_error(
-                            cloid.clone(),
-                            err_str.clone(),
-                        )
+                        OrderResult::failed_with_cloid_and_error(cloid.clone(), err_str.clone())
                     })
                     .collect();
             }

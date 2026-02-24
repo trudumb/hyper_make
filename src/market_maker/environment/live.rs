@@ -96,19 +96,16 @@ impl TradingEnvironment for LiveEnvironment {
     type ObservationStream = LiveObservationStream;
 
     async fn observation_stream(&mut self) -> Result<Self::ObservationStream> {
-        let info_client = self
-            .info_client
-            .as_mut()
-            .ok_or_else(|| crate::Error::GenericRequest(
+        let info_client = self.info_client.as_mut().ok_or_else(|| {
+            crate::Error::GenericRequest(
                 "LiveEnvironment::observation_stream() requires InfoClient. \
-                 Use LiveEnvironment::new() instead of from_executor().".to_string()
-            ))?;
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| crate::Error::GenericRequest(
-                "LiveEnvironment missing config".to_string()
-            ))?;
+                 Use LiveEnvironment::new() instead of from_executor()."
+                    .to_string(),
+            )
+        })?;
+        let config = self.config.as_ref().ok_or_else(|| {
+            crate::Error::GenericRequest("LiveEnvironment missing config".to_string())
+        })?;
 
         let (sender, receiver) = mpsc::unbounded_channel::<Arc<Message>>();
 

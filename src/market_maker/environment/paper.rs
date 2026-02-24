@@ -6,13 +6,13 @@
 //! The `PaperEnvironment` produces observations from market data WS channels
 //! and synthesizes fill events using the FillSimulator.
 
+use alloy::primitives::Address;
 use async_trait::async_trait;
+use futures_util::Stream;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use alloy::primitives::Address;
-use futures_util::Stream;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
@@ -95,14 +95,11 @@ impl TradingEnvironment for PaperEnvironment {
     async fn observation_stream(&mut self) -> Result<Self::ObservationStream> {
         use crate::Subscription;
 
-        let info_client = self
-            .info_client
-            .as_mut()
-            .ok_or_else(|| {
-                crate::Error::GenericRequest(
-                    "PaperEnvironment::observation_stream() requires InfoClient".to_string(),
-                )
-            })?;
+        let info_client = self.info_client.as_mut().ok_or_else(|| {
+            crate::Error::GenericRequest(
+                "PaperEnvironment::observation_stream() requires InfoClient".to_string(),
+            )
+        })?;
 
         let (sender, receiver) = mpsc::unbounded_channel::<Arc<Message>>();
 
@@ -275,9 +272,7 @@ impl PaperObservationStream {
             }
 
             // Update executor's mid price for post-only validation
-            self.fill_simulator
-                .executor
-                .update_mid(price);
+            self.fill_simulator.executor.update_mid(price);
 
             let market_trade = MarketTrade {
                 timestamp_ns: trade.time * 1_000_000, // ms → ns
@@ -384,7 +379,10 @@ impl Stream for PaperObservationStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Drain pending observations first (buffered fills from previous trade).
         if let Some(obs) = self.pending.pop_front() {
-            trace!(obs = obs.label(), "Paper stream: yielding pending observation");
+            trace!(
+                obs = obs.label(),
+                "Paper stream: yielding pending observation"
+            );
             return Poll::Ready(Some(obs));
         }
 

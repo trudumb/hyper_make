@@ -196,8 +196,8 @@ impl PositionPnLTracker {
         let regime = regime.min(NUM_REGIMES - 1);
 
         // Map position ratio to quantile (0-9)
-        let quantile = ((position_ratio * NUM_QUANTILES as f64).floor() as usize)
-            .min(NUM_QUANTILES - 1);
+        let quantile =
+            ((position_ratio * NUM_QUANTILES as f64).floor() as usize).min(NUM_QUANTILES - 1);
 
         // Record to specific cell
         self.pnl_by_quantile[quantile][regime].push(pnl_bps);

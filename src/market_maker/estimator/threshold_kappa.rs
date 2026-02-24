@@ -41,11 +41,11 @@ pub struct ThresholdKappaConfig {
 impl Default for ThresholdKappaConfig {
     fn default() -> Self {
         Self {
-            kappa_base: 1000.0,     // Typical HIP-3 kappa
-            threshold_bps: 15.0,    // Start momentum decay at 15 bps
-            decay_rate: 0.3,        // Moderate decay
-            ema_alpha: 0.1,         // 10% weight on new return
-            lookback_ms: 60_000,    // 1 minute lookback
+            kappa_base: 1000.0,  // Typical HIP-3 kappa
+            threshold_bps: 15.0, // Start momentum decay at 15 bps
+            decay_rate: 0.3,     // Moderate decay
+            ema_alpha: 0.1,      // 10% weight on new return
+            lookback_ms: 60_000, // 1 minute lookback
         }
     }
 }
@@ -131,8 +131,8 @@ impl ThresholdKappa {
         self.observations += 1;
 
         // Update return EMA (tracks directional deviation)
-        self.return_ema = self.config.ema_alpha * return_bps
-            + (1.0 - self.config.ema_alpha) * self.return_ema;
+        self.return_ema =
+            self.config.ema_alpha * return_bps + (1.0 - self.config.ema_alpha) * self.return_ema;
 
         // Update absolute return EMA (tracks volatility scale)
         self.abs_return_ema = self.config.ema_alpha * return_bps.abs()
@@ -322,7 +322,9 @@ mod tests {
 
     #[test]
     fn test_regime_spread_multiplier() {
-        assert!((ThresholdKappaRegime::StrongMeanReversion.spread_multiplier() - 1.0).abs() < 1e-10);
+        assert!(
+            (ThresholdKappaRegime::StrongMeanReversion.spread_multiplier() - 1.0).abs() < 1e-10
+        );
         assert!(ThresholdKappaRegime::StrongMomentum.spread_multiplier() > 1.5);
     }
 

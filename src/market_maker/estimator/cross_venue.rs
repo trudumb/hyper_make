@@ -249,7 +249,6 @@ impl RollingCorrelation {
             (cov / denom).clamp(-1.0, 1.0)
         }
     }
-
 }
 
 /// Cross-venue analyzer - computes joint features from both venues.
@@ -310,7 +309,8 @@ impl CrossVenueAnalyzer {
     /// Update with new observations from both venues.
     pub fn update(&mut self, binance: &FlowFeatureVec, hl: &FlowFeatureVec) {
         // Update rolling correlation of imbalances (use 5s window)
-        self.imbalance_correlation.add(binance.imbalance_5s, hl.imbalance_5s);
+        self.imbalance_correlation
+            .add(binance.imbalance_5s, hl.imbalance_5s);
 
         // Update lead venue (Binance) imbalance EWMAs for flow acceleration
         const LEAD_FAST_ALPHA: f64 = 0.2;
@@ -322,7 +322,8 @@ impl CrossVenueAnalyzer {
 
         // Update intensity EMAs
         let alpha = self.config.intensity_ema_alpha;
-        self.binance_intensity_ema = alpha * binance.intensity + (1.0 - alpha) * self.binance_intensity_ema;
+        self.binance_intensity_ema =
+            alpha * binance.intensity + (1.0 - alpha) * self.binance_intensity_ema;
         self.hl_intensity_ema = alpha * hl.intensity + (1.0 - alpha) * self.hl_intensity_ema;
 
         // Update agreement streak
@@ -360,7 +361,11 @@ impl CrossVenueAnalyzer {
     }
 
     /// Compute cross-venue features from current state.
-    fn compute_features(&self, binance: &FlowFeatureVec, hl: &FlowFeatureVec) -> CrossVenueFeatures {
+    fn compute_features(
+        &self,
+        binance: &FlowFeatureVec,
+        hl: &FlowFeatureVec,
+    ) -> CrossVenueFeatures {
         // Agreement: normalized streak
         let agreement = (self.agreement_streak as f64 / 20.0).clamp(-1.0, 1.0);
 
@@ -405,29 +410,30 @@ impl CrossVenueAnalyzer {
 
         // Combined direction (weighted by intensity)
         let combined_direction = if total_intensity > 1e-12 {
-            (self.binance_intensity_ema * binance.imbalance_5s +
-             self.hl_intensity_ema * hl.imbalance_5s) / total_intensity
+            (self.binance_intensity_ema * binance.imbalance_5s
+                + self.hl_intensity_ema * hl.imbalance_5s)
+                / total_intensity
         } else {
             (binance.imbalance_5s + hl.imbalance_5s) / 2.0
         };
 
         // Confidence calculation (FIXED: use additive approach instead of multiplicative)
         // This prevents a single 0 from zeroing out the entire confidence
-        
+
         // Data sufficiency factor [0, 1]
         let data_conf = (self.sample_count as f64 / self.config.min_samples as f64).min(1.0);
-        
+
         // Agreement factor: higher when venues agree
         let agree_conf = agreement.abs() * 0.5 + 0.5; // Maps [-1,1] agreement to [0.5, 1.0]
-        
+
         // Correlation factor: higher when correlation is positive
         let corr_conf = (imbalance_correlation * 0.5 + 0.5).max(0.1); // Map [-1,1] to [0.1,1]
-        
+
         // Individual venue confidences with floor
         // Use a floor of 0.3 to prevent complete gating when one venue has sparse data
         let binance_conf_adj = binance.confidence.max(0.3);
         let hl_conf_adj = hl.confidence.max(0.3);
-        
+
         // Weighted average of venue confidences (trade count weighted)
         let venue_weight = if binance.trade_count + hl.trade_count > 0 {
             let total_trades = (binance.trade_count + hl.trade_count) as f64;
@@ -438,11 +444,11 @@ impl CrossVenueAnalyzer {
             // Fallback: arithmetic mean with floor
             (binance_conf_adj + hl_conf_adj) / 2.0
         };
-        
+
         // Combine factors using geometric mean (less punishing than full multiplication)
         // Factors: data_conf, agree_conf, corr_conf, venue_weight
         let confidence = (data_conf * agree_conf * corr_conf * venue_weight).powf(0.25);
-        
+
         // Ensure minimum confidence when we have some data
         let confidence = if self.sample_count >= 5 {
             confidence.max(0.1)
@@ -506,7 +512,12 @@ impl CrossVenueAnalyzer {
     }
 
     /// Create bivariate observation from venue features.
-    pub fn create_observation(&self, binance: FlowFeatureVec, hl: FlowFeatureVec, timestamp_ms: i64) -> BivariateFlowObservation {
+    pub fn create_observation(
+        &self,
+        binance: FlowFeatureVec,
+        hl: FlowFeatureVec,
+        timestamp_ms: i64,
+    ) -> BivariateFlowObservation {
         BivariateFlowObservation {
             binance,
             hl,
@@ -603,8 +614,15 @@ mod tests {
         }
 
         let features = analyzer.features();
-        assert!(features.agreement > 0.0, "Expected positive agreement, got {}", features.agreement);
-        assert!(features.combined_direction > 0.0, "Expected positive direction");
+        assert!(
+            features.agreement > 0.0,
+            "Expected positive agreement, got {}",
+            features.agreement
+        );
+        assert!(
+            features.combined_direction > 0.0,
+            "Expected positive direction"
+        );
     }
 
     #[test]
@@ -619,8 +637,16 @@ mod tests {
         }
 
         let features = analyzer.features();
-        assert!(features.agreement < 0.0, "Expected negative agreement (divergence), got {}", features.agreement);
-        assert!(features.divergence > 0.5, "Expected high divergence, got {}", features.divergence);
+        assert!(
+            features.agreement < 0.0,
+            "Expected negative agreement (divergence), got {}",
+            features.agreement
+        );
+        assert!(
+            features.divergence > 0.5,
+            "Expected high divergence, got {}",
+            features.divergence
+        );
         assert!(features.divergence_alert, "Expected divergence alert");
     }
 
@@ -638,7 +664,10 @@ mod tests {
         let features = analyzer.features();
         assert!(features.max_toxicity > 0.6, "Expected high max toxicity");
         assert!(features.toxicity_alert, "Expected toxicity alert");
-        assert!(features.should_be_defensive(), "Should be defensive on toxicity");
+        assert!(
+            features.should_be_defensive(),
+            "Should be defensive on toxicity"
+        );
     }
 
     #[test]
@@ -648,12 +677,16 @@ mod tests {
         // High Binance activity, low HL activity
         for _ in 0..30 {
             let binance = make_binance_features(0.0, 0.3, 100.0); // High intensity
-            let hl = make_binance_features(0.0, 0.2, 10.0);       // Low intensity
+            let hl = make_binance_features(0.0, 0.2, 10.0); // Low intensity
             analyzer.update(&binance, &hl);
         }
 
         let features = analyzer.features();
-        assert!(features.intensity_ratio > 0.7, "Expected Binance dominance, got {}", features.intensity_ratio);
+        assert!(
+            features.intensity_ratio > 0.7,
+            "Expected Binance dominance, got {}",
+            features.intensity_ratio
+        );
     }
 
     #[test]
@@ -669,7 +702,11 @@ mod tests {
         }
 
         let features = analyzer.features();
-        assert!(features.imbalance_correlation > 0.8, "Expected high correlation, got {}", features.imbalance_correlation);
+        assert!(
+            features.imbalance_correlation > 0.8,
+            "Expected high correlation, got {}",
+            features.imbalance_correlation
+        );
     }
 
     #[test]
@@ -680,16 +717,25 @@ mod tests {
         features.divergence = 0.1;
         features.max_toxicity = 0.3;
         features.confidence = 0.8;
-        assert!((features.spread_multiplier() - 1.0).abs() < 0.1, "Expected minimal widening");
+        assert!(
+            (features.spread_multiplier() - 1.0).abs() < 0.1,
+            "Expected minimal widening"
+        );
 
         // High divergence
         features.divergence = 0.6;
-        assert!(features.spread_multiplier() > 1.1, "Expected widening on divergence");
+        assert!(
+            features.spread_multiplier() > 1.1,
+            "Expected widening on divergence"
+        );
 
         // High toxicity
         features.divergence = 0.1;
         features.max_toxicity = 0.8;
-        assert!(features.spread_multiplier() > 1.2, "Expected widening on toxicity");
+        assert!(
+            features.spread_multiplier() > 1.2,
+            "Expected widening on toxicity"
+        );
     }
 
     #[test]

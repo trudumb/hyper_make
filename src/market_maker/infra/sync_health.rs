@@ -92,7 +92,7 @@ pub struct SyncHealthConfig {
 impl Default for SyncHealthConfig {
     fn default() -> Self {
         Self {
-            max_snapshot_age_ms: 5000,      // 5 seconds
+            max_snapshot_age_ms: 5000,       // 5 seconds
             critical_snapshot_age_ms: 10000, // 10 seconds
             max_orphan_ratio: 0.2,           // 20% orphans
             sync_history_size: 20,
@@ -254,7 +254,8 @@ impl SyncHealthTracker {
                     0.0
                 } else {
                     // Linear interpolation
-                    let range = self.config.critical_snapshot_age_ms - self.config.max_snapshot_age_ms;
+                    let range =
+                        self.config.critical_snapshot_age_ms - self.config.max_snapshot_age_ms;
                     let excess = age_ms - self.config.max_snapshot_age_ms;
                     1.0 - (excess as f64 / range as f64)
                 }
@@ -321,7 +322,8 @@ impl SyncHealthTracker {
         SyncHealthSummary {
             health_score: self.health_score,
             health_level: self.health_level,
-            snapshot_age_ms: self.last_snapshot_time
+            snapshot_age_ms: self
+                .last_snapshot_time
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(u64::MAX),
             success_rate: self.compute_success_rate_score(),

@@ -204,8 +204,7 @@ impl HistoricalCalibrator {
                 continue; // Skip invalid windows
             }
 
-            let spread_bps =
-                (window[0].ask - window[0].bid) / window[0].mid_price * 10_000.0;
+            let spread_bps = (window[0].ask - window[0].bid) / window[0].mid_price * 10_000.0;
             if !(0.5..=100.0).contains(&spread_bps) {
                 continue; // Skip invalid spreads
             }
@@ -421,13 +420,15 @@ impl HistoricalCalibrator {
                     if !fills_in_period.is_empty() {
                         let avg_as: f64 = fills_in_period
                             .iter()
-                            .filter_map(|f| f.price_1s_later.map(|p| {
-                                if f.is_buy {
-                                    (p - f.price) / f.price * 10_000.0
-                                } else {
-                                    (f.price - p) / f.price * 10_000.0
-                                }
-                            }))
+                            .filter_map(|f| {
+                                f.price_1s_later.map(|p| {
+                                    if f.is_buy {
+                                        (p - f.price) / f.price * 10_000.0
+                                    } else {
+                                        (f.price - p) / f.price * 10_000.0
+                                    }
+                                })
+                            })
                             .sum::<f64>()
                             / fills_in_period.len() as f64;
 

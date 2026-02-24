@@ -58,7 +58,6 @@ impl CalibrationPhase {
             Self::Confident => 0.1,
         }
     }
-
 }
 
 /// Fill count thresholds for phase transitions.
@@ -107,8 +106,12 @@ pub struct CalibrationCoordinator {
     peak_fill_kappa: f64,
 }
 
-fn default_kappa() -> f64 { 1000.0 }
-fn default_sigma() -> f64 { 0.00025 }
+fn default_kappa() -> f64 {
+    1000.0
+}
+fn default_sigma() -> f64 {
+    0.00025
+}
 
 impl Default for CalibrationCoordinator {
     fn default() -> Self {
@@ -192,7 +195,8 @@ impl CalibrationCoordinator {
         // Uses exponential decay for monotonic transition (no discrete jumps)
         let fills_f = self.fill_count as f64;
         let profile_weight = 0.1 + 0.9 * (-fills_f / 40.0).exp();
-        let blended = profile_weight * self.profile_kappa + (1.0 - profile_weight) * self.fill_kappa;
+        let blended =
+            profile_weight * self.profile_kappa + (1.0 - profile_weight) * self.fill_kappa;
 
         // Warmup factor: starts at 0.5, converges to 1.0
         let warmup = 0.5 + 0.5 * (1.0 - (-fills_f / 10.0).exp());
@@ -205,7 +209,8 @@ impl CalibrationCoordinator {
     pub fn effective_sigma(&self) -> f64 {
         let fills_f = self.fill_count as f64;
         let profile_weight = 0.1 + 0.9 * (-fills_f / 40.0).exp();
-        let blended = profile_weight * self.profile_sigma + (1.0 - profile_weight) * self.fill_sigma;
+        let blended =
+            profile_weight * self.profile_sigma + (1.0 - profile_weight) * self.fill_sigma;
         blended.max(1e-6)
     }
 
@@ -371,15 +376,18 @@ mod tests {
 
         let gamma = 0.15;
         let fee_bps = 1.5;
-        let mut prev_spread = spread_for_kappa_test(
-            coord.effective_kappa(), gamma, fee_bps
-        ) + coord.uncertainty_premium_bps();
+        let mut prev_spread = spread_for_kappa_test(coord.effective_kappa(), gamma, fee_bps)
+            + coord.uncertainty_premium_bps();
 
         // Feed 100 fills at 20 bps (reasonable distance)
         for i in 1..=100 {
             coord.on_fill(20.0, false);
             let spread = crate::market_maker::strategy::spread_oracle::spread_for_kappa(
-                coord.effective_kappa(), gamma, 0.0, 0.0, fee_bps
+                coord.effective_kappa(),
+                gamma,
+                0.0,
+                0.0,
+                fee_bps,
             ) + coord.uncertainty_premium_bps();
 
             assert!(
@@ -501,7 +509,10 @@ mod tests {
         let initial_kappa = coord.effective_kappa();
         let initial_premium = coord.uncertainty_premium_bps();
         assert!(initial_kappa > 10.0, "Initial kappa should be meaningful");
-        assert!(initial_premium > 3.0, "Cold phase should have significant premium");
+        assert!(
+            initial_premium > 3.0,
+            "Cold phase should have significant premium"
+        );
 
         // Step 3: Feed 100 fills at ~15 bps distance (mildly favorable fills)
         let mut prev_kappa = initial_kappa;
@@ -563,7 +574,9 @@ mod tests {
         assert_eq!(restored.fill_count(), coord.fill_count());
         assert!(restored.is_seeded());
         assert!((restored.effective_kappa() - coord.effective_kappa()).abs() < 0.01);
-        assert!((restored.uncertainty_premium_bps() - coord.uncertainty_premium_bps()).abs() < 0.01);
+        assert!(
+            (restored.uncertainty_premium_bps() - coord.uncertainty_premium_bps()).abs() < 0.01
+        );
         assert!((restored.as_rate() - coord.as_rate()).abs() < 0.001);
     }
 }

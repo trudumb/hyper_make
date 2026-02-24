@@ -168,10 +168,7 @@ impl ExperienceLogger {
         let filename = format!("{source}_{timestamp}_{session_id}.jsonl");
         let path = dir.join(filename);
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         Ok(Self {
             writer: BufWriter::new(file),
@@ -180,10 +177,7 @@ impl ExperienceLogger {
     }
 
     /// Attach a live streaming channel to the training service.
-    pub fn with_live_tx(
-        mut self,
-        tx: tokio::sync::mpsc::Sender<ExperienceRecord>,
-    ) -> Self {
+    pub fn with_live_tx(mut self, tx: tokio::sync::mpsc::Sender<ExperienceRecord>) -> Self {
         self.live_tx = Some(tx);
         self
     }
@@ -258,8 +252,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut logger =
-            ExperienceLogger::new(dir.to_str().unwrap(), ExperienceSource::Paper, "test")
-                .unwrap();
+            ExperienceLogger::new(dir.to_str().unwrap(), ExperienceSource::Paper, "test").unwrap();
 
         let record = ExperienceRecord {
             state_idx: 0,

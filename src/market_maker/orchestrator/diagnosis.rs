@@ -179,9 +179,7 @@ mod tests {
         };
         assert!(format!("{r}").contains("size_below_min"));
 
-        let r = BlockingReason::QuotaExhausted {
-            headroom_pct: 3.2,
-        };
+        let r = BlockingReason::QuotaExhausted { headroom_pct: 3.2 };
         assert!(format!("{r}").contains("3.2%"));
     }
 }

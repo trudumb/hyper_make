@@ -46,7 +46,6 @@ pub enum CalibrationState {
     Stale { hours_since_calibration: f64 },
 }
 
-
 /// Calibrated risk model using log-additive gamma.
 ///
 /// Replaces the multiplicative scalar explosion with principled log-space addition:
@@ -184,7 +183,7 @@ impl CalibratedRiskModel {
         Self {
             log_gamma_base: 0.20_f64.ln(), // Higher base during warmup
             beta_volatility: 1.5,          // 50% more conservative
-            beta_toxicity: 0.75, // Interim conservative (1.5x of default 0.5)
+            beta_toxicity: 0.75,           // Interim conservative (1.5x of default 0.5)
             // DISABLED: inventory scaling handled by continuous γ(q) quadratic in glft.rs
             beta_inventory: 0.0,
             beta_hawkes: 0.6,
@@ -233,8 +232,8 @@ impl CalibratedRiskModel {
         // gamma_reg_steepness controls how fast the tanh saturates.
         const MAX_GAMMA_CONTRIBUTION: f64 = 1.5; // max ~4.5x gamma inflation (exp(1.5))
         const GAMMA_REG_STEEPNESS: f64 = 2.0; // how fast sigmoid saturates
-        let regulated_sum =
-            MAX_GAMMA_CONTRIBUTION * (raw_sum / (MAX_GAMMA_CONTRIBUTION * GAMMA_REG_STEEPNESS)).tanh();
+        let regulated_sum = MAX_GAMMA_CONTRIBUTION
+            * (raw_sum / (MAX_GAMMA_CONTRIBUTION * GAMMA_REG_STEEPNESS)).tanh();
 
         log::trace!(
             "[SPREAD TRACE] gamma features: raw_sum={:.4}, regulated_sum={:.4}, delta={:.4}",
@@ -271,8 +270,8 @@ impl CalibratedRiskModel {
                 required: min_samples,
             };
         } else if self.is_stale(current_ms, staleness_hours) {
-            let hours = (current_ms.saturating_sub(self.last_calibration_ms)) as f64
-                / (3600.0 * 1000.0);
+            let hours =
+                (current_ms.saturating_sub(self.last_calibration_ms)) as f64 / (3600.0 * 1000.0);
             self.state = CalibrationState::Stale {
                 hours_since_calibration: hours,
             };
@@ -543,8 +542,8 @@ impl RiskFeatures {
             depth_depletion,
             model_uncertainty,
             position_direction_confidence,
-            cascade_intensity: 0.0,     // Not available from MarketState
-            tail_risk_intensity: 0.0,   // Not available from MarketState
+            cascade_intensity: 0.0,   // Not available from MarketState
+            tail_risk_intensity: 0.0, // Not available from MarketState
         }
     }
 }
@@ -577,10 +576,10 @@ pub struct RiskModelConfig {
 impl Default for RiskModelConfig {
     fn default() -> Self {
         Self {
-            use_calibrated_risk_model: true, // Log-additive model enabled
-            risk_model_blend: 1.0,           // Pure log-additive (no multiplicative explosion)
-            sigma_baseline: 0.0002,           // 2 bps per √second
-            kappa_baseline: 2500.0,           // Prior for liquid markets
+            use_calibrated_risk_model: true,    // Log-additive model enabled
+            risk_model_blend: 1.0,              // Pure log-additive (no multiplicative explosion)
+            sigma_baseline: 0.0002,             // 2 bps per √second
+            kappa_baseline: 2500.0,             // Prior for liquid markets
             book_depth_baseline_usd: 100_000.0, // $100k baseline
             min_calibration_samples: 100,
             calibration_staleness_hours: 4.0,
@@ -711,10 +710,11 @@ impl GammaCalibrationTracker {
         kappa: f64,
         tau: f64,
     ) {
-        let breakeven = match Self::breakeven_gamma(spread_bps, markout_as_bps, fee_bps, sigma, kappa, tau) {
-            Some(g) => g,
-            None => return,
-        };
+        let breakeven =
+            match Self::breakeven_gamma(spread_bps, markout_as_bps, fee_bps, sigma, kappa, tau) {
+                Some(g) => g,
+                None => return,
+            };
 
         if predicted_gamma < 0.001 || !predicted_gamma.is_finite() {
             return;
@@ -965,12 +965,12 @@ mod tests {
         // The log-additive model prevents the 1.2^7 = 3.6x multiplicative explosion
         let model = CalibratedRiskModel::default();
         let stressed = RiskFeatures {
-            excess_volatility: 1.5, // 150% above baseline
-            toxicity_score: 0.7,    // High toxicity
-            inventory_fraction: 0.8, // Near max inventory
-            excess_intensity: 1.0,  // Double baseline
-            depth_depletion: 0.6,   // Thin book
-            model_uncertainty: 0.8, // High uncertainty
+            excess_volatility: 1.5,             // 150% above baseline
+            toxicity_score: 0.7,                // High toxicity
+            inventory_fraction: 0.8,            // Near max inventory
+            excess_intensity: 1.0,              // Double baseline
+            depth_depletion: 0.6,               // Thin book
+            model_uncertainty: 0.8,             // High uncertainty
             position_direction_confidence: 0.3, // Low confidence
             cascade_intensity: 0.0,
             tail_risk_intensity: 0.0,
@@ -984,10 +984,7 @@ mod tests {
             gamma < 5.0,
             "stressed gamma should be bounded by gamma_max: got {gamma}"
         );
-        assert!(
-            gamma > 0.05,
-            "gamma should still be positive: got {gamma}"
-        );
+        assert!(gamma > 0.05, "gamma should still be positive: got {gamma}");
         // Key insight: at base gamma 0.15 with moderate stress, the model stays reasonable
         let moderate = RiskFeatures {
             excess_volatility: 0.5,
@@ -1080,7 +1077,11 @@ mod tests {
         // target(4.5) < kappa_term(10) → gamma can be near 0
         let g = GammaCalibrationTracker::breakeven_gamma(5.0, 3.0, 1.5, 0.0002, 2000.0, 10.0);
         assert!(g.is_some());
-        assert!(g.unwrap() < 0.1, "Low target → near-zero gamma: {}", g.unwrap());
+        assert!(
+            g.unwrap() < 0.1,
+            "Low target → near-zero gamma: {}",
+            g.unwrap()
+        );
 
         // spread=20 bps, AS=5 bps, fee=1.5 bps → target=6.5 bps
         // kappa=500 → 2/500*10000 = 40 bps kappa term
@@ -1096,13 +1097,13 @@ mod tests {
         // Predicted gamma consistently 2x higher than breakeven
         for _ in 0..20 {
             tracker.record_markout(
-                0.2,   // predicted
-                5.0,   // spread
-                2.0,   // markout AS
-                1.5,   // fee
-                0.001, // sigma (high vol so denominator is meaningful)
+                0.2,    // predicted
+                5.0,    // spread
+                2.0,    // markout AS
+                1.5,    // fee
+                0.001,  // sigma (high vol so denominator is meaningful)
                 5000.0, // kappa
-                5.0,   // tau
+                5.0,    // tau
             );
         }
 
@@ -1122,8 +1123,8 @@ mod tests {
         // target = AS(2) + fee(1.5) = 3.5 bps
         // target(3.5) < kappa_term(4.0) → breakeven near 0.01 (floor)
         // Feed predicted gamma that matches breakeven
-        let be = GammaCalibrationTracker::breakeven_gamma(5.0, 2.0, 1.5, 0.001, 5000.0, 5.0)
-            .unwrap();
+        let be =
+            GammaCalibrationTracker::breakeven_gamma(5.0, 2.0, 1.5, 0.001, 5000.0, 5.0).unwrap();
 
         for _ in 0..20 {
             tracker.record_markout(be, 5.0, 2.0, 1.5, 0.001, 5000.0, 5.0);

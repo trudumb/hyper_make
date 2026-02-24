@@ -166,21 +166,9 @@ mod tests {
 
     #[test]
     fn test_regime_from_probs() {
-        assert_eq!(
-            Regime::from_probs(&[0.8, 0.1, 0.05, 0.05]),
-            Regime::Quiet
-        );
-        assert_eq!(
-            Regime::from_probs(&[0.1, 0.7, 0.1, 0.1]),
-            Regime::Normal
-        );
-        assert_eq!(
-            Regime::from_probs(&[0.1, 0.1, 0.7, 0.1]),
-            Regime::Bursty
-        );
-        assert_eq!(
-            Regime::from_probs(&[0.1, 0.1, 0.1, 0.7]),
-            Regime::Cascade
-        );
+        assert_eq!(Regime::from_probs(&[0.8, 0.1, 0.05, 0.05]), Regime::Quiet);
+        assert_eq!(Regime::from_probs(&[0.1, 0.7, 0.1, 0.1]), Regime::Normal);
+        assert_eq!(Regime::from_probs(&[0.1, 0.1, 0.7, 0.1]), Regime::Bursty);
+        assert_eq!(Regime::from_probs(&[0.1, 0.1, 0.1, 0.7]), Regime::Cascade);
     }
 }

@@ -79,8 +79,8 @@ pub mod state_machine;
 // Re-export key types
 pub use fill_tracker::{FillMetrics, FillRecord, FillTracker, Side};
 pub use mode_handlers::apply_mode_to_ladder;
-pub use state_machine::{ExecutionMode, ModeSelectionInput, select_mode};
 pub use order_lifecycle::{
     CancelAnalysis, CreateOrderParams, FillStatistics, OrderEvent, OrderLifecycle,
     OrderLifecycleTracker, OrderState,
 };
+pub use state_machine::{select_mode, ExecutionMode, ModeSelectionInput};

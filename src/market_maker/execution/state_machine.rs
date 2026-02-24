@@ -83,7 +83,6 @@ pub struct ModeSelectionInput {
     pub is_warmup: bool,
 
     // --- Cascade & Hawkes fields (A2: continuous GLFT-based quoting) ---
-
     /// Cascade size factor [0, 1]. 0 = full cascade (OI collapsing), 1 = calm.
     /// Derived from OI-drop and liquidation cascade tracker.
     #[serde(default = "default_cascade_size_factor")]
@@ -188,7 +187,10 @@ pub fn select_mode(input: &ModeSelectionInput) -> ExecutionMode {
     // Red zone → wider spreads via elevated γ (from regime_gamma_multiplier).
     // Yellow zone → γ·q penalty already biases against accumulation.
     // Toxic regime → routes through σ_conditional (Hawkes) and AS floor.
-    ExecutionMode::Maker { bid: true, ask: true }
+    ExecutionMode::Maker {
+        bid: true,
+        ask: true,
+    }
 }
 
 #[cfg(test)]
@@ -204,7 +206,7 @@ mod tests {
             has_alpha: true,
             position: 0.0,
             capital_tier: CapitalTier::Large, // Default to Large so existing tests pass unchanged
-            is_warmup: false, // Default: calibrated (not warming up)
+            is_warmup: false,                 // Default: calibrated (not warming up)
             // Cascade & Hawkes defaults: non-triggering values
             cascade_size_factor: default_cascade_size_factor(),
             cascade_threshold: default_cascade_threshold(),
@@ -661,7 +663,7 @@ mod tests {
         // Long position (8.0) with sell pressure (flow=-1.0) is adverse.
         let input = ModeSelectionInput {
             position_zone: PositionZone::Red,
-            position: 8.0,       // 80% of max_position=10.0
+            position: 8.0, // 80% of max_position=10.0
             max_position: 10.0,
             reduce_only_threshold: 0.7,
             flow_direction: -1.0, // Sell pressure opposes long position
@@ -685,7 +687,7 @@ mod tests {
         // Long position (8.0) with buy pressure (flow=+1.0) supports us — stay Maker.
         let input = ModeSelectionInput {
             position_zone: PositionZone::Red,
-            position: 8.0,       // 80% of max_position=10.0
+            position: 8.0, // 80% of max_position=10.0
             max_position: 10.0,
             reduce_only_threshold: 0.7,
             flow_direction: 1.0, // Buy pressure ALIGNS with long position

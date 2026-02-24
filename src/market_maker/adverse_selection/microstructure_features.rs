@@ -216,7 +216,6 @@ pub struct MicrostructureFeatures {
     pub confidence: f64,
 
     // === NEW ENTROPY FEATURES ===
-
     /// Trade size entropy [0, 1]
     /// Low entropy = concentrated sizes (potential informed trading)
     /// High entropy = diverse sizes (noise trading)
@@ -406,7 +405,11 @@ impl MicrostructureExtractor {
         // === Price impact (Kyle's lambda) ===
         if self.last_mid > 0.0 {
             let price_change_bps = (trade.price - self.last_mid) / self.last_mid * 10_000.0;
-            let signed_volume = if trade.is_buy { trade.size } else { -trade.size };
+            let signed_volume = if trade.is_buy {
+                trade.size
+            } else {
+                -trade.size
+            };
 
             // Estimate impact as price_change / signed_volume
             if signed_volume.abs() > 1e-10 {
@@ -473,7 +476,14 @@ impl MicrostructureExtractor {
     }
 
     /// Update with new book state
-    pub fn on_book_update(&mut self, bid: f64, ask: f64, bid_size: f64, ask_size: f64, timestamp_ms: u64) {
+    pub fn on_book_update(
+        &mut self,
+        bid: f64,
+        ask: f64,
+        bid_size: f64,
+        ask_size: f64,
+        timestamp_ms: u64,
+    ) {
         // === Spread tracking ===
         if bid > 0.0 && ask > 0.0 {
             let mid = (bid + ask) / 2.0;
@@ -505,7 +515,8 @@ impl MicrostructureExtractor {
                     break;
                 }
             }
-            self.book_imbalance_history.push_back((timestamp_ms, imbalance));
+            self.book_imbalance_history
+                .push_back((timestamp_ms, imbalance));
         }
     }
 
@@ -540,7 +551,8 @@ impl MicrostructureExtractor {
 
     /// Extract current features
     pub fn extract(&self) -> MicrostructureFeatures {
-        let warmup_ratio = (self.trade_count as f64 / self.config.min_warmup_trades as f64).min(1.0);
+        let warmup_ratio =
+            (self.trade_count as f64 / self.config.min_warmup_trades as f64).min(1.0);
 
         if warmup_ratio < 0.5 {
             return MicrostructureFeatures {
@@ -552,18 +564,18 @@ impl MicrostructureExtractor {
         let cap = self.config.zscore_cap;
 
         // === Intensity z-score ===
-        let intensity_zscore = self.intensity_stats
+        let intensity_zscore = self
+            .intensity_stats
             .zscore(self.current_intensity)
             .clamp(-cap, cap);
 
         // === Price impact z-score ===
         let recent_impact = self.impact_stats.mean();
-        let impact_zscore = self.impact_stats
-            .zscore(recent_impact)
-            .clamp(-cap, cap);
+        let impact_zscore = self.impact_stats.zscore(recent_impact).clamp(-cap, cap);
 
         // === Run length z-score ===
-        let run_length_zscore = self.run_length_stats
+        let run_length_zscore = self
+            .run_length_stats
             .zscore(self.current_run_length as f64)
             .clamp(-cap, cap);
 
@@ -658,15 +670,15 @@ impl MicrostructureExtractor {
         // - Volume imbalance and size are supporting signals
         // - Entropy features indicate informed vs noise trading
 
-        const W_IMPACT: f64 = 0.22;      // Kyle's lambda - most theoretically grounded
-        const W_RUN: f64 = 0.18;         // Run length - strong clustering signal
-        const W_INTENSITY: f64 = 0.12;   // Trade bursts
-        const W_ARRIVAL: f64 = 0.12;     // Fast arrivals
-        const W_SPREAD: f64 = 0.08;      // MM response
-        const W_IMBALANCE: f64 = 0.08;   // Directional pressure
-        const W_SIZE: f64 = 0.05;        // Large trades
-        const W_SIZE_CONC: f64 = 0.08;   // Size concentration (informed = concentrated)
-        const W_DIR_CONC: f64 = 0.07;    // Direction concentration (informed = one-sided)
+        const W_IMPACT: f64 = 0.22; // Kyle's lambda - most theoretically grounded
+        const W_RUN: f64 = 0.18; // Run length - strong clustering signal
+        const W_INTENSITY: f64 = 0.12; // Trade bursts
+        const W_ARRIVAL: f64 = 0.12; // Fast arrivals
+        const W_SPREAD: f64 = 0.08; // MM response
+        const W_IMBALANCE: f64 = 0.08; // Directional pressure
+        const W_SIZE: f64 = 0.05; // Large trades
+        const W_SIZE_CONC: f64 = 0.08; // Size concentration (informed = concentrated)
+        const W_DIR_CONC: f64 = 0.07; // Direction concentration (informed = one-sided)
 
         // Convert z-scores to [0, 1] probabilities using sigmoid
         let sigmoid = |z: f64| 1.0 / (1.0 + (-z).exp());
@@ -785,7 +797,10 @@ mod tests {
 
         let features = extractor.extract();
         // Run length z-score should be positive (longer than average)
-        assert!(features.run_length_zscore > 0.0, "Run length z-score should be positive for long run");
+        assert!(
+            features.run_length_zscore > 0.0,
+            "Run length z-score should be positive for long run"
+        );
     }
 
     #[test]
@@ -804,7 +819,11 @@ mod tests {
         }
 
         let features = extractor.extract();
-        assert!(features.intensity_zscore > 1.0, "Intensity should spike: {}", features.intensity_zscore);
+        assert!(
+            features.intensity_zscore > 1.0,
+            "Intensity should spike: {}",
+            features.intensity_zscore
+        );
     }
 
     #[test]
@@ -831,7 +850,10 @@ mod tests {
         }
 
         let features = extractor.extract();
-        assert!(features.volume_imbalance < 0.0, "Should show sell imbalance");
+        assert!(
+            features.volume_imbalance < 0.0,
+            "Should show sell imbalance"
+        );
     }
 
     #[test]
@@ -845,13 +867,19 @@ mod tests {
         }
 
         let features = extractor.extract();
-        assert!(features.spread_widening.abs() < 0.5, "Normal spread should have low widening signal");
+        assert!(
+            features.spread_widening.abs() < 0.5,
+            "Normal spread should have low widening signal"
+        );
 
         // Widen spread to 20 bps
         extractor.on_book_update(99.9, 100.1, 10.0, 10.0, 5000);
 
         let features = extractor.extract();
-        assert!(features.spread_widening > 0.5, "Widened spread should show positive signal");
+        assert!(
+            features.spread_widening > 0.5,
+            "Widened spread should show positive signal"
+        );
     }
 
     #[test]

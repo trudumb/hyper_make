@@ -19,17 +19,20 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 use hyperliquid_rust_sdk::{
-    init_logging, AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CascadeConfig, CollateralInfo,
-    DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, ExchangeResponseStatus,
-    ExchangeContext, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor,
+    init_logging,
+    market_maker::{
+        auto_derive::auto_derive, environment::live::LiveEnvironment, resolve_binance_symbol,
+        BinanceFeed,
+    },
+    AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CascadeConfig, CollateralInfo,
+    DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, ExchangeContext,
+    ExchangeResponseStatus, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor,
     ImpulseControlConfig, InfoClient, InventoryAwareStrategy, KillSwitchConfig, LadderConfig,
     LadderStrategy, LiquidationConfig, LogConfig, LogFormat as MmLogFormat, MarginConfig,
-    MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig,
-    QueueConfig, QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
+    MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
+    QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
     RejectionRateLimitConfig, RiskConfig, RiskModelConfig, SpreadConfig, SpreadProfile,
     StochasticConfig, SymmetricStrategy,
-    market_maker::{BinanceFeed, resolve_binance_symbol,
-    auto_derive::auto_derive, environment::live::LiveEnvironment},
 };
 
 // ============================================================================
@@ -352,6 +355,14 @@ struct Cli {
     #[arg(long, default_value = "1000.0")]
     paper_balance: f64,
 
+    // === Shadow Tuner (Continuous Background Optimization) ===
+    /// Enable the Shadow Tuner: a background CMA-ES optimizer that continuously
+    /// replays recent market data with candidate hyperparameters and hot-swaps
+    /// the best macro settings (gamma, inventory penalty, spread floors) into
+    /// the live engine.
+    #[arg(long)]
+    enable_shadow_tuner: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -432,14 +443,30 @@ pub struct KillSwitchAppConfig {
     pub enabled: bool,
 }
 
-fn default_ks_max_daily_loss() -> f64 { 500.0 }
-fn default_ks_max_drawdown() -> f64 { 0.05 }
-fn default_ks_max_position_value() -> f64 { 10_000.0 }
-fn default_ks_max_position_contracts() -> f64 { 1.0 }
-fn default_ks_stale_data_secs() -> u64 { 30 }
-fn default_ks_cascade_severity() -> f64 { 5.0 }
-fn default_ks_max_rate_limit_errors() -> u32 { 3 }
-fn default_ks_enabled() -> bool { true }
+fn default_ks_max_daily_loss() -> f64 {
+    500.0
+}
+fn default_ks_max_drawdown() -> f64 {
+    0.05
+}
+fn default_ks_max_position_value() -> f64 {
+    10_000.0
+}
+fn default_ks_max_position_contracts() -> f64 {
+    1.0
+}
+fn default_ks_stale_data_secs() -> u64 {
+    30
+}
+fn default_ks_cascade_severity() -> f64 {
+    5.0
+}
+fn default_ks_max_rate_limit_errors() -> u32 {
+    3
+}
+fn default_ks_enabled() -> bool {
+    true
+}
 
 impl Default for KillSwitchAppConfig {
     fn default() -> Self {
@@ -583,11 +610,11 @@ impl Default for TradingConfig {
     fn default() -> Self {
         Self {
             asset: default_asset(),
-            capital_usd: None,                  // Auto-derived from account value
-            target_liquidity: None,             // Auto-derived from capital_usd
-            risk_aversion: None,                // Auto-derived from spread_profile
-            max_bps_diff: None,                 // Auto-derived from fee structure
-            max_absolute_position_size: None,   // Auto-derived from margin
+            capital_usd: None,                // Auto-derived from account value
+            target_liquidity: None,           // Auto-derived from capital_usd
+            risk_aversion: None,              // Auto-derived from spread_profile
+            max_bps_diff: None,               // Auto-derived from fee structure
+            max_absolute_position_size: None, // Auto-derived from margin
             max_position_usd: None,
             leverage: None,
             decimals: None,
@@ -978,8 +1005,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         println!(
                             "Post-calibration: confidence {:.2}, verdict {:?}",
-                            confidence.overall,
-                            found.bundle.readiness.verdict,
+                            confidence.overall, found.bundle.readiness.verdict,
                         );
                     }
                 }
@@ -1020,21 +1046,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // All trading params are now Optional. Resolution priority:
     //   CLI flag → TOML explicit value → auto_derive(capital_usd, exchange_data)
     // These overrides are resolved later (after mark_px is known) in the auto_derive pipeline.
-    let target_liquidity_override: Option<f64> = cli.target_liquidity.or(config.trading.target_liquidity);
+    let target_liquidity_override: Option<f64> =
+        cli.target_liquidity.or(config.trading.target_liquidity);
     let risk_aversion_override: Option<f64> = cli.risk_aversion.or(config.trading.risk_aversion);
     let max_bps_diff_override: Option<u16> = cli.max_bps_diff.or(config.trading.max_bps_diff);
 
     // Resolve capital_usd: CLI > TOML capital_usd > TOML max_position_usd (backward compat)
-    let capital_usd_resolved: Option<f64> = cli.capital_usd
+    let capital_usd_resolved: Option<f64> = cli
+        .capital_usd
         .or(config.trading.capital_usd)
         .or(config.trading.max_position_usd); // backward compat: treat max_position_usd as capital
 
     // max_position is optional - will default to margin-based limit later
     // Priority: CLI --max-position-usd > TOML max_position_usd > CLI --max-position > TOML max_absolute_position_size
     // USD values are converted to contracts later when mark_px is known
-    let max_position_usd_override: Option<f64> = cli
-        .max_position_usd
-        .or(config.trading.max_position_usd);
+    let max_position_usd_override: Option<f64> =
+        cli.max_position_usd.or(config.trading.max_position_usd);
     let max_position_contracts_override: Option<f64> = cli
         .max_position
         .or(config.trading.max_absolute_position_size);
@@ -1411,11 +1438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .account_value
                         .parse()
                         .unwrap_or(0.0);
-                    let margin: f64 = state
-                        .margin_summary
-                        .account_value
-                        .parse()
-                        .unwrap_or(0.0);
+                    let margin: f64 = state.margin_summary.account_value.parse().unwrap_or(0.0);
                     cross.max(margin)
                 }
                 Err(e) => {
@@ -1488,9 +1511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sz_decimals,
                     min_notional: 10.0,
                 };
-                let derived = auto_derive(
-                    capital_usd, spread_profile, &exchange_ctx,
-                );
+                let derived = auto_derive(capital_usd, spread_profile, &exchange_ctx);
 
                 // 3. Viability check
                 if !derived.viable {
@@ -1500,8 +1521,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !cli.force {
                         return Err(format!(
                             "Cannot trade: {}",
-                            derived.diagnostic.as_deref().unwrap_or("insufficient capital")
-                        ).into());
+                            derived
+                                .diagnostic
+                                .as_deref()
+                                .unwrap_or("insufficient capital")
+                        )
+                        .into());
                     }
                     warn!("--force: proceeding despite insufficient capital");
                 }
@@ -1521,18 +1546,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let max_bps_diff = max_bps_diff_override.unwrap_or(derived.max_bps_diff);
 
                 // Resolve USD→contracts for explicit position overrides
-                let effective_override: Option<f64> = if let Some(usd_limit) = max_position_usd_override {
-                    let contracts = usd_limit / mark_px;
-                    info!(
-                        max_position_usd = %format!("{:.2}", usd_limit),
-                        mark_px = %format!("{:.2}", mark_px),
-                        derived_contracts = %format!("{:.6}", contracts),
-                        "USD position limit → contracts (explicit override)"
-                    );
-                    Some(contracts)
-                } else {
-                    max_position_override
-                };
+                let effective_override: Option<f64> =
+                    if let Some(usd_limit) = max_position_usd_override {
+                        let contracts = usd_limit / mark_px;
+                        info!(
+                            max_position_usd = %format!("{:.2}", usd_limit),
+                            mark_px = %format!("{:.2}", mark_px),
+                            derived_contracts = %format!("{:.6}", contracts),
+                            "USD position limit → contracts (explicit override)"
+                        );
+                        Some(contracts)
+                    } else {
+                        max_position_override
+                    };
 
                 // Max position: explicit override capped by margin, or auto-derived
                 let safety_factor = 0.5;
@@ -1594,7 +1620,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fallback_max = %format!("{:.6}", fallback_max),
                     "Failed to query asset data: {e}, using fallback values"
                 );
-                (fallback_liquidity, fallback_gamma, fallback_bps, fallback_max)
+                (
+                    fallback_liquidity,
+                    fallback_gamma,
+                    fallback_bps,
+                    fallback_max,
+                )
             }
         }
     };
@@ -1725,7 +1756,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Fill cascade detection (configurable thresholds, multipliers, cooldowns)
         cascade: CascadeConfig::default(),
         // Reference symbol for cross-market signals (auto-detected for HIP-3)
-        reference_symbol: cli.reference_symbol.clone()
+        reference_symbol: cli
+            .reference_symbol
+            .clone()
             .or_else(|| auto_detect_reference(&asset)),
     };
 
@@ -2078,6 +2111,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint_dir = PathBuf::from(format!("data/checkpoints/{asset}"));
     market_maker = market_maker.with_checkpoint_dir(checkpoint_dir);
 
+    // Wire Shadow Tuner if enabled (continuous CMA-ES background optimization)
+    if cli.enable_shadow_tuner {
+        let tuner_config = hyperliquid_rust_sdk::market_maker::ShadowTunerConfig::default();
+        let (mm, tuner) = market_maker.with_shadow_tuner(tuner_config, None);
+        market_maker = mm;
+        std::thread::spawn(move || {
+            let mut tuner = tuner;
+            tuner.run();
+        });
+        tracing::info!("Shadow Tuner background thread spawned");
+    }
+
     // Wire signal export path for diagnostic infrastructure
     if let Some(ref path) = cli.signal_export_path {
         market_maker = market_maker.with_signal_export_path(path.clone());
@@ -2090,10 +2135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wire Binance feed for cross-exchange lead-lag signal.
     // Auto-derive Binance symbol from asset; disable for HL-native tokens.
     if !cli.disable_binance_feed {
-        let binance_symbol = resolve_binance_symbol(
-            &asset,
-            cli.binance_symbol.as_deref(),
-        );
+        let binance_symbol = resolve_binance_symbol(&asset, cli.binance_symbol.as_deref());
         if let Some(ref sym) = binance_symbol {
             let (tx, rx) = tokio::sync::mpsc::channel(1000);
             let feed = BinanceFeed::for_symbol(sym, tx);
@@ -2119,7 +2161,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Set changepoint detector to ThinDex regime: threshold 0.85, 2 confirmations
             // Reduces false changepoints from noisy HIP-3 thin-book data
             market_maker.set_changepoint_regime_thin_dex();
-            tracing::info!("Changepoint detector set to ThinDex regime (threshold=0.85, confirmations=2)");
+            tracing::info!(
+                "Changepoint detector set to ThinDex regime (threshold=0.85, confirmations=2)"
+            );
         } else {
             tracing::warn!(
                 asset = %asset,
@@ -2142,9 +2186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Uses multi-path discovery to find priors across asset naming conventions.
     {
         use hyperliquid_rust_sdk::market_maker::checkpoint::{
-            PriorInject,
-            discovery::discover_prior,
-            transfer::InjectionConfig,
+            discovery::discover_prior, transfer::InjectionConfig, PriorInject,
         };
 
         let discovered = discover_prior(
@@ -2398,16 +2440,10 @@ fn print_startup_banner(asset: &str, quote_asset: &str, network: &BaseUrl, dry_r
 
     eprintln!();
     eprintln!("╔═══════════════════════════════════════════════════════════╗");
-    eprintln!(
-        "║     Hyperliquid Market Maker v{version:<10}{mode}              ║"
-    );
+    eprintln!("║     Hyperliquid Market Maker v{version:<10}{mode}              ║");
     eprintln!("║                                                           ║");
-    eprintln!(
-        "║  Asset:   {asset:<15}  Network: {network_str:<15}   ║"
-    );
-    eprintln!(
-        "║  Quote:   {quote_asset:<15}                                ║"
-    );
+    eprintln!("║  Asset:   {asset:<15}  Network: {network_str:<15}   ║");
+    eprintln!("║  Quote:   {quote_asset:<15}                                ║");
     eprintln!("╚═══════════════════════════════════════════════════════════╝");
     eprintln!();
 }
@@ -2465,9 +2501,9 @@ async fn list_available_dexs(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
 /// consuming market data and synthesizing fills through the FillSimulator.
 async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::error::Error>> {
     use hyperliquid_rust_sdk::market_maker::{
+        checkpoint::PriorExtract,
         environment::paper::{PaperEnvironment, PaperEnvironmentConfig},
         simulation::fill_sim::FillSimulatorConfig,
-        checkpoint::PriorExtract,
     };
 
     let config = load_config(cli)?;
@@ -2522,7 +2558,12 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
 
     // Auto-calculate decimals
     let decimals = cli.decimals.or(config.trading.decimals).unwrap_or_else(|| {
-        let is_spot = meta.universe.iter().position(|a| a.name == asset).map(|i| i >= 10000).unwrap_or(false);
+        let is_spot = meta
+            .universe
+            .iter()
+            .position(|a| a.name == asset)
+            .map(|i| i >= 10000)
+            .unwrap_or(false);
         let max_decimals: u32 = if is_spot { 8 } else { 6 };
         max_decimals.saturating_sub(sz_decimals)
     });
@@ -2530,7 +2571,8 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     // === Paper auto-derive: same pipeline as live ===
     // Query mark price for auto-derive (same API call live uses)
     let paper_balance = cli.paper_balance;
-    let leverage = cli.leverage
+    let leverage = cli
+        .leverage
         .or(config.trading.leverage)
         .unwrap_or(asset_meta.max_leverage as u32);
     let spread_profile = SpreadProfile::from_str(&cli.spread_profile);
@@ -2551,7 +2593,9 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
             let mark_px: f64 = match &asset_data_result {
                 Ok(data) => data.mark_px.parse().unwrap_or(1.0),
                 Err(e) => {
-                    warn!("Failed to query asset data for paper auto-derive: {e}, using mark_px=1.0");
+                    warn!(
+                        "Failed to query asset data for paper auto-derive: {e}, using mark_px=1.0"
+                    );
                     1.0
                 }
             };
@@ -2594,12 +2638,16 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
 
     // Resolve collateral
     let collateral = if let Some(token_index) = meta.collateral_token {
-        let spot_meta = info_client_for_mm.spot_meta().await
+        let spot_meta = info_client_for_mm
+            .spot_meta()
+            .await
             .map_err(|e| format!("Failed to get spot metadata: {e}"))?;
         CollateralInfo::from_token_index(token_index, &spot_meta)
     } else if dex.is_some() {
         // HIP-3 DEX but meta.collateral_token absent — assume USDE (most common)
-        let spot_meta = info_client_for_mm.spot_meta().await
+        let spot_meta = info_client_for_mm
+            .spot_meta()
+            .await
             .map_err(|e| format!("Failed to get spot metadata for HIP-3 collateral: {e}"))?;
         let usde_info = CollateralInfo::from_token_index(235, &spot_meta);
         warn!(
@@ -2629,7 +2677,8 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
 
     // Build MmConfig (same struct literal pattern as live, simplified)
     // Paper trader uses auto-derived values, with CLI/config overrides taking priority
-    let risk_aversion = cli.risk_aversion
+    let risk_aversion = cli
+        .risk_aversion
         .or(config.trading.risk_aversion)
         .or(derived_risk_aversion)
         .unwrap_or(0.3);
@@ -2639,7 +2688,8 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     let fee_bps = 1.5_f64;
 
     // Target liquidity: CLI > config > auto-derived > conservative default
-    let target_liquidity = cli.target_liquidity
+    let target_liquidity = cli
+        .target_liquidity
         .or(config.trading.target_liquidity)
         .or(derived_target_liquidity)
         .unwrap_or(0.01);
@@ -2648,7 +2698,10 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         asset: Arc::from(asset.as_str()),
         target_liquidity,
         risk_aversion,
-        max_bps_diff: cli.max_bps_diff.or(config.trading.max_bps_diff).unwrap_or(5),
+        max_bps_diff: cli
+            .max_bps_diff
+            .or(config.trading.max_bps_diff)
+            .unwrap_or(5),
         max_position,
         max_position_usd: 0.0,
         max_position_user_specified: cli.max_position.is_some(),
@@ -2673,7 +2726,9 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         spread_profile,
         fee_bps,
         cascade: CascadeConfig::default(),
-        reference_symbol: cli.reference_symbol.clone()
+        reference_symbol: cli
+            .reference_symbol
+            .clone()
             .or_else(|| auto_detect_reference(&asset)),
     };
 
@@ -2749,14 +2804,12 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         "Paper: LadderStrategy config"
     );
 
-    let strategy: Box<dyn QuotingStrategy> = Box::new(
-        LadderStrategy::with_full_config(
-            risk_cfg,
-            ladder_cfg,
-            risk_model_cfg,
-            Default::default(), // KellySizer
-        ),
-    );
+    let strategy: Box<dyn QuotingStrategy> = Box::new(LadderStrategy::with_full_config(
+        risk_cfg,
+        ladder_cfg,
+        risk_model_cfg,
+        Default::default(), // KellySizer
+    ));
 
     // Create metrics
     let metrics = Arc::new(MarketMakerMetrics::new());
@@ -2820,9 +2873,22 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     market_maker = market_maker.with_experience_logging("logs/experience");
 
     // Wire checkpoint persistence (use canonical base symbol for consistent paths)
-    let base_sym = hyperliquid_rust_sdk::market_maker::checkpoint::asset_identity::base_symbol(&asset);
+    let base_sym =
+        hyperliquid_rust_sdk::market_maker::checkpoint::asset_identity::base_symbol(&asset);
     let checkpoint_dir = PathBuf::from(format!("data/checkpoints/paper/{base_sym}"));
     market_maker = market_maker.with_checkpoint_dir(checkpoint_dir);
+
+    // Wire Shadow Tuner if enabled (continuous CMA-ES background optimization)
+    if cli.enable_shadow_tuner {
+        let tuner_config = hyperliquid_rust_sdk::market_maker::ShadowTunerConfig::default();
+        let (mm, tuner) = market_maker.with_shadow_tuner(tuner_config, None);
+        market_maker = mm;
+        std::thread::spawn(move || {
+            let mut tuner = tuner;
+            tuner.run();
+        });
+        tracing::info!("Shadow Tuner background thread spawned (paper mode)");
+    }
 
     // Disable Binance signals for paper (no cross-venue feed)
     market_maker.disable_binance_signals();
@@ -2840,11 +2906,9 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     // Run with optional duration
     if duration > 0 {
         info!(duration_s = duration, "Paper trading with time limit");
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(duration),
-            market_maker.run(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(duration), market_maker.run())
+                .await;
 
         match result {
             Ok(Ok(())) => info!("Paper trading completed normally"),
@@ -2863,7 +2927,10 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
                     "Prior readiness assessed"
                 );
                 // Save using canonical base symbol for cross-mode discovery
-                let base_sym = hyperliquid_rust_sdk::market_maker::checkpoint::asset_identity::base_symbol(&asset);
+                let base_sym =
+                    hyperliquid_rust_sdk::market_maker::checkpoint::asset_identity::base_symbol(
+                        &asset,
+                    );
                 // Stamp source_mode for prior chain tracking
                 prior.metadata.source_mode = "paper".to_string();
                 let checkpoint_path = format!("data/checkpoints/paper/{base_sym}/prior.json");

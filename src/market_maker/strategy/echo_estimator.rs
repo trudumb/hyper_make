@@ -44,14 +44,14 @@ impl EchoEstimator {
 
     /// Record trend change magnitude observed around our own fill.
     pub fn update_on_fill(&mut self, trend_change_abs: f64) {
-        self.fill_trend_ema = self.alpha * trend_change_abs
-            + (1.0 - self.alpha) * self.fill_trend_ema;
+        self.fill_trend_ema =
+            self.alpha * trend_change_abs + (1.0 - self.alpha) * self.fill_trend_ema;
     }
 
     /// Record trend change magnitude observed around external/reference move.
     pub fn update_on_reference_move(&mut self, trend_change_abs: f64) {
-        self.external_trend_ema = self.alpha * trend_change_abs
-            + (1.0 - self.alpha) * self.external_trend_ema;
+        self.external_trend_ema =
+            self.alpha * trend_change_abs + (1.0 - self.alpha) * self.external_trend_ema;
     }
 
     /// Fraction of trend changes attributable to self-echo [0, 1].
@@ -81,8 +81,11 @@ mod tests {
     #[test]
     fn test_cold_start_uninformative() {
         let est = EchoEstimator::default();
-        assert!((est.echo_fraction() - 0.5).abs() < 0.01,
-            "Cold start should be ~0.5, got {}", est.echo_fraction());
+        assert!(
+            (est.echo_fraction() - 0.5).abs() < 0.01,
+            "Cold start should be ~0.5, got {}",
+            est.echo_fraction()
+        );
     }
 
     #[test]
@@ -92,8 +95,11 @@ mod tests {
         for _ in 0..100 {
             est.update_on_fill(1.0);
         }
-        assert!(est.echo_fraction() > 0.95,
-            "Pure fill echo should be near 1.0, got {}", est.echo_fraction());
+        assert!(
+            est.echo_fraction() > 0.95,
+            "Pure fill echo should be near 1.0, got {}",
+            est.echo_fraction()
+        );
     }
 
     #[test]
@@ -103,8 +109,11 @@ mod tests {
         for _ in 0..100 {
             est.update_on_reference_move(1.0);
         }
-        assert!(est.echo_fraction() < 0.05,
-            "Pure external should be near 0.0, got {}", est.echo_fraction());
+        assert!(
+            est.echo_fraction() < 0.05,
+            "Pure external should be near 0.0, got {}",
+            est.echo_fraction()
+        );
     }
 
     #[test]
@@ -113,8 +122,11 @@ mod tests {
         let base = 5.0;
         let r = est.r_multiplier(base);
         // echo=0.5 → r = 5.0 * (0.5 + 2.5*0.5) = 5.0 * 1.75 = 8.75
-        assert!((r - base * 1.75).abs() < 0.1,
-            "Neutral echo r_mult should be ~{}, got {r}", base * 1.75);
+        assert!(
+            (r - base * 1.75).abs() < 0.1,
+            "Neutral echo r_mult should be ~{}, got {r}",
+            base * 1.75
+        );
 
         // High echo
         let mut high_echo = EchoEstimator::new(0.5);
@@ -122,8 +134,11 @@ mod tests {
         high_echo.external_trend_ema = 0.0;
         let r_high = high_echo.r_multiplier(base);
         // echo=1.0 → r = 5.0 * (0.5 + 2.5) = 5.0 * 3.0 = 15.0
-        assert!((r_high - base * 3.0).abs() < 0.1,
-            "Full echo r_mult should be ~{}, got {r_high}", base * 3.0);
+        assert!(
+            (r_high - base * 3.0).abs() < 0.1,
+            "Full echo r_mult should be ~{}, got {r_high}",
+            base * 3.0
+        );
 
         // Low echo
         let mut low_echo = EchoEstimator::new(0.5);
@@ -131,7 +146,10 @@ mod tests {
         low_echo.external_trend_ema = 1.0;
         let r_low = low_echo.r_multiplier(base);
         // echo=0.0 → r = 5.0 * (0.5 + 0) = 5.0 * 0.5 = 2.5
-        assert!((r_low - base * 0.5).abs() < 0.1,
-            "No echo r_mult should be ~{}, got {r_low}", base * 0.5);
+        assert!(
+            (r_low - base * 0.5).abs() < 0.1,
+            "No echo r_mult should be ~{}, got {r_low}",
+            base * 0.5
+        );
     }
 }

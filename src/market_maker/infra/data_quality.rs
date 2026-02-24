@@ -86,10 +86,9 @@ impl fmt::Display for DataQualityGateReason {
                 age_ms,
                 threshold_ms,
             } => write!(f, "stale_data(age={age_ms}ms, threshold={threshold_ms}ms)"),
-            DataQualityGateReason::CrossedBook {
-                best_bid,
-                best_ask,
-            } => write!(f, "crossed_book(bid={best_bid}, ask={best_ask})"),
+            DataQualityGateReason::CrossedBook { best_bid, best_ask } => {
+                write!(f, "crossed_book(bid={best_bid}, ask={best_ask})")
+            }
         }
     }
 }
@@ -306,10 +305,7 @@ impl DataQualityMonitor {
                 (self.last_best_bid.get(asset), self.last_best_ask.get(asset))
             {
                 if Self::is_crossed(best_bid, best_ask) {
-                    return Some(DataQualityGateReason::CrossedBook {
-                        best_bid,
-                        best_ask,
-                    });
+                    return Some(DataQualityGateReason::CrossedBook { best_bid, best_ask });
                 }
             }
         }
@@ -991,7 +987,10 @@ mod tests {
         // Wait for staleness
         std::thread::sleep(std::time::Duration::from_millis(150));
         assert!(
-            matches!(monitor.should_gate_quotes("BTC"), Some(DataQualityGateReason::StaleData { .. })),
+            matches!(
+                monitor.should_gate_quotes("BTC"),
+                Some(DataQualityGateReason::StaleData { .. })
+            ),
             "Should be gated while stale",
         );
 

@@ -80,8 +80,8 @@ impl Default for PositionGuardConfig {
             pull_threshold: 0.9,
             max_skew_bps: 100.0,
             direct_skew_max_bps: 15.0, // 15 bps at max position
-            sigma_bps: 50.0,     // 50 bps volatility
-            tau_seconds: 300.0,  // 5 minute horizon
+            sigma_bps: 50.0,           // 50 bps volatility
+            tau_seconds: 300.0,        // 5 minute horizon
             hard_entry_threshold: 0.95,
         }
     }
@@ -221,7 +221,7 @@ impl PositionGuard {
 
         // Only pull the side that would increase position
         match side {
-            Side::Buy if self.position > 0.0 => true,  // Long, pull buys
+            Side::Buy if self.position > 0.0 => true, // Long, pull buys
             Side::Sell if self.position < 0.0 => true, // Short, pull sells
             _ => false,
         }
@@ -555,13 +555,22 @@ mod tests {
         //   total = ~13.1 bps
         guard.update_position(0.5);
         let skew = guard.inventory_skew_bps();
-        assert!(skew > 12.0, "Expected >12 bps skew at 50% position, got {skew}");
-        assert!(skew < 14.0, "Expected <14 bps skew at 50% position, got {skew}");
+        assert!(
+            skew > 12.0,
+            "Expected >12 bps skew at 50% position, got {skew}"
+        );
+        assert!(
+            skew < 14.0,
+            "Expected <14 bps skew at 50% position, got {skew}"
+        );
 
         // Negative position should give negative skew of same magnitude
         guard.update_position(-0.5);
         let skew = guard.inventory_skew_bps();
-        assert!(skew < -12.0, "Expected <-12 bps skew at -50% position, got {skew}");
+        assert!(
+            skew < -12.0,
+            "Expected <-12 bps skew at -50% position, got {skew}"
+        );
     }
 
     #[test]
@@ -579,17 +588,20 @@ mod tests {
         // At 100% position utilization: direct_skew = 1.0 * 15.0 = 15.0 bps + GL
         guard.update_position(10.0);
         let skew = guard.inventory_skew_bps();
-        assert!(skew > 15.0, "Expected >15 bps skew at max position, got {skew}");
+        assert!(
+            skew > 15.0,
+            "Expected >15 bps skew at max position, got {skew}"
+        );
     }
 
     #[test]
     fn test_skew_clamping() {
         let mut guard = PositionGuard::with_config(PositionGuardConfig {
             max_position: 1.0,
-            gamma: 1.0, // Very high gamma
-            sigma_bps: 200.0, // Very high volatility
+            gamma: 1.0,          // Very high gamma
+            sigma_bps: 200.0,    // Very high volatility
             tau_seconds: 1000.0, // Long horizon
-            max_skew_bps: 50.0, // But limited skew
+            max_skew_bps: 50.0,  // But limited skew
             ..Default::default()
         });
 
@@ -606,15 +618,15 @@ mod tests {
         guard.update_position(0.5);
         let skew = guard.inventory_skew_bps();
         assert!(skew > 0.0);
-        assert_eq!(guard.bid_adjustment_bps(), skew);   // Widen bids
-        assert_eq!(guard.ask_adjustment_bps(), -skew);  // Tighten asks
+        assert_eq!(guard.bid_adjustment_bps(), skew); // Widen bids
+        assert_eq!(guard.ask_adjustment_bps(), -skew); // Tighten asks
 
         // Short position: tighten bids, widen asks
         guard.update_position(-0.5);
         let skew = guard.inventory_skew_bps();
         assert!(skew < 0.0);
-        assert_eq!(guard.bid_adjustment_bps(), skew);   // Tighten bids
-        assert_eq!(guard.ask_adjustment_bps(), -skew);  // Widen asks
+        assert_eq!(guard.bid_adjustment_bps(), skew); // Tighten bids
+        assert_eq!(guard.ask_adjustment_bps(), -skew); // Widen asks
     }
 
     #[test]
@@ -661,7 +673,12 @@ mod tests {
         // Already at 0.9, buying 0.1 would put us at 1.0 > 0.95 limit
         let check = guard.check_order_entry(0.9, 0.1, Side::Buy);
         assert!(!check.is_allowed());
-        if let OrderEntryCheck::Rejected { worst_case_position, hard_limit, .. } = check {
+        if let OrderEntryCheck::Rejected {
+            worst_case_position,
+            hard_limit,
+            ..
+        } = check
+        {
             assert!((worst_case_position - 1.0).abs() < 1e-10);
             assert!((hard_limit - 0.95).abs() < 1e-10);
         }

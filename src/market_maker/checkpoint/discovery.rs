@@ -61,11 +61,7 @@ pub fn discover_prior(
     }
 
     // 2. paper/{base_symbol}/prior.json
-    candidates.push(
-        Path::new(checkpoint_root)
-            .join(base)
-            .join("prior.json"),
-    );
+    candidates.push(Path::new(checkpoint_root).join(base).join("prior.json"));
 
     // 3. paper/{dex}:{base_symbol}/prior.json (if dex specified)
     if let Some(dex_name) = dex {
@@ -128,9 +124,9 @@ pub fn discover_prior(
                     }
 
                     // Otherwise, keep newest
-                    let dominated = best
-                        .as_ref()
-                        .is_some_and(|b| b.bundle.metadata.timestamp_ms >= bundle.metadata.timestamp_ms);
+                    let dominated = best.as_ref().is_some_and(|b| {
+                        b.bundle.metadata.timestamp_ms >= bundle.metadata.timestamp_ms
+                    });
                     if !dominated {
                         best = Some(DiscoveredPrior {
                             bundle,

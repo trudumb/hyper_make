@@ -89,8 +89,7 @@ impl PositionLimits {
     /// The effective position limit used for all quoting decisions.
     /// Always <= hard_max (config.max_position).
     pub fn effective(&self) -> f64 {
-        (self.hard_max.min(self.margin_max) * self.regime_fraction * self.signal_fraction)
-            .max(0.0)
+        (self.hard_max.min(self.margin_max) * self.regime_fraction * self.signal_fraction).max(0.0)
     }
 
     /// Whether current position exceeds effective limit (reduce-only mode).
@@ -158,7 +157,10 @@ impl PositionBudget {
         let eff = self.effective();
         parts.push(format!("raw={raw:.4}"));
         if self.floor_is_binding() {
-            parts.push(format!("FLOORED→{eff:.4} (min_viable={:.4})", self.min_viable));
+            parts.push(format!(
+                "FLOORED→{eff:.4} (min_viable={:.4})",
+                self.min_viable
+            ));
         } else {
             parts.push(format!("effective={eff:.4}"));
         }
@@ -224,10 +226,20 @@ impl InventoryGovernor {
         let (zone, max_new_exposure, addon_bps, reducing_addon) = if ratio >= 1.0 {
             // Kill zone: position at or above max.
             // Aggressively tighten reducing side to attract fills and escape overexposed state.
-            (PositionZone::Kill, 0.0, self.config.kill_addon_bps, -self.config.kill_reducing_addon_bps)
+            (
+                PositionZone::Kill,
+                0.0,
+                self.config.kill_addon_bps,
+                -self.config.kill_reducing_addon_bps,
+            )
         } else if ratio >= red {
             // Red zone: reduce-only. Tighten reducing side to attract fills.
-            (PositionZone::Red, 0.0, self.config.red_addon_bps, -self.config.red_reducing_addon_bps)
+            (
+                PositionZone::Red,
+                0.0,
+                self.config.red_addon_bps,
+                -self.config.red_reducing_addon_bps,
+            )
         } else if ratio >= yellow {
             // Yellow zone: bias toward reducing, cap new exposure
             let capped_exposure = remaining * 0.5;
@@ -254,12 +266,7 @@ impl InventoryGovernor {
     /// Check if placing an order of `order_size` would push position past max.
     ///
     /// Returns `true` if the resulting |position| would exceed max_position.
-    pub fn would_exceed(
-        &self,
-        current_position: f64,
-        order_size: f64,
-        is_buy: bool,
-    ) -> bool {
+    pub fn would_exceed(&self, current_position: f64, order_size: f64, is_buy: bool) -> bool {
         let new_position = if is_buy {
             current_position + order_size
         } else {

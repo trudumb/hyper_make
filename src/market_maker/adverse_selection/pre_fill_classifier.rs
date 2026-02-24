@@ -111,9 +111,9 @@ impl Default for PreFillClassifierConfig {
 
             max_spread_multiplier: 3.0, // Cap at 3x base spread
 
-            imbalance_threshold: 2.0,   // 2:1 bid/ask ratio
-            flow_threshold: 0.7,        // 70% one-sided flow
-            funding_threshold: 0.001,   // 0.1% per 8h (annualized ~110%)
+            imbalance_threshold: 2.0, // 2:1 bid/ask ratio
+            flow_threshold: 0.7,      // 70% one-sided flow
+            funding_threshold: 0.001, // 0.1% per 8h (annualized ~110%)
 
             enable_learning: true,
             learning_rate: 0.01,
@@ -130,7 +130,6 @@ impl Default for PreFillClassifierConfig {
         }
     }
 }
-
 
 impl PreFillClassifierConfig {
     /// Return the config-default weights as an array of NUM_SIGNALS elements.
@@ -302,12 +301,12 @@ impl PreFillASClassifier {
 
         Self {
             config,
-            orderbook_imbalance: 1.0, // Neutral
+            orderbook_imbalance: 1.0,    // Neutral
             recent_trade_direction: 0.0, // Neutral
-            regime_trust: 1.0, // High trust initially
-            changepoint_prob: 0.0, // No changepoint
-            funding_rate: 0.0, // Neutral funding
-            trend_momentum_bps: 0.0, // No drift
+            regime_trust: 1.0,           // High trust initially
+            changepoint_prob: 0.0,       // No changepoint
+            funding_rate: 0.0,           // Neutral funding
+            trend_momentum_bps: 0.0,     // No drift
             cached_toxicity: 0.0,
             update_count: 0,
             orderbook_updated_at_ms: 0,
@@ -318,7 +317,7 @@ impl PreFillASClassifier {
             signal_sq_sum: [0.0; NUM_SIGNALS],
             learning_samples: 0,
             // Regime-conditional state
-            current_regime: 1, // Start with Normal
+            current_regime: 1,                    // Start with Normal
             regime_probs: [0.1, 0.7, 0.15, 0.05], // Default prior
             // Blended toxicity override
             blended_toxicity_override: None,
@@ -565,7 +564,6 @@ impl PreFillASClassifier {
             .unwrap_or(0);
         self.update_cached_toxicity();
     }
-
 
     /// Update full regime probabilities for regime-conditional weighting.
     ///
@@ -841,7 +839,11 @@ impl PreFillASClassifier {
 
         // === Orderbook Imbalance (pre-computed z-score) ===
         // Directional: positive z (high bid pressure) is toxic for bids
-        let directional_z_imb = if is_bid { self.imbalance_z } else { -self.imbalance_z };
+        let directional_z_imb = if is_bid {
+            self.imbalance_z
+        } else {
+            -self.imbalance_z
+        };
         let imbalance_signal = Self::sigmoid(directional_z_imb * scale);
 
         // === Trade Flow (pre-computed z-score) ===
@@ -855,7 +857,11 @@ impl PreFillASClassifier {
 
         // === Funding Rate (pre-computed z-score) ===
         // Directional: positive z (high positive funding) is toxic for bids
-        let directional_z_fund = if is_bid { self.funding_z } else { -self.funding_z };
+        let directional_z_fund = if is_bid {
+            self.funding_z
+        } else {
+            -self.funding_z
+        };
         let funding_signal = Self::sigmoid(directional_z_fund * scale);
 
         // === Changepoint (pre-computed z-score) ===
@@ -888,7 +894,12 @@ impl PreFillASClassifier {
     /// - `adverse_magnitude_bps`: Optional magnitude of adverse movement (for weighted learning)
     ///
     /// Call this after each fill is resolved with its markout outcome.
-    pub fn record_outcome(&mut self, is_bid: bool, was_adverse: bool, adverse_magnitude_bps: Option<f64>) {
+    pub fn record_outcome(
+        &mut self,
+        is_bid: bool,
+        was_adverse: bool,
+        adverse_magnitude_bps: Option<f64>,
+    ) {
         if !self.config.enable_learning {
             return;
         }
@@ -1243,10 +1254,7 @@ impl LearningDiagnostics {
             "DEFAULT"
         };
 
-        let mut s = format!(
-            "PreFillAS [{} n={}]\n",
-            status, self.samples
-        );
+        let mut s = format!("PreFillAS [{} n={}]\n", status, self.samples);
 
         let weights = if self.is_using_learned {
             &self.learned_weights
@@ -1258,7 +1266,11 @@ impl LearningDiagnostics {
             let learned = self.learned_weights[i];
             let default = self.default_weights[i];
             let diff = if (learned - default).abs() > 0.05 {
-                if learned > default { "↑" } else { "↓" }
+                if learned > default {
+                    "↑"
+                } else {
+                    "↓"
+                }
             } else {
                 "="
             };
@@ -1326,7 +1338,10 @@ mod tests {
         let _ask_tox_with_buy_flow = classifier.predict_toxicity(false);
 
         // Bids should be toxic (we're buying with the crowd)
-        assert!(bid_tox_with_buy_flow > 0.1, "Buy flow should make bids toxic");
+        assert!(
+            bid_tox_with_buy_flow > 0.1,
+            "Buy flow should make bids toxic"
+        );
         // Asks should NOT be elevated from buy flow alone
         // (only from regime/changepoint which are symmetric)
 
@@ -1336,10 +1351,15 @@ mod tests {
         let ask_tox_with_sell_flow = classifier.predict_toxicity(false);
 
         // Asks should be toxic (we're selling with the crowd)
-        assert!(ask_tox_with_sell_flow > 0.1, "Sell flow should make asks toxic");
+        assert!(
+            ask_tox_with_sell_flow > 0.1,
+            "Sell flow should make asks toxic"
+        );
         // Buy flow contribution to bid should be gone now
-        assert!(bid_tox_with_sell_flow < bid_tox_with_buy_flow,
-            "Sell flow should reduce bid toxicity vs buy flow");
+        assert!(
+            bid_tox_with_sell_flow < bid_tox_with_buy_flow,
+            "Sell flow should reduce bid toxicity vs buy flow"
+        );
     }
 
     #[test]
@@ -1354,8 +1374,10 @@ mod tests {
 
         // Positive funding should make bids more toxic (crowd is long, may dump)
         // Asks should be less affected (or safe - crowd is long, not short)
-        assert!(bid_tox_pos_funding > ask_tox_pos_funding,
-            "Positive funding should make bids more toxic than asks");
+        assert!(
+            bid_tox_pos_funding > ask_tox_pos_funding,
+            "Positive funding should make bids more toxic than asks"
+        );
 
         // Negative funding = shorts pay longs = crowd is short
         classifier.update_funding(-0.001); // High negative funding
@@ -1364,8 +1386,10 @@ mod tests {
         let ask_tox_neg_funding = classifier.predict_toxicity(false);
 
         // Negative funding should make asks more toxic (crowd is short, may squeeze)
-        assert!(ask_tox_neg_funding > bid_tox_neg_funding,
-            "Negative funding should make asks more toxic than bids");
+        assert!(
+            ask_tox_neg_funding > bid_tox_neg_funding,
+            "Negative funding should make asks more toxic than bids"
+        );
     }
 
     #[test]
@@ -1379,7 +1403,8 @@ mod tests {
 
         // High confidence + low changepoint = low toxicity
         classifier.update_regime(0.95, 0.05);
-        let low_tox = (classifier.predict_toxicity(true) + classifier.predict_toxicity(false)) / 2.0;
+        let low_tox =
+            (classifier.predict_toxicity(true) + classifier.predict_toxicity(false)) / 2.0;
         assert!(low_tox < 0.3);
     }
 
@@ -1423,7 +1448,11 @@ mod tests {
 
         // Bias should be close to 5.0 (overpredicting by 5 bps)
         let bias = classifier.bias_correction();
-        assert!(bias > 3.0, "Bias should be positive (overpredicting): {}", bias);
+        assert!(
+            bias > 3.0,
+            "Bias should be positive (overpredicting): {}",
+            bias
+        );
         assert!(bias < 6.0, "Bias should converge toward 5.0: {}", bias);
     }
 
@@ -1462,9 +1491,12 @@ mod tests {
         let mult_after = classifier.spread_multiplier(true);
 
         // After bias correction, spread multiplier should be lower
-        assert!(mult_after <= mult_before,
+        assert!(
+            mult_after <= mult_before,
             "Bias correction should reduce spread multiplier: before={}, after={}",
-            mult_before, mult_after);
+            mult_before,
+            mult_after
+        );
     }
 
     #[test]
@@ -1478,10 +1510,21 @@ mod tests {
         let ask_tox = classifier.predict_toxicity(false);
 
         // With 0 updates, prior_weight = 1.0, so toxicity = warmup_prior_toxicity = 0.35
-        assert!(bid_tox > 0.0, "Warmup prior should produce nonzero bid toxicity, got {}", bid_tox);
-        assert!(ask_tox > 0.0, "Warmup prior should produce nonzero ask toxicity, got {}", ask_tox);
-        assert!((bid_tox - 0.35).abs() < 0.01,
-            "With 0 updates, toxicity should equal warmup_prior_toxicity (0.35), got {}", bid_tox);
+        assert!(
+            bid_tox > 0.0,
+            "Warmup prior should produce nonzero bid toxicity, got {}",
+            bid_tox
+        );
+        assert!(
+            ask_tox > 0.0,
+            "Warmup prior should produce nonzero ask toxicity, got {}",
+            ask_tox
+        );
+        assert!(
+            (bid_tox - 0.35).abs() < 0.01,
+            "With 0 updates, toxicity should equal warmup_prior_toxicity (0.35), got {}",
+            bid_tox
+        );
     }
 
     #[test]
@@ -1503,13 +1546,19 @@ mod tests {
 
         // With neutral inputs and no prior, classifier_tox should be near 0
         // (all signals are at neutral defaults). The prior was inflating it.
-        assert!(tox_after_warmup < tox_at_zero,
+        assert!(
+            tox_after_warmup < tox_at_zero,
             "Prior should decay: tox_at_zero={}, tox_after_warmup={}",
-            tox_at_zero, tox_after_warmup);
+            tox_at_zero,
+            tox_after_warmup
+        );
 
         // Data-only toxicity should be very low with neutral signals
-        assert!(tox_after_warmup < 0.1,
-            "Neutral signals with no prior should give low toxicity, got {}", tox_after_warmup);
+        assert!(
+            tox_after_warmup < 0.1,
+            "Neutral signals with no prior should give low toxicity, got {}",
+            tox_after_warmup
+        );
     }
 
     #[test]
@@ -1525,11 +1574,23 @@ mod tests {
         // excess = (0.35 - 0.3) / (1.0 - 0.3) ≈ 0.071
         // multiplier = 1.0 + 0.071 * (3.0 - 1.0) ≈ 1.14
         // Mild spread widening during cold start — proportional response.
-        assert!(bid_mult > 1.0, "Warmup prior should produce spread widening, got {}", bid_mult);
-        assert!(bid_mult < 1.3, "Warmup widening should be mild, got {}", bid_mult);
+        assert!(
+            bid_mult > 1.0,
+            "Warmup prior should produce spread widening, got {}",
+            bid_mult
+        );
+        assert!(
+            bid_mult < 1.3,
+            "Warmup widening should be mild, got {}",
+            bid_mult
+        );
 
         let tox = classifier.predict_toxicity(true);
-        assert!(tox > 0.0, "Fresh classifier must have nonzero toxicity, got {}", tox);
+        assert!(
+            tox > 0.0,
+            "Fresh classifier must have nonzero toxicity, got {}",
+            tox
+        );
 
         // With a higher prior, spread multiplier should be larger.
         let mut config = PreFillClassifierConfig::default();
@@ -1537,14 +1598,25 @@ mod tests {
         let high_prior_classifier = PreFillASClassifier::with_config(config);
 
         let high_bid_mult = high_prior_classifier.spread_multiplier(true);
-        assert!(high_bid_mult > 1.0,
-            "High warmup prior (0.7) should widen spreads, got multiplier={}", high_bid_mult);
+        assert!(
+            high_bid_mult > 1.0,
+            "High warmup prior (0.7) should widen spreads, got multiplier={}",
+            high_bid_mult
+        );
 
         // Default prior should not be wider than high prior
-        assert!(bid_mult <= high_bid_mult,
-            "Default prior mult ({}) should be <= high prior mult ({})", bid_mult, high_bid_mult);
-        assert!(ask_mult <= high_bid_mult,
-            "Default prior mult ({}) should be <= high prior mult ({})", ask_mult, high_bid_mult);
+        assert!(
+            bid_mult <= high_bid_mult,
+            "Default prior mult ({}) should be <= high prior mult ({})",
+            bid_mult,
+            high_bid_mult
+        );
+        assert!(
+            ask_mult <= high_bid_mult,
+            "Default prior mult ({}) should be <= high prior mult ({})",
+            ask_mult,
+            high_bid_mult
+        );
     }
 
     // === Trend Opposition Tests ===
@@ -1570,13 +1642,15 @@ mod tests {
         assert!(
             bid_tox_downtrend > bid_tox_neutral,
             "Downtrend should increase bid toxicity: neutral={:.4}, downtrend={:.4}",
-            bid_tox_neutral, bid_tox_downtrend
+            bid_tox_neutral,
+            bid_tox_downtrend
         );
         // Asks should NOT be more toxic from downtrend (selling into decline is safe)
         assert!(
             ask_tox_downtrend < bid_tox_downtrend,
             "Downtrend should not make asks more toxic than bids: ask={:.4}, bid={:.4}",
-            ask_tox_downtrend, bid_tox_downtrend
+            ask_tox_downtrend,
+            bid_tox_downtrend
         );
     }
 
@@ -1600,13 +1674,15 @@ mod tests {
         assert!(
             (bid_tox_uptrend - bid_tox_neutral).abs() < 0.05,
             "Uptrend should not increase bid toxicity: neutral={:.4}, uptrend={:.4}",
-            bid_tox_neutral, bid_tox_uptrend
+            bid_tox_neutral,
+            bid_tox_uptrend
         );
         // Asks SHOULD be more toxic in an uptrend (selling into rising market)
         assert!(
             ask_tox_uptrend > bid_tox_uptrend,
             "Uptrend should make asks more toxic than bids: ask={:.4}, bid={:.4}",
-            ask_tox_uptrend, bid_tox_uptrend
+            ask_tox_uptrend,
+            bid_tox_uptrend
         );
     }
 
@@ -1655,7 +1731,10 @@ mod tests {
 
         let diag = classifier.learning_diagnostics();
         assert_eq!(diag.samples, 100);
-        assert!(diag.is_using_learned, "Should be using learned weights after 100 samples");
+        assert!(
+            diag.is_using_learned,
+            "Should be using learned weights after 100 samples"
+        );
 
         // All 6 signal names should be present
         assert_eq!(diag.signal_names.len(), 6);

@@ -639,7 +639,6 @@ impl LagDecayTracker {
     pub fn history_len(&self) -> usize {
         self.history.len()
     }
-
 }
 
 /// Lead-lag stability gate.
@@ -682,9 +681,9 @@ impl Default for LeadLagStabilityGate {
             mi_history: VecDeque::with_capacity(50),
             window_size: 20,
             max_variance_ms2: 10000.0, // 100ms std dev max
-            min_mean_lag_ms: 25.0,      // At least 25ms lead
-            min_mi: 0.02,               // Minimum 0.02 bits MI
-            min_stable_count: 10,       // 10 consecutive stable readings
+            min_mean_lag_ms: 25.0,     // At least 25ms lead
+            min_mi: 0.02,              // Minimum 0.02 bits MI
+            min_stable_count: 10,      // 10 consecutive stable readings
             stable_count: 0,
             total_observations: 0,
         }
@@ -1092,7 +1091,10 @@ mod tests {
                 break;
             }
         }
-        assert!(detected, "CUSUM should detect a large shift within 5 observations");
+        assert!(
+            detected,
+            "CUSUM should detect a large shift within 5 observations"
+        );
     }
 
     #[test]

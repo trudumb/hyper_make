@@ -123,8 +123,8 @@ impl Default for DynamicReconcileConfig {
             optimal_spread_bps: 20.0,   // Default ~20 bps
             max_modify_price_bps: 50.0, // Default 50 bps
             use_priority_matching: true,
-            latch_threshold_bps: 3.0,   // Adaptive default
-            latch_size_fraction: 0.10,  // 10% size change threshold
+            latch_threshold_bps: 3.0,  // Adaptive default
+            latch_size_fraction: 0.10, // 10% size change threshold
             // HJB queue value integration
             use_hjb_queue_value: true,
             hjb_queue_alpha: 0.1,
@@ -157,9 +157,7 @@ impl DynamicReconcileConfig {
     /// Clamped to [5, 10] bps.
     pub fn compute_stale_threshold(sigma: f64, cycle_time_s: f64, tick_bps: f64) -> f64 {
         let expected_move_bps = sigma * cycle_time_s.sqrt() * 10_000.0;
-        expected_move_bps
-            .max(2.0 * tick_bps)
-            .clamp(5.0, 10.0) // Floor 5 bps (normal drift), cap 10 bps (genuinely stale)
+        expected_move_bps.max(2.0 * tick_bps).clamp(5.0, 10.0) // Floor 5 bps (normal drift), cap 10 bps (genuinely stale)
     }
 
     /// Create from market parameters with exchange context (tick size, API headroom).
@@ -834,17 +832,21 @@ pub fn priority_based_matching(
                         // Front-of-queue: depth < 1.0 units → +50% latch
                         // Mid-queue: depth 1-5 units → +25% latch
                         // Back-of-queue: depth > 5 → no bonus
-                        if depth < 1.0 { 0.50 }
-                        else if depth < 5.0 { 0.25 }
-                        else { 0.0 }
+                        if depth < 1.0 {
+                            0.50
+                        } else if depth < 5.0 {
+                            0.25
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
                     }
                 } else {
                     0.0
                 };
-                let effective_latch_bps = (config.latch_threshold_bps + age_bonus_bps)
-                    * (1.0 + queue_bonus_frac);
+                let effective_latch_bps =
+                    (config.latch_threshold_bps + age_bonus_bps) * (1.0 + queue_bonus_frac);
                 if price_diff_bps <= effective_latch_bps
                     && size_diff_pct <= config.latch_size_fraction
                 {
@@ -863,7 +865,9 @@ pub fn priority_based_matching(
                 // Case 1b: Price is within latch, but size changed beyond fraction
                 // → MODIFY size at same price (preserves queue!)
                 // This prevents unnecessary cancel+place when only edge predictions fluctuate.
-                if price_diff_bps <= effective_latch_bps && size_diff_pct > config.latch_size_fraction {
+                if price_diff_bps <= effective_latch_bps
+                    && size_diff_pct > config.latch_size_fraction
+                {
                     let truncated = truncate_float(target_size, sz_decimals, false);
                     if truncated > 0.0 {
                         debug!(
@@ -874,7 +878,7 @@ pub fn priority_based_matching(
                         );
                         actions.push(LadderAction::Modify {
                             oid: order.oid,
-                            new_price: order.price,  // keep same price = preserve queue
+                            new_price: order.price, // keep same price = preserve queue
                             new_size: truncated,
                             side,
                         });
@@ -904,7 +908,7 @@ pub fn priority_based_matching(
                     );
                     actions.push(LadderAction::Modify {
                         oid: order.oid,
-                        new_price: order.price,    // Keep same price
+                        new_price: order.price,     // Keep same price
                         new_size: truncated_target, // Reduce size (truncated)
                         side,
                     });
@@ -1158,7 +1162,14 @@ mod tests {
         };
 
         let (actions, _stats) = reconcile_side_smart_with_impulse(
-            &current, &target, Side::Buy, &config, None, None, None, 1, // sz_decimals=1
+            &current,
+            &target,
+            Side::Buy,
+            &config,
+            None,
+            None,
+            None,
+            1, // sz_decimals=1
         );
 
         // Should get a Modify with truncated size
@@ -1203,7 +1214,14 @@ mod tests {
         };
 
         let (actions, stats) = reconcile_side_smart_with_impulse(
-            &current, &target, Side::Buy, &config, None, None, None, 2, // sz_decimals=2
+            &current,
+            &target,
+            Side::Buy,
+            &config,
+            None,
+            None,
+            None,
+            2, // sz_decimals=2
         );
 
         // Should get a Cancel (not a Modify with 0 size)
@@ -1248,7 +1266,8 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let (actions, _latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 1, None);
+        let (actions, _latched) =
+            priority_based_matching(&current, &target, Side::Buy, &config, None, 1, None);
 
         // Should get a Modify with truncated size 0.5
         assert_eq!(actions.len(), 1);
@@ -1294,7 +1313,8 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let (actions, _latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 2, None);
+        let (actions, _latched) =
+            priority_based_matching(&current, &target, Side::Buy, &config, None, 2, None);
 
         // Should get Cancel (truncated to zero → don't send zero-size modify)
         assert_eq!(actions.len(), 1);
@@ -1311,11 +1331,7 @@ mod tests {
         // the thresholds should be meaningfully different
         let default_config = DynamicReconcileConfig::from_market_params(0.1, 1500.0, 0.001, 1.0);
         let actual_config = DynamicReconcileConfig::from_market_params_with_context(
-            0.5,
-            3000.0,
-            0.001,
-            1.0,
-            0.5, // tick_bps
+            0.5, 3000.0, 0.001, 1.0, 0.5, // tick_bps
             1.0, // full headroom
         );
 
@@ -1358,7 +1374,7 @@ mod tests {
         // With large tick size (5 bps), best tolerance should be at least 2*tick = 10 bps
         let config = DynamicReconcileConfig::from_market_params_with_context(
             0.1, 1500.0, 0.0001, // low vol
-            1.0, 5.0,            // 5 bps ticks
+            1.0, 5.0, // 5 bps ticks
             1.0,
         );
 
@@ -1391,7 +1407,7 @@ mod tests {
             optimal_spread_bps: 10.0,
             max_modify_price_bps: 20.0,
             use_priority_matching: true,
-            latch_threshold_bps: 3.0,  // Order is 1.5 bps away → within latch
+            latch_threshold_bps: 3.0, // Order is 1.5 bps away → within latch
             latch_size_fraction: 0.10, // 5% → within latch
             use_hjb_queue_value: false,
             hjb_queue_alpha: 0.0,
@@ -1399,7 +1415,8 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let (actions, latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 4, None);
+        let (actions, latched) =
+            priority_based_matching(&current, &target, Side::Buy, &config, None, 4, None);
 
         // Should produce NO actions — order is latched
         assert!(
@@ -1433,7 +1450,7 @@ mod tests {
             optimal_spread_bps: 10.0,
             max_modify_price_bps: 20.0,
             use_priority_matching: true,
-            latch_threshold_bps: 3.0,  // Order is 8 bps away → NOT latched
+            latch_threshold_bps: 3.0, // Order is 8 bps away → NOT latched
             latch_size_fraction: 0.10,
             use_hjb_queue_value: false,
             hjb_queue_alpha: 0.0,
@@ -1441,7 +1458,8 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let (actions, _latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 4, None);
+        let (actions, _latched) =
+            priority_based_matching(&current, &target, Side::Buy, &config, None, 4, None);
 
         // Should produce an action (cancel+place) since drift exceeds latch
         assert!(

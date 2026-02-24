@@ -193,8 +193,8 @@ impl ExchangeRules {
         }
 
         // Determine if we had to fix the price or size
-        let was_fixed = (rounded_price - price).abs() > 1e-12
-            || (rounded_size - size).abs() > 1e-12;
+        let was_fixed =
+            (rounded_price - price).abs() > 1e-12 || (rounded_size - size).abs() > 1e-12;
 
         Ok(ValidatedQuote {
             price: rounded_price,
@@ -273,10 +273,7 @@ pub enum QuoteRejection {
         reason: &'static str,
     },
     /// Size is NaN, Inf, zero, negative, or truncated to zero.
-    InvalidSize {
-        raw_size: f64,
-        reason: &'static str,
-    },
+    InvalidSize { raw_size: f64, reason: &'static str },
     /// Notional (price * size) below exchange minimum.
     BelowNotional { notional: f64, min_notional: f64 },
 }
@@ -294,10 +291,7 @@ impl fmt::Display for QuoteRejection {
                 notional,
                 min_notional,
             } => {
-                write!(
-                    f,
-                    "notional {notional:.2} below minimum {min_notional:.2}"
-                )
+                write!(f, "notional {notional:.2} below minimum {min_notional:.2}")
             }
         }
     }
@@ -429,8 +423,18 @@ mod tests {
         // round(round(x)) == round(x) for many random-ish prices
         let rules = eth_rules();
         let prices = [
-            1000.0, 1234.5678, 99999.99, 0.01, 50000.12345, 1.23456789,
-            100.0, 3000.001, 2500.999, 50.12345, 0.12345, 99.999,
+            1000.0,
+            1234.5678,
+            99999.99,
+            0.01,
+            50000.12345,
+            1.23456789,
+            100.0,
+            3000.001,
+            2500.999,
+            50.12345,
+            0.12345,
+            99.999,
         ];
         for &price in &prices {
             let r1 = rules.round_price(price);
@@ -456,9 +460,7 @@ mod tests {
     fn test_is_valid_after_round() {
         // round(x) always passes is_valid_price()
         let rules = eth_rules();
-        let prices = [
-            1000.0, 1234.5678, 50000.12345, 0.01, 99999.99, 3000.001,
-        ];
+        let prices = [1000.0, 1234.5678, 50000.12345, 0.01, 99999.99, 3000.001];
         for &price in &prices {
             let rounded = rules.round_price(price);
             assert!(
@@ -582,7 +584,10 @@ mod tests {
         report.rejected = 1;
 
         // proposed == valid + fixed + rejected
-        assert_eq!(report.proposed, report.valid + report.fixed + report.rejected);
+        assert_eq!(
+            report.proposed,
+            report.valid + report.fixed + report.rejected
+        );
     }
 
     #[test]
@@ -638,7 +643,7 @@ mod tests {
         let widened_offset = original_offset * 1.54; // ~1.5273
 
         let raw_ask_price = mid + widened_offset; // ~1984.977...
-        // Without re-rounding, this price has too many decimals → exchange rejects!
+                                                  // Without re-rounding, this price has too many decimals → exchange rejects!
         assert!(
             !rules.is_valid_price(raw_ask_price),
             "Raw widened price {raw_ask_price} should NOT be valid",
@@ -680,7 +685,7 @@ mod tests {
     #[test]
     fn test_ceil_size_on_grid() {
         let rules = hype_rules(); // sz_decimals=2, size_step=0.01
-        // Already on grid — no change
+                                  // Already on grid — no change
         assert!((rules.ceil_size(0.50) - 0.50).abs() < 1e-12);
         assert!((rules.ceil_size(0.01) - 0.01).abs() < 1e-12);
     }
@@ -688,7 +693,7 @@ mod tests {
     #[test]
     fn test_ceil_size_rounds_up() {
         let rules = hype_rules(); // sz_decimals=2, size_step=0.01
-        // 0.003 rounds up to 0.01 (one step)
+                                  // 0.003 rounds up to 0.01 (one step)
         assert!((rules.ceil_size(0.003) - 0.01).abs() < 1e-12);
         // 0.015 rounds up to 0.02
         assert!((rules.ceil_size(0.015) - 0.02).abs() < 1e-12);
@@ -715,8 +720,8 @@ mod tests {
         // Before this fix, size 0.003 with sz_decimals=2 would truncate to 0.00 → rejected.
         // Now it rounds UP to 0.01.
         let rules = hype_rules(); // sz_decimals=2, price at ~$25
-        // Size 0.003 at $25 → rounds up to 0.01. Notional = $25 * 0.01 = $0.25 < $10
-        // → BelowNotional (not "truncated to zero")
+                                  // Size 0.003 at $25 → rounds up to 0.01. Notional = $25 * 0.01 = $0.25 < $10
+                                  // → BelowNotional (not "truncated to zero")
         let result = rules.validate_quote(25.0, 0.003, true);
         assert!(result.is_err());
         match result.unwrap_err() {

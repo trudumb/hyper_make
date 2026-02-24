@@ -314,7 +314,7 @@ mod tests {
     fn test_reconcile_ladder_partial_match() {
         let mut mgr = OrderManager::new();
         mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0, 0.0)); // Matches first level
-                                                                   // No ask order
+                                                                        // No ask order
 
         let ladder = Ladder {
             bids: smallvec![
@@ -420,7 +420,8 @@ mod tests {
 
     #[test]
     fn test_tracked_order_with_cloid() {
-        let order = TrackedOrder::with_cloid(1, "my-client-id".to_string(), Side::Buy, 100.0, 1.0, 0.0);
+        let order =
+            TrackedOrder::with_cloid(1, "my-client-id".to_string(), Side::Buy, 100.0, 1.0, 0.0);
         assert_eq!(order.cloid, Some("my-client-id".to_string()));
         assert_eq!(order.oid, 1);
     }

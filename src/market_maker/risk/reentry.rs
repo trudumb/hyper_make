@@ -33,10 +33,10 @@ pub struct ReentryConfig {
 impl Default for ReentryConfig {
     fn default() -> Self {
         Self {
-            cooling_period: Duration::from_secs(300),      // 5 minutes
-            recovery_position_fraction: 0.5,               // 50% position limits
-            recovery_duration: Duration::from_secs(1800),   // 30 minutes
-            rapid_kill_window: Duration::from_secs(3600),   // 1 hour
+            cooling_period: Duration::from_secs(300),     // 5 minutes
+            recovery_position_fraction: 0.5,              // 50% position limits
+            recovery_duration: Duration::from_secs(1800), // 30 minutes
+            rapid_kill_window: Duration::from_secs(3600), // 1 hour
             max_daily_kills: 3,
             auto_reentry_enabled: true,
         }
@@ -174,10 +174,7 @@ impl ReentryManager {
             .is_some_and(|t| now.duration_since(t) < self.config.rapid_kill_window);
 
         // Record this kill
-        self.daily_kills.push(KillEvent {
-            time: now,
-            reason,
-        });
+        self.daily_kills.push(KillEvent { time: now, reason });
         self.last_kill_time = Some(now);
 
         // Decide next phase
@@ -261,22 +258,20 @@ impl ReentryManager {
     /// Summary for logging/monitoring.
     pub fn summary(&self) -> ReentrySummary {
         let cooling_remaining = match (self.phase, self.last_kill_time) {
-            (ReentryPhase::Cooling, Some(kill_time)) => {
-                self.config
-                    .cooling_period
-                    .checked_sub(kill_time.elapsed())
-                    .map(|d| d.as_secs_f64())
-            }
+            (ReentryPhase::Cooling, Some(kill_time)) => self
+                .config
+                .cooling_period
+                .checked_sub(kill_time.elapsed())
+                .map(|d| d.as_secs_f64()),
             _ => None,
         };
 
         let recovery_remaining = match (self.phase, self.recovery_start) {
-            (ReentryPhase::Recovery, Some(start)) => {
-                self.config
-                    .recovery_duration
-                    .checked_sub(start.elapsed())
-                    .map(|d| d.as_secs_f64())
-            }
+            (ReentryPhase::Recovery, Some(start)) => self
+                .config
+                .recovery_duration
+                .checked_sub(start.elapsed())
+                .map(|d| d.as_secs_f64()),
             _ => None,
         };
 

@@ -490,7 +490,6 @@ impl HJBInventoryController {
                 .map(|t| t.elapsed().as_secs_f64() < 60.0)
                 .unwrap_or(false)
     }
-
 }
 
 #[cfg(test)]

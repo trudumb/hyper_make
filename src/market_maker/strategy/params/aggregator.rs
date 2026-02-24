@@ -1,7 +1,10 @@
 //! Parameter aggregation from multiple sources.
 
 use crate::market_maker::adaptive::AdaptiveSpreadCalculator;
-use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS, PreFillASClassifier};
+use crate::market_maker::adverse_selection::{
+    AdverseSelectionEstimator, DepthDecayAS, PreFillASClassifier,
+};
+use crate::market_maker::belief::BeliefSnapshot;
 use crate::market_maker::config::{KellyTimeHorizonMethod, StochasticConfig};
 use crate::market_maker::estimator::{MarketEstimator, ParameterEstimator};
 use crate::market_maker::infra::MarginAwareSizer;
@@ -9,11 +12,10 @@ use crate::market_maker::process_models::{
     DriftAdjustedSkew, FundingRateEstimator, HJBInventoryController, HawkesOrderFlowEstimator,
     LiquidationCascadeDetector, SpreadProcessEstimator,
 };
-use crate::market_maker::belief::BeliefSnapshot;
 use crate::market_maker::stochastic::StochasticControlBuilder;
 
-use super::super::MarketParams;
 use super::super::regime_state::ControllerObjective;
+use super::super::MarketParams;
 
 /// Sources for parameter aggregation.
 ///
@@ -117,7 +119,8 @@ pub struct ParameterSources<'a> {
 
     // === CalibrationCoordinator (Bootstrap from Book) ===
     /// Reference to the CalibrationCoordinator for L2-derived kappa.
-    pub calibration_coordinator: &'a crate::market_maker::estimator::calibration_coordinator::CalibrationCoordinator,
+    pub calibration_coordinator:
+        &'a crate::market_maker::estimator::calibration_coordinator::CalibrationCoordinator,
 
     // === Sigma Correction (CovarianceTracker) ===
     /// Bayesian posterior correction factor for sigma_effective.
@@ -291,7 +294,9 @@ impl ParameterAggregator {
             // pre_fill_size_mult_bid/ask deleted — toxicity handled by additive spread widening
 
             // Phase 3: Tail risk is additive log-odds in strategy, but we still pass intensity
-            tail_risk_intensity: ((sources.liquidation_detector.tail_risk_multiplier() - 1.0) / 4.0).clamp(0.0, 1.0),
+            tail_risk_intensity: ((sources.liquidation_detector.tail_risk_multiplier() - 1.0)
+                / 4.0)
+                .clamp(0.0, 1.0),
             should_pull_quotes: sources.liquidation_detector.should_pull_quotes(),
             cascade_intensity: 1.0 - sources.liquidation_detector.size_reduction_factor(),
 
@@ -302,20 +307,20 @@ impl ParameterAggregator {
             hawkes_activity_percentile: sources.hawkes.intensity_percentile(),
             // Hawkes Excitation Prediction (Phase 7: Bayesian Fusion)
             // These will be populated from HawkesExcitationPredictor in orchestrator
-            hawkes_p_cluster: 0.0,               // Default until predictor integrated
-            hawkes_excitation_penalty: 1.0,      // Default full edge
-            hawkes_is_high_excitation: false,    // Default not excited
-            hawkes_branching_ratio: 0.3,         // Default moderate
-            hawkes_spread_widening: 1.0,         // Default no widening
+            hawkes_p_cluster: 0.0, // Default until predictor integrated
+            hawkes_excitation_penalty: 1.0, // Default full edge
+            hawkes_is_high_excitation: false, // Default not excited
+            hawkes_branching_ratio: 0.3, // Default moderate
+            hawkes_spread_widening: 1.0, // Default no widening
             hawkes_expected_cluster_time: f64::INFINITY, // Default no imminent
-            hawkes_excess_intensity_ratio: 1.0,  // Default at baseline
+            hawkes_excess_intensity_ratio: 1.0, // Default at baseline
 
             // Phase 8: RL Policy Recommendations
             // These will be populated from QLearningAgent in orchestrator
-            rl_spread_delta_bps: 0.0,            // Default no adjustment
+            rl_spread_delta_bps: 0.0, // Default no adjustment
             rl_bid_skew_bps: 0.0,
             rl_ask_skew_bps: 0.0,
-            rl_confidence: 0.0,                  // Default no confidence
+            rl_confidence: 0.0, // Default no confidence
             rl_is_exploration: false,
             rl_expected_q: 0.0,
             rl_action_applied: false,
@@ -327,10 +332,10 @@ impl ParameterAggregator {
 
             // Phase 8: Competitor Model
             // These will be populated from CompetitorModel in orchestrator
-            competitor_snipe_prob: 0.1,          // Default 10% baseline
-            competitor_spread_factor: 1.0,       // Default no adjustment
-            competitor_count: 3.0,               // Default 3 competitors
-            market_share: 0.0,                   // Unknown until observed
+            competitor_snipe_prob: 0.1,    // Default 10% baseline
+            competitor_spread_factor: 1.0, // Default no adjustment
+            competitor_count: 3.0,         // Default 3 competitors
+            market_share: 0.0,             // Unknown until observed
 
             // === Tier 2: Funding Rate ===
             funding_rate: sources.funding.current_rate(),
@@ -344,8 +349,8 @@ impl ParameterAggregator {
                 .time_to_next_funding()
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(28800.0), // Default 8 hours if unknown
-            open_interest: 0.0,   // Set by orchestrator from exchange data
-            oi_change_1m: 0.0,    // Set by orchestrator from OI history
+            open_interest: 0.0, // Set by orchestrator from exchange data
+            oi_change_1m: 0.0,  // Set by orchestrator from OI history
             premium: sources.funding.current_premium(),
             premium_alpha: sources.funding.premium_alpha(),
 
@@ -656,9 +661,9 @@ impl ParameterAggregator {
             } else {
                 0.5 // 50% initially (uncertain)
             },
-            bootstrap_confidence: 0.0,    // Not calibrated initially
-            adverse_uncertainty: 0.1,     // Moderate uncertainty
-            adverse_regime: 1,            // Normal regime
+            bootstrap_confidence: 0.0, // Not calibrated initially
+            adverse_uncertainty: 0.1,  // Moderate uncertainty
+            adverse_regime: 1,         // Normal regime
             // bayesian_gamma_mult deleted — posterior gamma via CalibratedRiskModel betas
 
             // === Phase 9: Rate Limit Death Spiral Prevention ===
@@ -774,7 +779,9 @@ impl ParameterAggregator {
             } else {
                 0.0
             },
-            coordinator_uncertainty_premium_bps: sources.calibration_coordinator.uncertainty_premium_bps(),
+            coordinator_uncertainty_premium_bps: sources
+                .calibration_coordinator
+                .uncertainty_premium_bps(),
             use_coordinator_kappa: sources.calibration_coordinator.is_seeded(),
 
             // Fix 2: AS floor — populated later by quote engine from AS estimator

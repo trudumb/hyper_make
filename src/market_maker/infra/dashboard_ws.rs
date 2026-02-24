@@ -168,7 +168,9 @@ impl DashboardWsState {
     /// Push a snapshot to all clients
     pub fn push_snapshot(&self) {
         let state = self.current_state.read().unwrap().clone();
-        self.push(DashboardPush::Snapshot { state: Box::new(state) });
+        self.push(DashboardPush::Snapshot {
+            state: Box::new(state),
+        });
     }
 
     /// Push a fill event immediately
@@ -233,7 +235,9 @@ async fn handle_connection(socket: WebSocket, state: Arc<DashboardWsState>) {
     // Send initial snapshot
     {
         let current = state.current_state.read().unwrap().clone();
-        let msg = DashboardPush::Snapshot { state: Box::new(current) };
+        let msg = DashboardPush::Snapshot {
+            state: Box::new(current),
+        };
         if let Ok(json) = serde_json::to_string(&msg) {
             if sender.send(Message::Text(json)).await.is_err() {
                 state.client_count.fetch_sub(1, Ordering::SeqCst);

@@ -157,6 +157,9 @@ pub struct CheckpointBundle {
     /// Posterior state (μ, σ²) is NOT persisted — it resets relative to current mid.
     #[serde(default)]
     pub bayesian_fair_value: crate::market_maker::belief::BayesianFairValueCheckpoint,
+    /// Shadow Tuner state: current best params, optimizer sigma, generation count.
+    #[serde(default)]
+    pub shadow_tuner: Option<crate::market_maker::simulation::shadow_tuner::ShadowTunerCheckpoint>,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -379,7 +382,7 @@ impl Default for VolFilterCheckpoint {
     fn default() -> Self {
         Self {
             sigma_mean: 0.0005, // Reasonable crypto vol prior (~5 bps/sqrt(s))
-            sigma_std: 0.0002, // Non-degenerate prior spread
+            sigma_std: 0.0002,  // Non-degenerate prior spread
             regime_probs: [0.1, 0.7, 0.15, 0.05],
             observation_count: 0,
             bias_fill_intervals: 0,
@@ -564,7 +567,10 @@ pub struct MomentumCheckpoint {
     #[serde(default)]
     pub counts_by_magnitude: [usize; 10],
     /// Prior probability of momentum continuation
-    #[serde(default = "default_momentum_prior", deserialize_with = "deserialize_f64_or_null")]
+    #[serde(
+        default = "default_momentum_prior",
+        deserialize_with = "deserialize_f64_or_null"
+    )]
     pub prior_continuation: f64,
 }
 
@@ -641,7 +647,6 @@ impl Default for EnsembleWeightsCheckpoint {
         }
     }
 }
-
 
 /// Baseline tracker checkpoint for counterfactual reward centering.
 ///
@@ -776,7 +781,9 @@ mod tests {
                 model_weights: vec![0.6, 0.25, 0.15],
                 total_updates: 100,
             },
-            quote_outcomes: QuoteOutcomeCheckpoint { bins: vec![(0.0, 2.0, 5, 20), (2.0, 4.0, 10, 30)] },
+            quote_outcomes: QuoteOutcomeCheckpoint {
+                bins: vec![(0.0, 2.0, 5, 20), (2.0, 4.0, 10, 30)],
+            },
             spread_bandit: SpreadBanditCheckpoint::default(),
             baseline_tracker: BaselineTrackerCheckpoint {
                 ewma_reward: -1.5,
@@ -797,6 +804,7 @@ mod tests {
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
+            shadow_tuner: None,
         };
 
         // Serialize to JSON
@@ -820,7 +828,10 @@ mod tests {
         assert_eq!(restored.kelly_tracker.ewma_wins, 7.5);
         assert_eq!(restored.kelly_tracker.decay, 0.98);
         // Ensemble weights round-trip
-        assert_eq!(restored.ensemble_weights.model_weights, vec![0.6, 0.25, 0.15]);
+        assert_eq!(
+            restored.ensemble_weights.model_weights,
+            vec![0.6, 0.25, 0.15]
+        );
         assert_eq!(restored.ensemble_weights.total_updates, 100);
         // Quote outcomes round-trip
         assert_eq!(restored.quote_outcomes.bins.len(), 2);
@@ -845,10 +856,16 @@ mod tests {
     fn test_defaults_are_sane() {
         let pre_fill = PreFillCheckpoint::default();
         let sum: f64 = pre_fill.learned_weights.iter().sum();
-        assert!((sum - 1.0).abs() < 0.01, "Default weights should sum to ~1.0");
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "Default weights should sum to ~1.0"
+        );
 
         let regime_sum: f64 = pre_fill.regime_probs.iter().sum();
-        assert!((regime_sum - 1.0).abs() < 0.01, "Regime probs should sum to ~1.0");
+        assert!(
+            (regime_sum - 1.0).abs() < 0.01,
+            "Regime probs should sum to ~1.0"
+        );
 
         let momentum = MomentumCheckpoint::default();
         assert_eq!(momentum.prior_continuation, 0.5);
@@ -888,14 +905,14 @@ mod tests {
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
+            shadow_tuner: None,
         };
 
         // Serialize to JSON
         let json = serde_json::to_string(&bundle).expect("serialize");
 
         // Remove the kill_switch field to simulate an old checkpoint
-        let json_without_ks: serde_json::Value =
-            serde_json::from_str(&json).expect("parse");
+        let json_without_ks: serde_json::Value = serde_json::from_str(&json).expect("parse");
         let mut map = json_without_ks.as_object().unwrap().clone();
         map.remove("kill_switch");
         let old_json = serde_json::to_string(&map).expect("re-serialize");
@@ -943,12 +960,14 @@ mod tests {
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
+            shadow_tuner: None,
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
         map.as_object_mut().unwrap().remove("readiness");
         let old_json = serde_json::to_string(&map).expect("re-serialize");
-        let restored: CheckpointBundle = serde_json::from_str(&old_json).expect("deserialize old format");
+        let restored: CheckpointBundle =
+            serde_json::from_str(&old_json).expect("deserialize old format");
         assert_eq!(restored.readiness.verdict, PriorVerdict::Insufficient);
         assert_eq!(restored.readiness.estimators_ready, 0);
     }
@@ -985,13 +1004,16 @@ mod tests {
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
+            shadow_tuner: None,
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
-        map.as_object_mut().unwrap().remove("calibration_coordinator");
+        map.as_object_mut()
+            .unwrap()
+            .remove("calibration_coordinator");
         let old_json = serde_json::to_string(&map).expect("re-serialize");
-        let restored: CheckpointBundle =
-            serde_json::from_str(&old_json).expect("deserialize old format without calibration_coordinator");
+        let restored: CheckpointBundle = serde_json::from_str(&old_json)
+            .expect("deserialize old format without calibration_coordinator");
         // Should default to Cold phase with 0 fills
         assert_eq!(
             restored.calibration_coordinator.phase(),

@@ -81,13 +81,13 @@ impl Default for LatencyModel {
                 p99_us: 500_000,
             },
             cancellation: LatencyDistribution {
-                p10_us: 20_000,  // Cancels slightly faster
+                p10_us: 20_000, // Cancels slightly faster
                 p50_us: 60_000,
                 p90_us: 150_000,
                 p99_us: 400_000,
             },
             market_data: LatencyDistribution {
-                p10_us: 5_000,  // WebSocket data is faster
+                p10_us: 5_000, // WebSocket data is faster
                 p50_us: 15_000,
                 p90_us: 50_000,
                 p99_us: 150_000,

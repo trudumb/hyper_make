@@ -212,7 +212,9 @@ fn normal_cdf_approx(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.2316419 * x.abs());
     let d = 0.3989422804014327; // 1/sqrt(2π)
     let p = d * (-x * x / 2.0).exp();
-    let poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    let poly = t
+        * (0.319381530
+            + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
     if x >= 0.0 {
         1.0 - p * poly
     } else {
@@ -238,9 +240,7 @@ fn classify_action(
     let _ = sz_decimals;
 
     // Case 1: Within latch threshold on both price and size.
-    if price_diff_bps <= config.latch_threshold_bps
-        && size_diff_pct <= config.latch_size_fraction
-    {
+    if price_diff_bps <= config.latch_threshold_bps && size_diff_pct <= config.latch_size_fraction {
         return ActionType::Latch;
     }
 
@@ -264,10 +264,7 @@ fn classify_action(
 ///
 /// Returns a value in [0, 1] where 0 = front of queue, 1 = back.
 /// Uses the queue tracker's depth-ahead estimate.
-fn queue_rank_for_order(
-    queue_tracker: Option<&QueuePositionTracker>,
-    oid: u64,
-) -> f64 {
+fn queue_rank_for_order(queue_tracker: Option<&QueuePositionTracker>, oid: u64) -> f64 {
     let qt = match queue_tracker {
         Some(qt) => qt,
         None => return 0.5, // Unknown: assume middle
@@ -343,11 +340,8 @@ pub fn score_all(
             } else {
                 target.depth_bps
             };
-            let spread_capture_keep = queue_value.queue_value(
-                keep_depth_bps,
-                toxicity,
-                keep_queue_rank,
-            );
+            let spread_capture_keep =
+                queue_value.queue_value(keep_depth_bps, toxicity, keep_queue_rank);
             let ev_keep = p_fill_keep * spread_capture_keep.max(0.0);
 
             // EV_new: value of a fresh order at the target.
@@ -370,7 +364,8 @@ pub fn score_all(
                 ActionType::ModifySize => {
                     // ModifySize preserves queue -- cost is just the API call.
                     // Benefit: closer to target size. Use a fraction of EV_new improvement.
-                    let size_benefit = (spread_capture_new - spread_capture_keep).max(0.0) * p_fill_keep;
+                    let size_benefit =
+                        (spread_capture_new - spread_capture_keep).max(0.0) * p_fill_keep;
                     size_benefit - api_cost
                 }
                 _ => ev_new - ev_keep - api_cost,
@@ -393,13 +388,8 @@ pub fn score_all(
         } else {
             // Unmatched target: needs a new placement.
             if target.size > EPSILON {
-                let p_fill_new = estimate_p_fill_new(
-                    queue_tracker,
-                    target.price,
-                    side,
-                    mid,
-                    horizon_s,
-                );
+                let p_fill_new =
+                    estimate_p_fill_new(queue_tracker, target.price, side, mid, horizon_s);
                 let spread_capture = queue_value.queue_value(
                     target.depth_bps,
                     toxicity,
@@ -457,11 +447,7 @@ pub fn score_all(
                 20.0
             };
             let keep_rank = queue_rank_for_order(queue_tracker, order.oid);
-            let spread_capture_keep = queue_value.queue_value(
-                keep_depth_bps,
-                toxicity,
-                keep_rank,
-            );
+            let spread_capture_keep = queue_value.queue_value(keep_depth_bps, toxicity, keep_rank);
             let ev_keep = p_fill_keep * spread_capture_keep.max(0.0);
 
             // Stale cancel frees up a slot for a better order. Net value is the

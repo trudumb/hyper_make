@@ -169,7 +169,10 @@ impl KalmanDriftEstimator {
         }
 
         for obs in signals {
-            if obs.variance <= 0.0 || !obs.variance.is_finite() || !obs.value_bps_per_sec.is_finite() {
+            if obs.variance <= 0.0
+                || !obs.variance.is_finite()
+                || !obs.value_bps_per_sec.is_finite()
+            {
                 continue;
             }
             self.update_single_observation(obs.value_bps_per_sec, obs.variance);
@@ -213,7 +216,13 @@ impl KalmanDriftEstimator {
     /// `r_multiplier` inflates observation noise to attenuate echo signals on thin venues.
     /// - 1.0 = default (LiquidCex), 5.0+ = ThinDex (heavily distrust trend)
     /// - Combined from venue_base, lambda-adaptive, and echo estimator
-    pub fn update_trend(&mut self, magnitude: f64, agreement: f64, p_continuation: f64, r_multiplier: f64) {
+    pub fn update_trend(
+        &mut self,
+        magnitude: f64,
+        agreement: f64,
+        p_continuation: f64,
+        r_multiplier: f64,
+    ) {
         if agreement < 0.1 || !magnitude.is_finite() {
             return;
         }
@@ -454,8 +463,8 @@ impl LegacyDriftEstimator {
     pub fn update(&mut self, signals: &[SignalObservation]) {
         if signals.is_empty() {
             self.posterior_mean *= 0.9;
-            self.posterior_precision = self.prior_precision
-                + 0.9 * (self.posterior_precision - self.prior_precision);
+            self.posterior_precision =
+                self.prior_precision + 0.9 * (self.posterior_precision - self.prior_precision);
             return;
         }
 
@@ -463,7 +472,10 @@ impl LegacyDriftEstimator {
         let mut weighted_sum = 0.0;
 
         for obs in signals {
-            if obs.variance <= 0.0 || !obs.variance.is_finite() || !obs.value_bps_per_sec.is_finite() {
+            if obs.variance <= 0.0
+                || !obs.variance.is_finite()
+                || !obs.value_bps_per_sec.is_finite()
+            {
                 continue;
             }
             let precision = 1.0 / obs.variance;
@@ -638,7 +650,10 @@ mod tests {
     fn test_confidence_increases_with_signals() {
         let mut est = KalmanDriftEstimator::default();
         let initial_conf = est.drift_confidence();
-        assert!(initial_conf < 0.01, "Initial confidence should be ~0: {initial_conf}");
+        assert!(
+            initial_conf < 0.01,
+            "Initial confidence should be ~0: {initial_conf}"
+        );
 
         est.last_update_ms = now_ms();
         est.update_single_observation(5.0, 10.0);
@@ -678,7 +693,10 @@ mod tests {
         est.update_single_observation(5.0, f64::INFINITY);
         est.update_single_observation(5.0, -1.0);
 
-        assert_eq!(est.state_mean, initial, "Degenerate observations should be ignored");
+        assert_eq!(
+            est.state_mean, initial,
+            "Degenerate observations should be ignored"
+        );
     }
 
     #[test]
@@ -755,7 +773,8 @@ mod tests {
         assert!(
             est.process_noise() < initial_noise,
             "Small error should decrease process_noise: {} vs {}",
-            est.process_noise(), initial_noise
+            est.process_noise(),
+            initial_noise
         );
     }
 
@@ -812,7 +831,7 @@ mod tests {
         // sell fills when skew is negative. This is echo behavior.
         // Need variance in both x and y for Pearson correlation to be defined.
         for _ in 0..10 {
-            est.record_fill_for_autocorrelation(1.0, 0.8);  // buy fill, positive skew
+            est.record_fill_for_autocorrelation(1.0, 0.8); // buy fill, positive skew
             est.record_fill_for_autocorrelation(-1.0, -0.8); // sell fill, negative skew
         }
 
@@ -850,8 +869,8 @@ mod tests {
         // Fill with high echo (fills align with skew direction — echo behavior)
         // Need variance in both x and y for Pearson r to be defined
         for _ in 0..10 {
-            est.record_fill_for_autocorrelation(1.0, 0.9);   // buy fill, positive skew
-            est.record_fill_for_autocorrelation(-1.0, -0.9);  // sell fill, negative skew
+            est.record_fill_for_autocorrelation(1.0, 0.9); // buy fill, positive skew
+            est.record_fill_for_autocorrelation(-1.0, -0.9); // sell fill, negative skew
         }
 
         let high_echo_r = est.observation_variance_scaled(base_r);

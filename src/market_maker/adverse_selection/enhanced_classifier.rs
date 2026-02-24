@@ -47,16 +47,16 @@ impl Default for EnhancedClassifierConfig {
 /// Feature weights for toxicity prediction
 /// Based on market microstructure theory
 const THEORY_WEIGHTS: [f64; 10] = [
-    0.12,  // intensity_zscore - Hawkes/information events
-    0.22,  // price_impact_zscore - Kyle's lambda (most important)
-    0.18,  // run_length_zscore - informed trader clustering
-    0.08,  // volume_imbalance - directional pressure
-    0.08,  // spread_widening - MM response
-    0.04,  // book_velocity_zscore - order flow dynamics
-    0.08,  // arrival_speed_zscore - information processing
-    0.05,  // size_zscore - large trade indicator
-    0.08,  // size_concentration - entropy: concentrated sizes = informed
-    0.07,  // direction_concentration - entropy: one-sided flow = informed
+    0.12, // intensity_zscore - Hawkes/information events
+    0.22, // price_impact_zscore - Kyle's lambda (most important)
+    0.18, // run_length_zscore - informed trader clustering
+    0.08, // volume_imbalance - directional pressure
+    0.08, // spread_widening - MM response
+    0.04, // book_velocity_zscore - order flow dynamics
+    0.08, // arrival_speed_zscore - information processing
+    0.05, // size_zscore - large trade indicator
+    0.08, // size_concentration - entropy: concentrated sizes = informed
+    0.07, // direction_concentration - entropy: one-sided flow = informed
 ];
 
 /// Enhanced adverse selection classifier
@@ -138,8 +138,16 @@ impl EnhancedASClassifier {
     }
 
     /// Process a book update
-    pub fn on_book_update(&mut self, bid: f64, ask: f64, bid_size: f64, ask_size: f64, timestamp_ms: u64) {
-        self.extractor.on_book_update(bid, ask, bid_size, ask_size, timestamp_ms);
+    pub fn on_book_update(
+        &mut self,
+        bid: f64,
+        ask: f64,
+        bid_size: f64,
+        ask_size: f64,
+        timestamp_ms: u64,
+    ) {
+        self.extractor
+            .on_book_update(bid, ask, bid_size, ask_size, timestamp_ms);
     }
 
     /// Get current features
@@ -192,7 +200,12 @@ impl EnhancedASClassifier {
     }
 
     /// Record the outcome of a fill for online learning
-    pub fn record_outcome(&mut self, is_bid: bool, was_adverse: bool, adverse_magnitude_bps: Option<f64>) {
+    pub fn record_outcome(
+        &mut self,
+        is_bid: bool,
+        was_adverse: bool,
+        adverse_magnitude_bps: Option<f64>,
+    ) {
         self.total_predictions += 1;
         self.outcome_sum += if was_adverse { 1.0 } else { 0.0 };
 
@@ -244,13 +257,20 @@ impl EnhancedASClassifier {
             let error = prediction - target;
 
             // Update gradients with momentum
-            for (i, (grad, feat)) in self.weight_gradients.iter_mut().zip(feature_vec.iter()).enumerate() {
+            for (i, (grad, feat)) in self
+                .weight_gradients
+                .iter_mut()
+                .zip(feature_vec.iter())
+                .enumerate()
+            {
                 let new_grad = error * feat;
                 *grad = 0.9 * *grad + 0.1 * new_grad; // Momentum
 
                 // Apply gradient with regularization toward theory weights
-                let regularization_pull = self.config.regularization * (self.learned_weights[i] - THEORY_WEIGHTS[i]);
-                self.learned_weights[i] -= self.config.learning_rate * (*grad + regularization_pull);
+                let regularization_pull =
+                    self.config.regularization * (self.learned_weights[i] - THEORY_WEIGHTS[i]);
+                self.learned_weights[i] -=
+                    self.config.learning_rate * (*grad + regularization_pull);
             }
 
             // Keep weights positive and normalized
@@ -276,7 +296,9 @@ impl EnhancedASClassifier {
 
     /// Get effective weights (learned or theory-driven)
     pub fn effective_weights(&self) -> [f64; 10] {
-        if self.config.enable_learning && self.learning_samples >= self.config.min_samples_for_learning {
+        if self.config.enable_learning
+            && self.learning_samples >= self.config.min_samples_for_learning
+        {
             self.learned_weights
         } else {
             THEORY_WEIGHTS
@@ -364,7 +386,8 @@ pub struct EnhancedClassifierDiagnostics {
 
 impl EnhancedClassifierDiagnostics {
     pub fn summary(&self) -> String {
-        let weight_str: Vec<String> = self.effective_weights
+        let weight_str: Vec<String> = self
+            .effective_weights
             .iter()
             .map(|w| format!("{w:.2}"))
             .collect();
@@ -377,7 +400,11 @@ impl EnhancedClassifierDiagnostics {
             self.base_rate * 100.0,
             self.calibration_gap * 100.0,
             weight_str.join(","),
-            if self.is_using_learned { " LEARNED" } else { " default" }
+            if self.is_using_learned {
+                " LEARNED"
+            } else {
+                " default"
+            }
         )
     }
 
@@ -388,7 +415,8 @@ impl EnhancedClassifierDiagnostics {
         let mut pairs: Vec<_> = names.iter().zip(weights.iter()).collect();
         pairs.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
 
-        pairs.iter()
+        pairs
+            .iter()
             .take(4)
             .map(|(n, w)| format!("{}={:.0}%", n, *w * 100.0))
             .collect::<Vec<_>>()
@@ -462,8 +490,8 @@ mod tests {
             classifier.on_trade(make_trade(
                 base_ts + 5000 + i * 10, // Very fast
                 100.0 - i as f64 * 0.01, // Falling price
-                3.0, // Larger size
-                false, // All sells
+                3.0,                     // Larger size
+                false,                   // All sells
             ));
         }
         // Widen spread (MM response)
@@ -490,6 +518,10 @@ mod tests {
         }
 
         let mult = classifier.spread_multiplier(true);
-        assert!(mult >= 0.9 && mult <= 1.5, "Multiplier out of range: {}", mult);
+        assert!(
+            mult >= 0.9 && mult <= 1.5,
+            "Multiplier out of range: {}",
+            mult
+        );
     }
 }

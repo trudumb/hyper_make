@@ -166,8 +166,8 @@ impl SnipeTracker {
             max_events: 100,
             total_snipes: 0,
             total_fills: 0,
-            ewma_snipe_rate: 0.1,  // Start with 10% baseline
-            ewma_snipe_loss: 5.0,  // Start with 5 bps baseline
+            ewma_snipe_rate: 0.1, // Start with 10% baseline
+            ewma_snipe_loss: 5.0, // Start with 5 bps baseline
             ewma_alpha: 0.1,
         }
     }
@@ -179,8 +179,8 @@ impl SnipeTracker {
         // Update EWMA
         self.ewma_snipe_rate =
             self.ewma_alpha * 1.0 + (1.0 - self.ewma_alpha) * self.ewma_snipe_rate;
-        self.ewma_snipe_loss = self.ewma_alpha * event.price_move_bps
-            + (1.0 - self.ewma_alpha) * self.ewma_snipe_loss;
+        self.ewma_snipe_loss =
+            self.ewma_alpha * event.price_move_bps + (1.0 - self.ewma_alpha) * self.ewma_snipe_loss;
 
         // Store event
         self.recent_snipes.push_back(event);
@@ -233,7 +233,10 @@ impl SnipeTracker {
         if self.recent_snipes.is_empty() {
             return 100.0; // Default assumption
         }
-        self.recent_snipes.iter().map(|e| e.time_to_snipe_ms as f64).sum::<f64>()
+        self.recent_snipes
+            .iter()
+            .map(|e| e.time_to_snipe_ms as f64)
+            .sum::<f64>()
             / self.recent_snipes.len() as f64
     }
 }
@@ -267,7 +270,7 @@ impl QueueCompetitionModel {
         Self {
             // Prior: competitors refresh ~5 orders/sec
             competitor_refresh_rate: BayesianGamma::from_mean_variance(5.0, 10.0),
-            avg_queue_position: 0.5,  // Start at middle
+            avg_queue_position: 0.5, // Start at middle
             ewma_alpha: 0.1,
             queue_observations: 0,
         }
@@ -290,9 +293,8 @@ impl QueueCompetitionModel {
         if time_window_secs > 0.01 {
             let implied_rate = implied_arrivals / time_window_secs;
             // Soft update toward implied rate
-            self.competitor_refresh_rate.update_upward(
-                (implied_rate - self.competitor_refresh_rate.mean()).signum() * 0.1
-            );
+            self.competitor_refresh_rate
+                .update_upward((implied_rate - self.competitor_refresh_rate.mean()).signum() * 0.1);
         }
     }
 
@@ -349,11 +351,11 @@ pub struct CompetitorModelConfig {
 impl Default for CompetitorModelConfig {
     fn default() -> Self {
         Self {
-            prior_lambda_mean: 10.0,       // 10 competitor orders/sec baseline
+            prior_lambda_mean: 10.0, // 10 competitor orders/sec baseline
             prior_lambda_variance: 25.0,
-            our_latency_ms: 50.0,          // 50ms typical latency
+            our_latency_ms: 50.0, // 50ms typical latency
             snipe_sensitivity: 0.5,
-            large_order_threshold: 10.0,   // 10 contracts = large order
+            large_order_threshold: 10.0, // 10 contracts = large order
             max_spread_adjustment_bps: 5.0,
         }
     }
@@ -373,15 +375,9 @@ pub enum MarketEvent {
         time_to_sweep_ms: u64,
     },
     /// Depth change observed
-    DepthChange {
-        side: Side,
-        delta: f64,
-    },
+    DepthChange { side: Side, delta: f64 },
     /// Competitor order detected (large order at edge)
-    CompetitorOrder {
-        size: f64,
-        is_aggressive: bool,
-    },
+    CompetitorOrder { size: f64, is_aggressive: bool },
 }
 
 /// Order side.
@@ -430,20 +426,28 @@ impl CompetitorModel {
     /// Update model with observed market event.
     pub fn observe(&mut self, event: &MarketEvent) {
         match event {
-            MarketEvent::OurFill { queue_position, time_in_queue_ms } => {
+            MarketEvent::OurFill {
+                queue_position,
+                time_in_queue_ms,
+            } => {
                 // Fill at good queue position = fewer competitors ahead
-                self.queue_model.observe_fill(*queue_position, *time_in_queue_ms);
+                self.queue_model
+                    .observe_fill(*queue_position, *time_in_queue_ms);
                 self.snipe_tracker.record_fill();
 
                 // Infer competitor rate from fill success
-                let implied_lambda = self.infer_lambda_from_fill(*queue_position, *time_in_queue_ms);
+                let implied_lambda =
+                    self.infer_lambda_from_fill(*queue_position, *time_in_queue_ms);
                 // Soft update toward implied rate
                 if implied_lambda > 0.0 {
                     let diff = implied_lambda - self.lambda_competitor.mean();
                     self.lambda_competitor.update_upward(diff.signum() * 0.1);
                 }
             }
-            MarketEvent::OurCancelledBySweep { price_move_bps, time_to_sweep_ms } => {
+            MarketEvent::OurCancelledBySweep {
+                price_move_bps,
+                time_to_sweep_ms,
+            } => {
                 // Got sniped = competitor was faster
                 self.snipe_tracker.record_snipe(SnipeEvent {
                     timestamp_ms: now_ms(),
@@ -466,7 +470,10 @@ impl CompetitorModel {
                     self.n_competitors_estimate = self.estimate_n_competitors(*delta);
                 }
             }
-            MarketEvent::CompetitorOrder { size, is_aggressive } => {
+            MarketEvent::CompetitorOrder {
+                size,
+                is_aggressive,
+            } => {
                 // Direct competitor detection
                 if *is_aggressive && *size > self.config.large_order_threshold {
                     self.lambda_competitor.update_upward(0.3);
@@ -522,7 +529,8 @@ impl CompetitorModel {
     pub fn snipe_adjusted_spread(&self, base_spread_bps: f64) -> f64 {
         let p_snipe = self.p_snipe(base_spread_bps, self.config.our_latency_ms);
         let snipe_cost_bps = p_snipe * self.snipe_tracker.expected_snipe_loss();
-        (base_spread_bps + snipe_cost_bps).min(base_spread_bps + self.config.max_spread_adjustment_bps)
+        (base_spread_bps + snipe_cost_bps)
+            .min(base_spread_bps + self.config.max_spread_adjustment_bps)
     }
 
     /// Get spread widening factor for competition.
@@ -546,7 +554,9 @@ impl CompetitorModel {
             n_competitors: self.n_competitors_estimate,
             snipe_rate: self.snipe_tracker.snipe_rate(),
             expected_snipe_loss_bps: self.snipe_tracker.expected_snipe_loss(),
-            queue_ahead_prob: self.queue_model.p_ahead_in_queue(self.config.our_latency_ms),
+            queue_ahead_prob: self
+                .queue_model
+                .p_ahead_in_queue(self.config.our_latency_ms),
             competition_spread_factor: self.competition_spread_factor(),
         }
     }
@@ -616,10 +626,10 @@ pub fn compute_equilibrium_spread_factor(
     };
 
     // Adverse selection increases spread linearly
-    let adverse_factor = 1.0 + adverse_prob * 0.5;  // 0.5 sensitivity
+    let adverse_factor = 1.0 + adverse_prob * 0.5; // 0.5 sensitivity
 
     // Competition intensity increases spread
-    let competition_factor = 1.0 + competition_intensity * 0.3;  // 0.3 sensitivity
+    let competition_factor = 1.0 + competition_intensity * 0.3; // 0.3 sensitivity
 
     // Combine multiplicatively (no harsh clamp to preserve gradients)
     (adverse_factor * competition_factor).clamp(0.9, 1.8)
@@ -680,7 +690,9 @@ fn sample_uniform() -> f64 {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(12345);
         }
-        SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        SEED = SEED
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (SEED >> 33) as f64 / (1u64 << 31) as f64
     }
 }
@@ -788,8 +800,8 @@ mod tests {
     fn test_p_snipe_increases_with_tighter_spread() {
         let model = CompetitorModel::default();
 
-        let p_snipe_tight = model.p_snipe(2.0, 100.0);  // 2 bps spread
-        let p_snipe_wide = model.p_snipe(10.0, 100.0);  // 10 bps spread
+        let p_snipe_tight = model.p_snipe(2.0, 100.0); // 2 bps spread
+        let p_snipe_wide = model.p_snipe(10.0, 100.0); // 10 bps spread
 
         // Tighter spread = higher snipe risk
         assert!(p_snipe_tight > p_snipe_wide);

@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::market_maker::checkpoint::transfer::{PriorAgePolicy, prior_age_confidence};
+use crate::market_maker::checkpoint::transfer::{prior_age_confidence, PriorAgePolicy};
 use crate::market_maker::checkpoint::types::{CheckpointBundle, PriorReadiness, PriorVerdict};
 
 /// Continuous confidence assessment for a prior checkpoint.
@@ -219,8 +219,7 @@ impl CalibrationGate {
             / self.config.min_market_observations.max(1) as f64)
             .min(1.0);
         let regime_obs = bundle.regime_hmm.observation_count as f64;
-        let regime_sat =
-            (regime_obs / self.config.min_market_observations.max(1) as f64).min(1.0);
+        let regime_sat = (regime_obs / self.config.min_market_observations.max(1) as f64).min(1.0);
         let structural = (vol_sat * regime_sat).sqrt();
 
         // Execution confidence: geometric mean of kappa/AS/fill_rate saturation
@@ -252,8 +251,8 @@ impl CalibrationGate {
             "live" => self.config.live_execution_base_credit,
             _ => {
                 // Unknown source: average of paper and live as safe default
-                (self.config.paper_execution_base_credit
-                    + self.config.live_execution_base_credit) / 2.0
+                (self.config.paper_execution_base_credit + self.config.live_execution_base_credit)
+                    / 2.0
             }
         };
 
@@ -333,7 +332,8 @@ impl CalibrationGate {
         } else {
             format!(
                 "Verdict {:?} ({}/5 estimators ready): {}",
-                readiness.verdict, readiness.estimators_ready,
+                readiness.verdict,
+                readiness.estimators_ready,
                 issues.join("; ")
             )
         }
@@ -474,14 +474,19 @@ mod tests {
             },
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             quote_outcomes: QuoteOutcomeCheckpoint::default(),
-            spread_bandit: crate::market_maker::learning::spread_bandit::SpreadBanditCheckpoint::default(),
-            baseline_tracker: crate::market_maker::checkpoint::types::BaselineTrackerCheckpoint::default(),
+            spread_bandit:
+                crate::market_maker::learning::spread_bandit::SpreadBanditCheckpoint::default(),
+            baseline_tracker:
+                crate::market_maker::checkpoint::types::BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
-            calibration_coordinator: crate::market_maker::checkpoint::types::CalibrationCoordinatorCheckpoint::default(),
-            kappa_orchestrator: crate::market_maker::checkpoint::types::KappaOrchestratorCheckpoint::default(),
+            calibration_coordinator:
+                crate::market_maker::checkpoint::types::CalibrationCoordinatorCheckpoint::default(),
+            kappa_orchestrator:
+                crate::market_maker::checkpoint::types::KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
+            shadow_tuner: None,
         }
     }
 
@@ -647,14 +652,14 @@ mod tests {
         let gate = CalibrationGate::new(CalibrationGateConfig::default());
 
         let bundle = make_bundle(
-            500.0,  // too short (need 1800s)
-            100,    // vol_obs: ready
-            20,     // kappa_obs: ready
-            30,     // as_samples: ready
-            100,    // regime_obs: ready
-            30,     // fill_rate: ready
-            5,      // kelly wins
-            5,      // kelly losses
+            500.0, // too short (need 1800s)
+            100,   // vol_obs: ready
+            20,    // kappa_obs: ready
+            30,    // as_samples: ready
+            100,   // regime_obs: ready
+            30,    // fill_rate: ready
+            5,     // kelly wins
+            5,     // kelly losses
         );
 
         let readiness = gate.assess(&bundle);
@@ -692,10 +697,18 @@ mod tests {
         // Market data converged, zero fills
         let bundle = make_bundle(2000.0, 80, 0, 0, 60, 0, 0, 0);
         let conf = gate.confidence(&bundle, 100.0);
-        assert!(conf.structural > 0.9, "structural should be ~1.0: {}", conf.structural);
+        assert!(
+            conf.structural > 0.9,
+            "structural should be ~1.0: {}",
+            conf.structural
+        );
         assert_eq!(conf.execution, 0.0);
         // overall = min(1.0, 1.0) * (0.4 + 0.6*0) = 0.4  (unknown source → 0.4 base)
-        assert!((conf.overall - 0.4).abs() < 0.05, "overall ~0.4: {}", conf.overall);
+        assert!(
+            (conf.overall - 0.4).abs() < 0.05,
+            "overall ~0.4: {}",
+            conf.overall
+        );
     }
 
     #[test]
@@ -745,7 +758,16 @@ mod tests {
         regime_obs: u64,
         fill_rate_obs: usize,
     ) -> CheckpointBundle {
-        let mut bundle = make_bundle(2000.0, vol_obs, kappa_obs, as_samples, regime_obs, fill_rate_obs, 5, 5);
+        let mut bundle = make_bundle(
+            2000.0,
+            vol_obs,
+            kappa_obs,
+            as_samples,
+            regime_obs,
+            fill_rate_obs,
+            5,
+            5,
+        );
         bundle.metadata.source_mode = source_mode.to_string();
         bundle
     }
@@ -765,7 +787,8 @@ mod tests {
         assert!(
             paper_conf.overall < live_conf.overall,
             "Paper confidence {} should be < live confidence {}",
-            paper_conf.overall, live_conf.overall
+            paper_conf.overall,
+            live_conf.overall
         );
 
         // Structural and execution should be the same (source doesn't affect these)
@@ -795,12 +818,14 @@ mod tests {
         assert!(
             unknown_conf.overall > paper_conf.overall,
             "Unknown {} should be > paper {}",
-            unknown_conf.overall, paper_conf.overall
+            unknown_conf.overall,
+            paper_conf.overall
         );
         assert!(
             unknown_conf.overall < live_conf.overall,
             "Unknown {} should be < live {}",
-            unknown_conf.overall, live_conf.overall
+            unknown_conf.overall,
+            live_conf.overall
         );
     }
 

@@ -148,7 +148,7 @@ pub struct FundingDivergenceModel {
 impl Default for FundingDivergenceModel {
     fn default() -> Self {
         Self {
-            long_term_mean: 0.0001, // 0.01% per 8h (slightly positive bias)
+            long_term_mean: 0.0001,    // 0.01% per 8h (slightly positive bias)
             mean_reversion_speed: 0.3, // 30% mean reversion per period
             funding_history: RingBuffer::new(100),
         }
@@ -385,7 +385,10 @@ mod tests {
 
         // Signal when funding is high (0.05%)
         let signal_high = model.signal(0.0005);
-        assert!(signal_high > 0.0, "Expected positive signal for high funding");
+        assert!(
+            signal_high > 0.0,
+            "Expected positive signal for high funding"
+        );
 
         // Signal when funding is low (-0.05%)
         let signal_low = model.signal(-0.0005);
@@ -412,7 +415,10 @@ mod tests {
 
         // Should predict higher vol
         let mult_increase = model.vol_multiplier();
-        assert!(mult_increase > 1.0, "Expected higher vol multiplier after OI increase");
+        assert!(
+            mult_increase > 1.0,
+            "Expected higher vol multiplier after OI increase"
+        );
     }
 
     #[test]

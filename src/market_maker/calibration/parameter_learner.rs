@@ -278,10 +278,7 @@ impl BayesianParam {
     /// * `failures` - Number of failures (e.g., uninformed fills)
     pub fn observe_beta(&mut self, successes: usize, failures: usize) {
         if self.family != PriorFamily::Beta {
-            tracing::warn!(
-                "observe_beta called on non-Beta parameter {}",
-                self.name
-            );
+            tracing::warn!("observe_beta called on non-Beta parameter {}", self.name);
             return;
         }
 
@@ -410,8 +407,8 @@ impl BayesianParam {
         let posterior_precision = prior_precision + sample_precision;
 
         let prior_log_mean = self.prior_mean.ln() - self.posterior_param2 / 2.0;
-        self.posterior_param1 =
-            (prior_precision * prior_log_mean + sample_precision * sample_mean) / posterior_precision;
+        self.posterior_param1 = (prior_precision * prior_log_mean + sample_precision * sample_mean)
+            / posterior_precision;
 
         self.last_updated = Some(Instant::now());
     }
@@ -607,7 +604,6 @@ impl BayesianParam {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedParameters {
     // ==================== Tier 1: P&L Critical ====================
-
     /// Informed trader probability at touch.
     /// Prior: Beta(2, 6) → E[α] = 0.25, based on historical analysis
     pub alpha_touch: BayesianParam,
@@ -633,7 +629,6 @@ pub struct LearnedParameters {
     pub predictive_bias_sensitivity: BayesianParam,
 
     // ==================== Tier 2: Risk Management ====================
-
     /// Maximum daily loss as fraction of account.
     /// Prior: Beta(1, 49) → E = 0.02 (2% Kelly-scaled)
     pub max_daily_loss_fraction: BayesianParam,
@@ -659,7 +654,6 @@ pub struct LearnedParameters {
     pub quote_latch_threshold_bps: BayesianParam,
 
     // ==================== Tier 3: Calibration ====================
-
     /// Fill intensity κ (fills per unit spread).
     /// Prior: Gamma(4, 0.002) → E = 2000
     pub kappa: BayesianParam,
@@ -689,7 +683,6 @@ pub struct LearnedParameters {
     pub regime_sticky_diagonal: BayesianParam,
 
     // ==================== Tier 4: Microstructure ====================
-
     /// Kalman filter process noise Q.
     /// Prior: InverseGamma(10, 9e-8) → E = 1e-8
     pub kalman_q: BayesianParam,
@@ -715,7 +708,6 @@ pub struct LearnedParameters {
     pub microprice_decay: BayesianParam,
 
     // ==================== Metadata ====================
-
     /// Last full calibration timestamp (skipped in serialization - not persisted)
     #[serde(skip)]
     pub last_calibration: Option<Instant>,
@@ -731,9 +723,17 @@ impl Default for LearnedParameters {
             alpha_touch: BayesianParam::beta("alpha_touch", 0.25, 8.0),
             gamma_base: BayesianParam::gamma("gamma_base", 0.15, 3.0),
             spread_floor_bps: BayesianParam::normal("spread_floor_bps", 5.0, 4.0),
-            proactive_skew_sensitivity: BayesianParam::normal("proactive_skew_sensitivity", 2.0, 0.25),
+            proactive_skew_sensitivity: BayesianParam::normal(
+                "proactive_skew_sensitivity",
+                2.0,
+                0.25,
+            ),
             toxic_hour_gamma_mult: BayesianParam::log_normal("toxic_hour_gamma_mult", 2.0, 0.3),
-            predictive_bias_sensitivity: BayesianParam::normal("predictive_bias_sensitivity", 2.0, 1.0),
+            predictive_bias_sensitivity: BayesianParam::normal(
+                "predictive_bias_sensitivity",
+                2.0,
+                1.0,
+            ),
 
             // Tier 2: Risk Management
             max_daily_loss_fraction: BayesianParam::beta("max_daily_loss_fraction", 0.02, 50.0),
@@ -757,7 +757,11 @@ impl Default for LearnedParameters {
             kalman_r: BayesianParam::inverse_gamma("kalman_r", 2.5e-9, 20.0),
             momentum_normalizer_bps: BayesianParam::gamma("momentum_normalizer_bps", 20.0, 4.0),
             depth_spacing_ratio: BayesianParam::log_normal("depth_spacing_ratio", 1.5, 0.2),
-            fill_probability_width_bps: BayesianParam::normal("fill_probability_width_bps", 2.0, 0.25),
+            fill_probability_width_bps: BayesianParam::normal(
+                "fill_probability_width_bps",
+                2.0,
+                0.25,
+            ),
             microprice_decay: BayesianParam::beta("microprice_decay", 0.999, 1000.0),
 
             // Metadata
@@ -830,25 +834,53 @@ impl LearnedParameters {
     /// Get a summary of all parameter estimates for logging.
     pub fn summary(&self) -> Vec<(&str, f64, f64, usize)> {
         vec![
-            ("alpha_touch", self.alpha_touch.estimate(), self.alpha_touch.cv(), self.alpha_touch.n_observations),
-            ("gamma_base", self.gamma_base.estimate(), self.gamma_base.cv(), self.gamma_base.n_observations),
-            ("spread_floor_bps", self.spread_floor_bps.estimate(), self.spread_floor_bps.cv(), self.spread_floor_bps.n_observations),
-            ("kappa", self.kappa.estimate(), self.kappa.cv(), self.kappa.n_observations),
-            ("hawkes_mu", self.hawkes_mu.estimate(), self.hawkes_mu.cv(), self.hawkes_mu.n_observations),
-            ("hawkes_alpha", self.hawkes_alpha.estimate(), self.hawkes_alpha.cv(), self.hawkes_alpha.n_observations),
+            (
+                "alpha_touch",
+                self.alpha_touch.estimate(),
+                self.alpha_touch.cv(),
+                self.alpha_touch.n_observations,
+            ),
+            (
+                "gamma_base",
+                self.gamma_base.estimate(),
+                self.gamma_base.cv(),
+                self.gamma_base.n_observations,
+            ),
+            (
+                "spread_floor_bps",
+                self.spread_floor_bps.estimate(),
+                self.spread_floor_bps.cv(),
+                self.spread_floor_bps.n_observations,
+            ),
+            (
+                "kappa",
+                self.kappa.estimate(),
+                self.kappa.cv(),
+                self.kappa.n_observations,
+            ),
+            (
+                "hawkes_mu",
+                self.hawkes_mu.estimate(),
+                self.hawkes_mu.cv(),
+                self.hawkes_mu.n_observations,
+            ),
+            (
+                "hawkes_alpha",
+                self.hawkes_alpha.estimate(),
+                self.hawkes_alpha.cv(),
+                self.hawkes_alpha.n_observations,
+            ),
         ]
     }
 
     /// Check overall calibration status.
     pub fn calibration_status(&self) -> CalibrationStatus {
-        let tier1_calibrated =
-            self.alpha_touch.is_calibrated(50, 0.5) &&
-            self.gamma_base.is_calibrated(20, 1.0) &&
-            self.kappa.is_calibrated(100, 0.5);
+        let tier1_calibrated = self.alpha_touch.is_calibrated(50, 0.5)
+            && self.gamma_base.is_calibrated(20, 1.0)
+            && self.kappa.is_calibrated(100, 0.5);
 
-        let tier2_calibrated =
-            self.cascade_oi_threshold.is_calibrated(10, 1.0) &&
-            self.bocpd_threshold.is_calibrated(10, 0.5);
+        let tier2_calibrated = self.cascade_oi_threshold.is_calibrated(10, 1.0)
+            && self.bocpd_threshold.is_calibrated(10, 0.5);
 
         CalibrationStatus {
             tier1_ready: tier1_calibrated,
@@ -1001,9 +1033,7 @@ impl LearnedParameters {
         // --- Tier 3: Calibration ---
 
         // kappa: fill intensity (fills per unit spread-time)
-        if let (Some(count), Some(exposure)) =
-            (outcome.fills_in_window, outcome.window_exposure)
-        {
+        if let (Some(count), Some(exposure)) = (outcome.fills_in_window, outcome.window_exposure) {
             if exposure > 0.0 {
                 self.kappa.observe_gamma_poisson(count, exposure);
             }
@@ -1072,7 +1102,6 @@ impl LearnedParameters {
             &self.gamma_base,
             &self.spread_floor_bps,
             &self.proactive_skew_sensitivity,
-
             &self.toxic_hour_gamma_mult,
             &self.predictive_bias_sensitivity,
             &self.max_daily_loss_fraction,
@@ -1218,29 +1247,32 @@ mod tests {
     #[test]
     fn test_save_load_roundtrip() {
         use std::fs;
-        
+
         // Create params and add some observations
         let mut params = LearnedParameters::default();
         params.alpha_touch.observe_beta(30, 70); // 30% informed
         params.kappa.observe_gamma_poisson(100, 0.05); // 2000 fills/sec/spread
         params.total_fills_observed = 100;
-        
+
         // Save to temp file
         let temp_dir = std::env::temp_dir();
         let temp_path = temp_dir.join("test_learned_params.json");
-        
+
         params.save_to_file(&temp_path).expect("Failed to save");
-        
+
         // Load and verify
         let loaded = LearnedParameters::load_from_file(&temp_path).expect("Failed to load");
-        
+
         // Verify key values persisted
-        assert_eq!(loaded.alpha_touch.n_observations, params.alpha_touch.n_observations);
+        assert_eq!(
+            loaded.alpha_touch.n_observations,
+            params.alpha_touch.n_observations
+        );
         assert!((loaded.alpha_touch.estimate() - params.alpha_touch.estimate()).abs() < 0.001);
         assert_eq!(loaded.kappa.n_observations, params.kappa.n_observations);
         assert!((loaded.kappa.estimate() - params.kappa.estimate()).abs() < 1.0);
         assert_eq!(loaded.total_fills_observed, 100);
-        
+
         // Clean up
         fs::remove_file(&temp_path).ok();
     }
@@ -1249,7 +1281,7 @@ mod tests {
     fn test_load_or_default_missing_file() {
         let nonexistent_path = std::path::PathBuf::from("/nonexistent/path/params.json");
         let params = LearnedParameters::load_or_default(&nonexistent_path);
-        
+
         // Should return defaults
         assert!((params.alpha_touch.estimate() - 0.25).abs() < 0.01);
         assert_eq!(params.total_fills_observed, 0);

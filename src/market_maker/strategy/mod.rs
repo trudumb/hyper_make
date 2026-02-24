@@ -4,6 +4,7 @@
 //! `QuotingStrategy` trait.
 
 pub mod drift_estimator;
+pub mod dynamic_params;
 pub mod echo_estimator;
 pub mod feature_store;
 mod glft;
@@ -13,13 +14,13 @@ mod market_params;
 mod params;
 mod position_manager;
 pub mod regime_state;
-pub mod spread_oracle;
 mod risk_config;
 mod risk_model;
 mod signal_integration;
 #[cfg(test)]
 mod signal_integration_test;
 mod simple;
+pub mod spread_oracle;
 
 pub use glft::*;
 pub use kelly::*;
@@ -30,6 +31,7 @@ pub use position_manager::*;
 // regime_state types are used via qualified paths (strategy::regime_state::*)
 // to avoid name conflicts with control::changepoint::MarketRegime and
 // infra::metrics::dashboard::RegimeState.
+pub use dynamic_params::DynamicParams;
 pub use risk_config::*;
 pub use risk_model::*;
 pub use signal_integration::*;
@@ -730,7 +732,7 @@ mod tests {
         };
 
         let as_params = MarketParams {
-            as_spread_adjustment: 0.001, // 10 bps AS adjustment (total)
+            as_spread_adjustment: 0.001,     // 10 bps AS adjustment (total)
             as_spread_adjustment_bid: 0.001, // 10 bps per-side
             as_spread_adjustment_ask: 0.001,
             ..base_params.clone()
@@ -798,8 +800,10 @@ mod tests {
 
         // should_pull_quotes=true no longer returns (None, None)
         // Quotes are always produced; risk is handled by γ(q) continuously
-        assert!(bid.is_some() || ask.is_some(),
-            "should_pull_quotes should NOT produce empty quotes — γ handles risk");
+        assert!(
+            bid.is_some() || ask.is_some(),
+            "should_pull_quotes should NOT produce empty quotes — γ handles risk"
+        );
     }
 
     // === GLFT Implementation Fixes - Verification Tests ===
@@ -812,8 +816,8 @@ mod tests {
         // Use lower kappa to ensure spreads are above the floor, so we can see
         // the volatility compensation effect clearly.
         let config = RiskConfig {
-            gamma_base: 0.5,           // Higher gamma for wider base spread
-            min_spread_floor: 0.0003,  // 3 bps floor (lower than computed spread)
+            gamma_base: 0.5,          // Higher gamma for wider base spread
+            min_spread_floor: 0.0003, // 3 bps floor (lower than computed spread)
             ..Default::default()
         };
         let strategy = GLFTStrategy::with_config(config);
@@ -821,9 +825,9 @@ mod tests {
 
         // Normal conditions with lower kappa to get spread above floor
         let normal_params = MarketParams {
-            sigma: 0.0002,          // 2 bps/√sec (normal)
+            sigma: 0.0002, // 2 bps/√sec (normal)
             sigma_effective: 0.0002,
-            kappa: 500.0,           // Lower kappa = wider GLFT spread
+            kappa: 500.0, // Lower kappa = wider GLFT spread
             kappa_bid: 500.0,
             kappa_ask: 500.0,
             arrival_intensity: 1.0 / 60.0, // 60 second hold time
@@ -843,12 +847,20 @@ mod tests {
         // Vol comp: 0.5 × 0.5 × (0.0002)² × 60 = 1.2e-7 (0.0012 bps) - negligible
         // Fee: 0.00015 (1.5 bps)
         // Total half-spread: ~21.5 bps per side, total spread ~43 bps
-        assert!(spread_bps > 30.0, "Normal spread should be > 30 bps, got {:.2}", spread_bps);
-        assert!(spread_bps < 60.0, "Normal spread should be < 60 bps, got {:.2}", spread_bps);
+        assert!(
+            spread_bps > 30.0,
+            "Normal spread should be > 30 bps, got {:.2}",
+            spread_bps
+        );
+        assert!(
+            spread_bps < 60.0,
+            "Normal spread should be < 60 bps, got {:.2}",
+            spread_bps
+        );
 
         // High volatility case - spread should be wider due to gamma vol scaling
         let high_vol_params = MarketParams {
-            sigma: 0.001,           // 10 bps/√sec (5× normal)
+            sigma: 0.001, // 10 bps/√sec (5× normal)
             sigma_effective: 0.001,
             kappa: 500.0,
             kappa_bid: 500.0,
@@ -858,7 +870,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (bid_high, ask_high) = strategy.calculate_quotes(&quote_config, 0.0, 1.0, 0.5, &high_vol_params);
+        let (bid_high, ask_high) =
+            strategy.calculate_quotes(&quote_config, 0.0, 1.0, 0.5, &high_vol_params);
 
         let bid_high = bid_high.unwrap();
         let ask_high = ask_high.unwrap();
@@ -911,8 +924,10 @@ mod tests {
         };
 
         // With position = 1.0 (long), positive funding should skew quotes
-        let (bid_base, ask_base) = strategy.calculate_quotes(&quote_config, 1.0, 2.0, 0.5, &base_params);
-        let (bid_fund, ask_fund) = strategy.calculate_quotes(&quote_config, 1.0, 2.0, 0.5, &funding_params);
+        let (bid_base, ask_base) =
+            strategy.calculate_quotes(&quote_config, 1.0, 2.0, 0.5, &base_params);
+        let (bid_fund, ask_fund) =
+            strategy.calculate_quotes(&quote_config, 1.0, 2.0, 0.5, &funding_params);
 
         let _mid_base = (ask_base.unwrap().price + bid_base.unwrap().price) / 2.0;
         let _mid_fund = (ask_fund.unwrap().price + bid_fund.unwrap().price) / 2.0;
@@ -925,8 +940,13 @@ mod tests {
         assert!(ask_fund.is_some(), "Should produce ask quote with funding");
 
         // Verify the funding quote prices are close to base (effect is small)
-        let bid_diff_bps = (bid_fund.unwrap().price - bid_base.unwrap().price).abs() / 100.0 * 10000.0;
-        assert!(bid_diff_bps < 1.0, "Funding impact should be < 1 bps on bid, got {:.4} bps", bid_diff_bps);
+        let bid_diff_bps =
+            (bid_fund.unwrap().price - bid_base.unwrap().price).abs() / 100.0 * 10000.0;
+        assert!(
+            bid_diff_bps < 1.0,
+            "Funding impact should be < 1 bps on bid, got {:.4} bps",
+            bid_diff_bps
+        );
     }
 
     #[test]
@@ -946,7 +966,7 @@ mod tests {
 
         // Normal volatility
         let sigma_normal = 0.0002; // 2 bps/√sec
-        let tau = 60.0;            // 60 second hold time
+        let tau = 60.0; // 60 second hold time
 
         // Calculate expected values manually:
         // GLFT term: (1/0.5) × ln(1 + 0.5/500) = 2 × ln(1.001) ≈ 2 × 0.000999 = 0.002 (20 bps)
