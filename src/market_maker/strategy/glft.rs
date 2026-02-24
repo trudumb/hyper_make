@@ -93,10 +93,12 @@ pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
 /// low kappa and high AS. The accumulating side should still require E[PnL] > 0,
 /// but the reducing side gets a negative threshold that grows with position urgency.
 ///
-/// Shape: `q_ratio^1.5` captures quadratic VaR scaling (structural, regime-independent).
+/// Shape: `sqrt(q_ratio)` captures square-root scaling, granting a larger
+/// carve-out for small remnant positions to prevent getting 'stuck' holding
+/// directional risk when the trend opposes closing.
 /// V2 gamma_ratio: `gamma / gamma_baseline` encodes regime risk aversion.
-/// - Extreme (gamma 3x) → -4.5 bps at 100% pos (3 fees: willing to pay to unwind)
-/// - Calm (gamma 0.5x) → -0.75 bps at 100% pos (half fee: cheap to wait)
+/// - Extreme (gamma 3x) → -6.0 bps at 100% pos (willing to pay to unwind)
+/// - Calm (gamma 0.5x) → -1.0 bps at 100% pos (cheap to wait)
 ///
 /// Returns a negative threshold in bps (or 0.0 at flat position).
 pub fn reducing_threshold_bps(
@@ -118,7 +120,7 @@ pub fn reducing_threshold_bps(
     } else {
         1.0
     };
-    -fee_bps * gamma_ratio * q_ratio.powf(1.5)
+    -2.0 * fee_bps * gamma_ratio * q_ratio.powf(0.5)
 }
 
 /// Avellaneda-Stoikov reservation price shift with HARA utility.
@@ -3035,34 +3037,34 @@ mod tests {
 
     #[test]
     fn test_reducing_threshold_80pct_position() {
-        // q_ratio = 0.8, q_ratio^1.5 ≈ 0.7155, gamma_ratio = 1.0
-        // threshold = -1.5 * 1.0 * 0.7155 ≈ -1.073
+        // q_ratio = 0.8, sqrt(0.8) ≈ 0.8944, gamma_ratio = 1.0
+        // threshold = -2.0 * 1.5 * 1.0 * sqrt(0.8) ≈ -2.683
         let t = reducing_threshold_bps(8.0, 10.0, 1.5, 1.0, 1.0);
         assert!(
-            (t - (-1.5 * 0.8_f64.powf(1.5))).abs() < 0.01,
-            "80% position → ~-1.07 bps, got {t}"
+            (t - (-2.0 * 1.5 * 0.8_f64.powf(0.5))).abs() < 0.01,
+            "80% position → ~-2.68 bps, got {t}"
         );
     }
 
     #[test]
     fn test_reducing_threshold_100pct_extreme_regime() {
         // gamma=3.0, baseline=1.0 → gamma_ratio=3.0
-        // threshold = -1.5 * 3.0 * 1.0^1.5 = -4.5
+        // threshold = -2.0 * 1.5 * 3.0 * 1.0^0.5 = -9.0
         let t = reducing_threshold_bps(10.0, 10.0, 1.5, 3.0, 1.0);
         assert!(
-            (t - (-4.5)).abs() < 1e-9,
-            "Extreme regime at 100% pos → -4.5 bps (3 fees), got {t}"
+            (t - (-9.0)).abs() < 1e-9,
+            "Extreme regime at 100% pos → -9.0 bps (3 fees * 2), got {t}"
         );
     }
 
     #[test]
     fn test_reducing_threshold_100pct_calm_regime() {
         // gamma=0.5, baseline=1.0 → gamma_ratio=0.5
-        // threshold = -1.5 * 0.5 * 1.0^1.5 = -0.75
+        // threshold = -2.0 * 1.5 * 0.5 * 1.0^0.5 = -1.5
         let t = reducing_threshold_bps(10.0, 10.0, 1.5, 0.5, 1.0);
         assert!(
-            (t - (-0.75)).abs() < 1e-9,
-            "Calm regime at 100% pos → -0.75 bps (half fee), got {t}"
+            (t - (-1.5)).abs() < 1e-9,
+            "Calm regime at 100% pos → -1.5 bps (half fee * 2), got {t}"
         );
     }
 
@@ -3071,14 +3073,14 @@ mod tests {
         // gamma=10.0, baseline=1.0 → gamma_ratio clamped to 3.0
         let t = reducing_threshold_bps(10.0, 10.0, 1.5, 10.0, 1.0);
         assert!(
-            (t - (-4.5)).abs() < 1e-9,
+            (t - (-9.0)).abs() < 1e-9,
             "Gamma ratio should clamp at 3.0, got {t}"
         );
 
         // gamma=0.01, baseline=1.0 → gamma_ratio clamped to 0.5
         let t2 = reducing_threshold_bps(10.0, 10.0, 1.5, 0.01, 1.0);
         assert!(
-            (t2 - (-0.75)).abs() < 1e-9,
+            (t2 - (-1.5)).abs() < 1e-9,
             "Gamma ratio should clamp at 0.5, got {t2}"
         );
     }

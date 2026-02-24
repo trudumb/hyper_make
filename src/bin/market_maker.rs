@@ -2114,7 +2114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wire Shadow Tuner if enabled (continuous CMA-ES background optimization)
     if cli.enable_shadow_tuner {
         let tuner_config = hyperliquid_rust_sdk::market_maker::ShadowTunerConfig::default();
-        let (mm, tuner) = market_maker.with_shadow_tuner(tuner_config, None);
+        let (mm, tuner) = market_maker.with_shadow_tuner(tuner_config, None, None);
         market_maker = mm;
         std::thread::spawn(move || {
             let mut tuner = tuner;
@@ -2881,7 +2881,7 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     // Wire Shadow Tuner if enabled (continuous CMA-ES background optimization)
     if cli.enable_shadow_tuner {
         let tuner_config = hyperliquid_rust_sdk::market_maker::ShadowTunerConfig::default();
-        let (mm, tuner) = market_maker.with_shadow_tuner(tuner_config, None);
+        let (mm, tuner) = market_maker.with_shadow_tuner(tuner_config, None, None);
         market_maker = mm;
         std::thread::spawn(move || {
             let mut tuner = tuner;

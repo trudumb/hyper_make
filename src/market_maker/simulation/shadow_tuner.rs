@@ -138,6 +138,20 @@ pub fn default_param_bounds() -> Vec<ParamBound> {
 }
 
 // ---------------------------------------------------------------------------
+// SharedEstimators
+// ---------------------------------------------------------------------------
+
+/// Shared atomic state from the live engine, used by the tuner for gating and replay.
+pub struct SharedEstimators {
+    /// Gate signal; tuner sleeps until this is `true`.
+    pub calibration_gate_passed: Arc<AtomicBool>,
+    /// Live order-arrival intensity from the online estimator.
+    pub live_kappa: Arc<AtomicF64>,
+    /// Live volatility estimate from the online estimator.
+    pub live_sigma: Arc<AtomicF64>,
+}
+
+// ---------------------------------------------------------------------------
 // ShadowTuner
 // ---------------------------------------------------------------------------
 
@@ -147,8 +161,7 @@ pub fn default_param_bounds() -> Vec<ParamBound> {
 /// Communicates with the live engine via:
 /// - [`ShadowBufferConsumer`] (receives market events via lock-free flume channel)
 /// - [`tokio::sync::watch::Sender<DynamicParams>`] (publishes optimized params)
-/// - [`Arc<AtomicBool>`] (calibration gate signal)
-/// - [`Arc<AtomicF64>`] (live kappa and sigma from estimators)
+/// - [`SharedEstimators`] (calibration gate, live kappa and sigma)
 pub struct ShadowTuner {
     consumer: ShadowBufferConsumer,
     params_tx: tokio::sync::watch::Sender<DynamicParams>,
@@ -157,45 +170,57 @@ pub struct ShadowTuner {
     current_best_score: f64,
     config: TunerConfig,
     cycle_count: u64,
-    calibration_gate_passed: Arc<AtomicBool>,
-    live_kappa: Arc<AtomicF64>,
-    live_sigma: Arc<AtomicF64>,
+    shared: SharedEstimators,
 }
 
 impl ShadowTuner {
-    /// Create a new shadow tuner.
+    /// Create a new shadow tuner, optionally restoring from a checkpoint.
     ///
     /// # Arguments
     /// * `consumer` -- consumer end of the shadow buffer (from [`create_shadow_buffer`])
     /// * `params_tx` -- watch channel sender for publishing optimized params
     /// * `config` -- tuner runtime configuration
-    /// * `calibration_gate_passed` -- gate signal; tuner sleeps until this is `true`
-    /// * `live_kappa` -- live order-arrival intensity from the online estimator
-    /// * `live_sigma` -- live volatility estimate from the online estimator
+    /// * `shared` -- shared atomic state from the live engine
     /// * `initial_params` -- optional starting point; falls back to [`DynamicParams::default()`]
+    /// * `checkpoint` -- optional checkpoint to restore optimizer state from
     pub fn new(
         consumer: ShadowBufferConsumer,
         params_tx: tokio::sync::watch::Sender<DynamicParams>,
         config: TunerConfig,
-        calibration_gate_passed: Arc<AtomicBool>,
-        live_kappa: Arc<AtomicF64>,
-        live_sigma: Arc<AtomicF64>,
+        shared: SharedEstimators,
         initial_params: Option<DynamicParams>,
+        checkpoint: Option<ShadowTunerCheckpoint>,
     ) -> Self {
         let initial = initial_params.unwrap_or_default();
         let initial_vec = initial.to_vec();
-        let optimizer = CmaEsOptimizer::new(config.param_bounds.clone(), &initial_vec);
+        let mut optimizer = CmaEsOptimizer::new(config.param_bounds.clone(), &initial_vec);
+
+        let (current_best, current_best_score, cycle_count) = if let Some(ref ckpt) = checkpoint {
+            // Restore optimizer mean/sigma/generation if checkpoint has valid mean
+            if !ckpt.optimizer_mean.is_empty() {
+                optimizer.restore_state(
+                    &ckpt.optimizer_mean,
+                    ckpt.optimizer_sigma,
+                    ckpt.generation,
+                );
+            }
+            let best = ckpt.current_best.clone().unwrap_or(initial);
+            // If we had a previous best, score is unknown — use NEG_INFINITY
+            // so the first generation's result is always accepted
+            (best, f64::NEG_INFINITY, ckpt.cycles_completed)
+        } else {
+            (initial, f64::NEG_INFINITY, 0)
+        };
+
         Self {
             consumer,
             params_tx,
             optimizer,
-            current_best: initial,
-            current_best_score: f64::NEG_INFINITY,
+            current_best,
+            current_best_score,
             config,
-            cycle_count: 0,
-            calibration_gate_passed,
-            live_kappa,
-            live_sigma,
+            cycle_count,
+            shared,
         }
     }
 
@@ -222,7 +247,7 @@ impl ShadowTuner {
             std::thread::sleep(Duration::from_secs(self.config.cycle_interval_s));
 
             // Check calibration gate
-            if !self.calibration_gate_passed.load(Ordering::Relaxed) {
+            if !self.shared.calibration_gate_passed.load(Ordering::Relaxed) {
                 debug!("[ShadowTuner] Calibration gate not passed, sleeping");
                 continue;
             }
@@ -240,8 +265,8 @@ impl ShadowTuner {
             let events = self.consumer.snapshot();
 
             // Read live estimator values
-            let kappa = self.live_kappa.load(Ordering::Relaxed).max(1.0);
-            let sigma = self.live_sigma.load(Ordering::Relaxed);
+            let kappa = self.shared.live_kappa.load(Ordering::Relaxed).max(1.0);
+            let sigma = self.shared.live_sigma.load(Ordering::Relaxed);
 
             // Run one CMA-ES generation
             let (best_params, best_score) = if let Some(ref pool) = pool {
@@ -363,7 +388,7 @@ impl ShadowTuner {
     pub fn checkpoint(&self) -> ShadowTunerCheckpoint {
         ShadowTunerCheckpoint {
             current_best: Some(self.current_best.clone()),
-            optimizer_mean: Vec::new(), // TODO: expose optimizer mean for full persistence
+            optimizer_mean: self.optimizer.mean_vec(),
             optimizer_sigma: self.optimizer.sigma(),
             generation: self.optimizer.generation(),
             cycles_completed: self.cycle_count,
@@ -422,21 +447,33 @@ mod tests {
         assert!(restored.current_best.is_some());
     }
 
+    fn test_shared_estimators() -> SharedEstimators {
+        SharedEstimators {
+            calibration_gate_passed: Arc::new(AtomicBool::new(false)),
+            live_kappa: Arc::new(AtomicF64::new(2000.0)),
+            live_sigma: Arc::new(AtomicF64::new(0.0002)),
+        }
+    }
+
+    fn test_shared_estimators_gated() -> SharedEstimators {
+        SharedEstimators {
+            calibration_gate_passed: Arc::new(AtomicBool::new(true)),
+            live_kappa: Arc::new(AtomicF64::new(2000.0)),
+            live_sigma: Arc::new(AtomicF64::new(0.0002)),
+        }
+    }
+
     #[test]
     fn test_tuner_creation() {
         let (_, consumer) = create_shadow_buffer(1000, 60_000_000_000);
         let (tx, _rx) = tokio::sync::watch::channel(DynamicParams::default());
-        let gate = Arc::new(AtomicBool::new(false));
-        let kappa = Arc::new(AtomicF64::new(2000.0));
-        let sigma = Arc::new(AtomicF64::new(0.0002));
 
         let tuner = ShadowTuner::new(
             consumer,
             tx,
             TunerConfig::default(),
-            gate,
-            kappa,
-            sigma,
+            test_shared_estimators(),
+            None,
             None,
         );
         assert_eq!(tuner.cycle_count, 0);
@@ -447,9 +484,6 @@ mod tests {
     fn test_run_generation_with_synthetic_data() {
         let (producer, consumer) = create_shadow_buffer(10_000, 60_000_000_000);
         let (tx, _rx) = tokio::sync::watch::channel(DynamicParams::default());
-        let gate = Arc::new(AtomicBool::new(true));
-        let kappa = Arc::new(AtomicF64::new(2000.0));
-        let sigma = Arc::new(AtomicF64::new(0.0002));
 
         // Feed synthetic market data
         for i in 0..100 {
@@ -479,9 +513,8 @@ mod tests {
                 min_events_for_replay: 10,
                 ..Default::default()
             },
-            gate,
-            kappa,
-            sigma,
+            test_shared_estimators_gated(),
+            None,
             None,
         );
 
@@ -499,5 +532,109 @@ mod tests {
             best_score.is_finite(),
             "Score should be finite: {best_score}"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_stores_mean() {
+        let (_, consumer) = create_shadow_buffer(1000, 60_000_000_000);
+        let (tx, _rx) = tokio::sync::watch::channel(DynamicParams::default());
+
+        let tuner = ShadowTuner::new(
+            consumer,
+            tx,
+            TunerConfig::default(),
+            test_shared_estimators(),
+            None,
+            None,
+        );
+
+        let ckpt = tuner.checkpoint();
+        // optimizer_mean should be non-empty (8 dimensions)
+        assert_eq!(
+            ckpt.optimizer_mean.len(),
+            8,
+            "checkpoint mean should have 8 elements, got {}",
+            ckpt.optimizer_mean.len()
+        );
+        // All values should be finite
+        for (i, &v) in ckpt.optimizer_mean.iter().enumerate() {
+            assert!(v.is_finite(), "mean[{i}] is not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_restore_roundtrip() {
+        let (producer, consumer) = create_shadow_buffer(10_000, 60_000_000_000);
+        let (tx, _rx) = tokio::sync::watch::channel(DynamicParams::default());
+
+        // Feed synthetic data
+        for i in 0..100 {
+            let ts = (i + 1) * 1_000_000_000u64;
+            let mid = 100.0 + (i as f64) * 0.001;
+            producer.push(ReplayEvent::L2Update {
+                timestamp_ns: ts,
+                best_bid: mid - 0.05,
+                best_ask: mid + 0.05,
+                bid_depth: 10.0,
+                ask_depth: 10.0,
+            });
+        }
+
+        let mut tuner = ShadowTuner::new(
+            consumer,
+            tx,
+            TunerConfig {
+                min_events_for_replay: 10,
+                ..Default::default()
+            },
+            test_shared_estimators_gated(),
+            None,
+            None,
+        );
+
+        // Run a generation to evolve optimizer state
+        tuner.consumer.drain();
+        let events = tuner.consumer.snapshot();
+        let _ = tuner.run_generation(&events, 2000.0, 0.0002);
+        tuner.cycle_count += 1;
+
+        // Take checkpoint
+        let ckpt = tuner.checkpoint();
+        assert!(!ckpt.optimizer_mean.is_empty());
+        assert!(ckpt.optimizer_sigma > 0.0);
+        assert_eq!(ckpt.generation, 1);
+        assert_eq!(ckpt.cycles_completed, 1);
+
+        // Create a new tuner from the checkpoint
+        let (_, consumer2) = create_shadow_buffer(1000, 60_000_000_000);
+        let (tx2, _rx2) = tokio::sync::watch::channel(DynamicParams::default());
+
+        let restored = ShadowTuner::new(
+            consumer2,
+            tx2,
+            TunerConfig::default(),
+            test_shared_estimators_gated(),
+            None,
+            Some(ckpt.clone()),
+        );
+
+        // Verify restored state
+        assert_eq!(restored.cycle_count, ckpt.cycles_completed);
+        assert_eq!(restored.optimizer.generation(), ckpt.generation);
+        assert!((restored.optimizer.sigma() - ckpt.optimizer_sigma).abs() < 1e-12);
+
+        // Verify restored optimizer mean matches checkpoint
+        let restored_mean = restored.optimizer.mean_vec();
+        assert_eq!(restored_mean.len(), ckpt.optimizer_mean.len());
+        for (i, (&r, &c)) in restored_mean
+            .iter()
+            .zip(ckpt.optimizer_mean.iter())
+            .enumerate()
+        {
+            assert!(
+                (r - c).abs() < 1e-12,
+                "dim {i}: restored={r}, checkpoint={c}"
+            );
+        }
     }
 }

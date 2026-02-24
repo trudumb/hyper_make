@@ -15,13 +15,14 @@ Rust-based quantitative market making for Hyperliquid perpetual futures using GL
 ## Build & Verification
 
 ```bash
-cargo clippy -- -D warnings      # Lint first — treat warnings as errors
-cargo test                        # After clippy passes
+cargo fmt --all -- --check              # 1. Check formatting first
+cargo clippy --all-targets -- -D warnings  # 2. Lint — treat warnings as errors
+cargo nextest run                       # 3. Run tests (isolated processes, OOM-safe)
 ```
 
 **Resource constraint**: One cargo command at a time (hook-enforced mutex). Sequential only — concurrent builds crash the machine.
 
-IMPORTANT: After any code change, run `cargo clippy -- -D warnings` and fix all warnings before considering the task done.
+IMPORTANT: After any code change, run `cargo fmt --all -- --check` then `cargo clippy --all-targets -- -D warnings` and fix all issues before considering the task done.
 
 ## Structure
 

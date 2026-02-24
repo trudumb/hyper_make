@@ -357,6 +357,28 @@ impl CmaEsOptimizer {
         self.sigma
     }
 
+    /// Returns the current mean vector in unbounded space as a plain Vec.
+    pub fn mean_vec(&self) -> Vec<f64> {
+        self.mean.iter().copied().collect()
+    }
+
+    /// Restore optimizer state from a checkpoint.
+    ///
+    /// Restores mean (in unbounded space), sigma, and generation count.
+    /// Covariance and evolution paths are reset to identity/zero — this is
+    /// acceptable because the covariance adapts quickly (O(10) generations).
+    pub fn restore_state(&mut self, mean_unbounded: &[f64], sigma: f64, generation: u64) {
+        if mean_unbounded.len() == self.dimension {
+            self.mean = DVector::from_column_slice(mean_unbounded);
+            self.sigma = sigma.clamp(1e-10, 10.0);
+            self.generation = generation;
+            // Covariance and paths reset — they'll re-adapt in ~10 generations
+            self.covariance = DMatrix::identity(self.dimension, self.dimension);
+            self.p_c = DVector::zeros(self.dimension);
+            self.p_sigma = DVector::zeros(self.dimension);
+        }
+    }
+
     /// Returns the decoded best individual and its fitness from a population evaluation.
     ///
     /// Fitness is maximized: the individual with the highest fitness wins.
@@ -652,5 +674,96 @@ mod tests {
             "mean y not near -2.0: {}",
             decoded_mean[1]
         );
+    }
+
+    #[test]
+    fn test_mean_vec_matches_decoded() {
+        let bounds = default_bounds();
+        let initial = default_initial();
+        let optimizer = CmaEsOptimizer::new(bounds.clone(), &initial);
+
+        let mean_vec = optimizer.mean_vec();
+        assert_eq!(mean_vec.len(), bounds.len());
+
+        // Decode via sigmoid and verify roundtrip with initial values
+        let decoded: Vec<f64> = mean_vec
+            .iter()
+            .zip(bounds.iter())
+            .map(|(&raw, b)| b.map_sigmoid(raw))
+            .collect();
+        for (i, (&dec, &ini)) in decoded.iter().zip(initial.iter()).enumerate() {
+            assert!(
+                (dec - ini).abs() < 1e-3,
+                "dim {i}: decoded={dec}, initial={ini}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_restore_state() {
+        let bounds = vec![
+            ParamBound {
+                min: -5.0,
+                max: 5.0,
+            },
+            ParamBound {
+                min: -5.0,
+                max: 5.0,
+            },
+        ];
+        let initial = vec![0.0, 0.0];
+        let mut optimizer = CmaEsOptimizer::new(bounds, &initial);
+
+        // Run a few generations to evolve state
+        for _ in 0..5 {
+            let population = optimizer.sample_population();
+            let fitnesses: Vec<f64> = population
+                .iter()
+                .map(|x| {
+                    let decoded = optimizer.decode_individual(x);
+                    -(decoded[0].powi(2) + decoded[1].powi(2))
+                })
+                .collect();
+            optimizer.update(&population, &fitnesses);
+        }
+
+        // Save state
+        let saved_mean = optimizer.mean_vec();
+        let saved_sigma = optimizer.sigma();
+        let saved_gen = optimizer.generation();
+        assert!(saved_gen >= 5);
+
+        // Create a fresh optimizer and restore
+        let bounds2 = vec![
+            ParamBound {
+                min: -5.0,
+                max: 5.0,
+            },
+            ParamBound {
+                min: -5.0,
+                max: 5.0,
+            },
+        ];
+        let mut restored = CmaEsOptimizer::new(bounds2, &[0.0, 0.0]);
+        restored.restore_state(&saved_mean, saved_sigma, saved_gen);
+
+        // Verify restored state
+        assert_eq!(restored.generation(), saved_gen);
+        assert!((restored.sigma() - saved_sigma).abs() < 1e-12);
+        let restored_mean = restored.mean_vec();
+        for (i, (&r, &s)) in restored_mean.iter().zip(saved_mean.iter()).enumerate() {
+            assert!((r - s).abs() < 1e-12, "dim {i}: restored={r}, saved={s}");
+        }
+
+        // Verify sampling still works after restore
+        let population = restored.sample_population();
+        assert!(!population.is_empty());
+        for individual in &population {
+            let decoded = restored.decode_individual(individual);
+            assert_eq!(decoded.len(), 2);
+            for &v in &decoded {
+                assert!(v.is_finite());
+            }
+        }
     }
 }

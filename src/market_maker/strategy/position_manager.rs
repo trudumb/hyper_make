@@ -182,8 +182,8 @@ impl PositionDecisionEngine {
             belief_drift,
             belief_confidence,
             edge_bps,
-            trend_momentum_bps,
-            unrealized_pnl_bps,
+            trend_momentum_bps: _trend_momentum_bps,
+            unrealized_pnl_bps: _unrealized_pnl_bps,
         } = *input;
         let inv_ratio = if max_position > 1e-9 {
             (position / max_position).abs()
@@ -236,15 +236,9 @@ impl PositionDecisionEngine {
             return PositionAction::Hold;
         }
 
-        // === TREND-MOMENTUM GUARD ===
-        // When changepoint resets beliefs, belief_drift and belief_confidence drop to ~0.
-        // This guard reads raw price momentum (NOT from belief system) to prevent
-        // selling into a profitable, trend-aligned position.
-        let trend_aligned =
-            trend_momentum_bps.signum() == position_sign && trend_momentum_bps.abs() > 5.0; // Meaningful trend
-        if trend_aligned && unrealized_pnl_bps > -2.0 {
-            return PositionAction::Hold;
-        }
+        // The TREND-MOMENTUM GUARD was removed because it bypassed Bayesian logic
+        // and forced the bot to HOLD directional positions, causing it to get
+        // stuck short even when it should have been safely exiting.
 
         // === REDUCE: Default behavior with urgency scaling ===
         let urgency = self.compute_urgency(p_cont, inv_ratio, aligned);
@@ -522,28 +516,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_trend_momentum_guard_prevents_selling_into_rally() {
-        let engine = PositionDecisionEngine::default();
 
-        // Simulate: beliefs are reset (low confidence), but raw trend is bullish
-        let action = engine.decide(&PositionDecisionInput {
-            position: 0.3,
-            max_position: 1.0,
-            belief_drift: 0.0,
-            belief_confidence: 0.0,
-            edge_bps: 0.0,
-            trend_momentum_bps: 15.0,
-            unrealized_pnl_bps: 2.0,
-        });
-
-        // Trend-momentum guard should fire: position aligned with trend, not underwater
-        assert!(
-            action.is_hold(),
-            "Expected HOLD from trend-momentum guard, got {:?}",
-            action
-        );
-    }
 
     #[test]
     fn test_trend_momentum_guard_does_not_fire_when_underwater() {

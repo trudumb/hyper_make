@@ -72,7 +72,11 @@
       "Bash(CARGO_TARGET_DIR=/tmp/hyper_target2 cargo test:*)",
       "Bash(head:*)",
       "Bash(grep after GLFT depth computation:*)",
-      "Bash(grep cycle_summary:*)"
+      "Bash(grep cycle_summary:*)",
+      "Bash(which mold:*)",
+      "Bash(sudo apt-get:*)",
+      "Bash(mold:*)",
+      "Bash(cargo fmt:*)"
     ]
   }
 }

@@ -50,4 +50,4 @@ pub use prediction::{
 pub use quick_mc::{MCSimulationResult, QuickMCConfig, QuickMCSimulator};
 pub use replay::{ReplayConfig, ReplayEngine, ReplayEvent, ReplayFill, ReplayReport};
 pub use shadow_buffer::{create_shadow_buffer, ShadowBufferConsumer, ShadowBufferProducer};
-pub use shadow_tuner::{ShadowTuner, ShadowTunerCheckpoint, TunerConfig};
+pub use shadow_tuner::{ShadowTuner, ShadowTunerCheckpoint, SharedEstimators, TunerConfig};

@@ -927,6 +927,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         mut self,
         config: config::ShadowTunerConfig,
         initial_params: Option<strategy::DynamicParams>,
+        checkpoint: Option<simulation::ShadowTunerCheckpoint>,
     ) -> (Self, simulation::ShadowTuner) {
         let max_duration_ns = config.buffer_duration_min * 60 * 1_000_000_000;
         let (producer, consumer) =
@@ -954,10 +955,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             consumer,
             params_tx,
             tuner_config,
-            gate.clone(),
-            kappa.clone(),
-            sigma.clone(),
+            simulation::SharedEstimators {
+                calibration_gate_passed: gate.clone(),
+                live_kappa: kappa.clone(),
+                live_sigma: sigma.clone(),
+            },
             initial_params,
+            checkpoint,
         );
 
         self.shadow_buffer_producer = Some(producer);
