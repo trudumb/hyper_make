@@ -38,10 +38,6 @@ pub struct SpreadComposition {
     /// Included in GLFT computation already, tracked here for decomposition visibility.
     /// Units: basis points.
     pub fee_bps: f64,
-    /// Spread widening from cascade tracker on the bid side.
-    pub cascade_bid_addon_bps: f64,
-    /// Spread widening from cascade tracker on the ask side.
-    pub cascade_ask_addon_bps: f64,
 }
 
 impl Default for SpreadComposition {
@@ -52,8 +48,6 @@ impl Default for SpreadComposition {
             quota_addon_bps: 0.0,
             warmup_addon_bps: 0.0,
             fee_bps: 1.5,
-            cascade_bid_addon_bps: 0.0,
-            cascade_ask_addon_bps: 0.0,
         }
     }
 }
@@ -72,12 +66,12 @@ impl SpreadComposition {
 
     /// Total Bid half-spread in basis points including asymmetric addons.
     pub fn bid_half_spread_bps(&self) -> f64 {
-        (self.total_half_spread_bps() + self.cascade_bid_addon_bps).max(self.fee_bps)
+        self.total_half_spread_bps().max(self.fee_bps)
     }
 
     /// Total Ask half-spread in basis points including asymmetric addons.
     pub fn ask_half_spread_bps(&self) -> f64 {
-        (self.total_half_spread_bps() + self.cascade_ask_addon_bps).max(self.fee_bps)
+        self.total_half_spread_bps().max(self.fee_bps)
     }
 
     /// Diagnostic breakdown string for logging.
@@ -854,12 +848,6 @@ pub struct MarketParams {
     /// Positive = in profit, negative = underwater.
     pub unrealized_pnl_bps: f64,
 
-    // ==================== Component-Level Spread Addons (Phases 1-3) ====================
-    /// Additive spread widening (bps) from FillCascadeTracker (bid side).
-    pub cascade_bid_addon_bps: f64,
-    /// Additive spread widening (bps) from FillCascadeTracker (ask side).
-    pub cascade_ask_addon_bps: f64,
-
     // ==================== Bayesian Gamma Components (Alpha Plan) ====================
     /// Trend confidence [0, 1] from directional signals.
     /// High confidence → can quote tighter spreads (lower gamma).
@@ -932,11 +920,7 @@ pub struct MarketParams {
     /// Confidence in continuation estimate [0, 1].
     /// Based on variance reduction from uniform prior.
     /// Higher with more fill observations.
-    pub continuation_confidence: f64,
-
-    pub continuation_confidence: f64,
-
-    // ==================== Bayesian Learned Parameters (Phase 6) ====================
+    pub continuation_confidence: f64,    // ==================== Bayesian Learned Parameters (Phase 6) ====================
     /// Whether using Bayesian learned parameters instead of static config values.
     /// When true, learned_kappa, learned_alpha_touch, etc. are being used.
     pub use_learned_parameters: bool,
@@ -1332,8 +1316,6 @@ impl Default for MarketParams {
             breakeven_price: 0.0,
             unrealized_pnl_bps: 0.0,
             // Component-Level Spread Addons
-            cascade_bid_addon_bps: 0.0,
-            cascade_ask_addon_bps: 0.0,
             // Bayesian Gamma Components (Alpha Plan)
             trend_confidence: 0.5,     // 50% confidence initially (uncertain)
             bootstrap_confidence: 0.0, // Not calibrated initially
@@ -1351,10 +1333,8 @@ impl Default for MarketParams {
             position_direction_confidence: 0.5, // Neutral confidence initially
             time_since_adverse_move: 0.0,       // No history initially
             // Position Continuation Model
-            position_action: super::PositionAction::default(), // Default REDUCE
             continuation_p: 0.5,                               // Neutral prior
             continuation_confidence: 0.0,                      // No confidence until fills observed
-            effective_inventory_ratio: 0.0, // Will be computed from position_action
             // Bayesian Learned Parameters (Phase 6)
             use_learned_parameters: false,    // Off until calibrated
             learned_kappa: 2000.0,            // Prior mean

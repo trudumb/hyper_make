@@ -668,8 +668,6 @@ impl ParameterAggregator {
             unrealized_pnl_bps: 0.0,
 
             // Component-Level Spread Addons
-            cascade_bid_addon_bps: 0.0, // Wired in quote_engine.rs
-            cascade_ask_addon_bps: 0.0,
 
             // === Bayesian Gamma Components (Alpha Plan) ===
             // These are populated from QuoteGate and TheoreticalEdgeEstimator
@@ -757,7 +755,6 @@ impl ParameterAggregator {
             // Defaults populated here; actual values computed in quote_engine.rs
             // from PositionDecisionEngine.decide() based on fills and regime
             // Phase 5: Use centralized beliefs when available
-            position_action: super::super::PositionAction::default(),
             continuation_p: if let Some(beliefs) = sources.beliefs {
                 beliefs.continuation.p_fused
             } else {
@@ -768,7 +765,6 @@ impl ParameterAggregator {
             } else {
                 0.0 // Default no confidence (will be computed)
             },
-            effective_inventory_ratio: 0.0, // Default no transformation (computed from position_action)
 
             // === Bayesian Learned Parameters (Phase 6) ===
             // Use learned values when calibrated and enabled

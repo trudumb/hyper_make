@@ -88,9 +88,23 @@ pub struct PositionDecisionEngine {
     fills_since_decay: u64,
 }
 
-/// Input parameters for position decision.
-#[derive(Debug, Clone, Copy)]
 
+impl Default for PositionDecisionEngine {
+    fn default() -> Self {
+        Self::new(PositionDecisionConfig::default())
+    }
+}
+
+impl PositionDecisionEngine {
+    /// Create new PositionDecisionEngine with specific config
+    pub fn new(config: PositionDecisionConfig) -> Self {
+        Self {
+            continuation: ContinuationPosterior::new(5.0, 5.0),
+            config,
+            current_regime: String::from("normal"),
+            fills_since_decay: 0,
+        }
+    }
 
     /// Update posterior with fill observation.
     ///
@@ -185,11 +199,12 @@ pub struct PositionDecisionEngine {
 }
 
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_cascade_regime_reset() {
         let mut engine = PositionDecisionEngine::default();
 
         // Build up some state

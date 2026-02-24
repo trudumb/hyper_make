@@ -190,7 +190,6 @@ pub struct EPnLParams {
     pub circuit_breaker_active: bool,
     pub drawdown_frac: f64,
     pub self_impact_bps: f64,
-    pub cascade_addon_bps: f64,
     pub inventory_beta: f64,
 }
 
@@ -217,8 +216,7 @@ pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
     let capture = params.depth_bps
         - params.as_cost_bps
         - params.fee_bps
-        - params.carry_cost_bps
-        - params.cascade_addon_bps;
+        - params.carry_cost_bps;
 
     // Drift contribution: directional, mirrors GLFT ±μ̂×τ/2 asymmetry.
     let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
@@ -357,7 +355,6 @@ pub fn expected_pnl_bps(
         circuit_breaker_active: false,
         drawdown_frac: 0.0,
         self_impact_bps: 0.0,
-        cascade_addon_bps: 0.0,
         inventory_beta: 0.0,
     };
     expected_pnl_bps_enhanced(&params)
@@ -397,8 +394,7 @@ pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagn
     let capture = params.depth_bps
         - params.as_cost_bps
         - params.fee_bps
-        - params.carry_cost_bps
-        - params.cascade_addon_bps;
+        - params.carry_cost_bps;
 
     let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
     let drift_contribution = if params.is_bid { drift_bps } else { -drift_bps };
@@ -926,8 +922,6 @@ impl GLFTStrategy {
             quota_addon_bps,
             warmup_addon_bps,
             fee_bps,
-            cascade_bid_addon_bps: 0.0,
-            cascade_ask_addon_bps: 0.0,
         }
     }
 
@@ -2811,7 +2805,6 @@ mod tests {
             circuit_breaker_active: false,
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
-            cascade_addon_bps: 0.0,
             inventory_beta: 7.0,
         };
         let pnl_clean = expected_pnl_bps_enhanced(&params);
@@ -2841,7 +2834,6 @@ mod tests {
             circuit_breaker_active: false,
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
-            cascade_addon_bps: 0.0,
             inventory_beta: 7.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
@@ -2874,7 +2866,6 @@ mod tests {
             circuit_breaker_active: false,
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
-            cascade_addon_bps: 0.0,
             inventory_beta: 7.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
@@ -2907,7 +2898,6 @@ mod tests {
             circuit_breaker_active: false,
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
-            cascade_addon_bps: 0.0,
             inventory_beta: 7.0,
         };
         let pnl_no_impact = expected_pnl_bps_enhanced(&params);
@@ -2922,38 +2912,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_epnl_cascade_reduces_capture() {
-        let mut params = EPnLParams {
-            depth_bps: 10.0,
-            is_bid: true,
-            gamma: 0.1,
-            kappa_side: 5.0,
-            sigma: 0.001,
-            time_horizon: 10.0,
-            drift_rate: 0.0,
-            position: 0.0,
-            max_position: 100.0,
-            as_cost_bps: 2.0,
-            fee_bps: -0.5,
-            carry_cost_bps: 0.0,
-            toxicity_score: 0.0,
-            circuit_breaker_active: false,
-            drawdown_frac: 0.0,
-            self_impact_bps: 0.0,
-            cascade_addon_bps: 0.0,
-            inventory_beta: 7.0,
-        };
-        let pnl_normal = expected_pnl_bps_enhanced(&params);
 
-        params.cascade_addon_bps = 3.0;
-        let pnl_cascade = expected_pnl_bps_enhanced(&params);
-
-        assert!(
-            pnl_cascade < pnl_normal,
-            "Cascade addon should compress spread capture"
-        );
-    }
 
     #[test]
     fn test_epnl_struct_matches_legacy() {
@@ -2978,7 +2937,6 @@ mod tests {
             circuit_breaker_active: false,
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
-            cascade_addon_bps: 0.0,
             inventory_beta: 0.0,
         };
         let enhanced = expected_pnl_bps_enhanced(&params);
@@ -3009,7 +2967,6 @@ mod tests {
             circuit_breaker_active: false,
             drawdown_frac: 0.0,
             self_impact_bps: 0.1,
-            cascade_addon_bps: 0.5,
             inventory_beta: 1.0,
         };
 

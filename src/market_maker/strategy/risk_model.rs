@@ -44,6 +44,10 @@ fn default_beta_ghost() -> f64 {
     0.5 // At ghost_mult=2.0: e^(0.5×1.0) = 1.65× gamma
 }
 
+fn default_beta_continuation() -> f64 {
+    -0.5 // High continuation probability reduces gamma for more two-sided quoting
+}
+
 /// Calibration state for the risk model.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CalibrationState {
@@ -127,6 +131,12 @@ pub struct CalibratedRiskModel {
     #[serde(default = "default_beta_ghost")]
     pub beta_ghost: f64,
 
+    /// Per unit continuation_probability [0, 1].
+    /// NEGATIVE coefficient: high continuation probability → LOWER gamma → more two-sided quoting.
+    /// Replaces discrete HOLD/ADD/REDUCE states in ladder strategy.
+    #[serde(default = "default_beta_continuation")]
+    pub beta_continuation: f64,
+
     // === Bounds ===
     /// Minimum gamma (floor)
     pub gamma_min: f64,
@@ -183,10 +193,10 @@ impl Default for CalibratedRiskModel {
             // Pending data-driven calibration from gamma_calibration.jsonl regression.
             beta_tail_risk: 0.7,
 
-            // WS1: New betas absorbing multiplicative post-processes from effective_gamma()
             beta_drawdown: 1.4,
             beta_regime: 1.0,
             beta_ghost: 0.5,
+            beta_continuation: -0.5,
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -230,10 +240,10 @@ impl CalibratedRiskModel {
             beta_cascade: 1.8,
             // More conservative tail risk during warmup
             beta_tail_risk: 1.05,
-            // WS1: Conservative versions of new betas
             beta_drawdown: 2.0, // More conservative during warmup
             beta_regime: 1.5,   // More conservative during warmup
             beta_ghost: 0.75,   // More conservative during warmup
+            beta_continuation: -0.25, // Less confident in continuation during warmup
             ..Default::default()
         }
     }
@@ -273,7 +283,8 @@ impl CalibratedRiskModel {
             // WS1: New terms absorbing multiplicative post-processes from effective_gamma()
             + self.beta_drawdown * features.drawdown_fraction
             + self.beta_regime * features.regime_risk_score
-            + self.beta_ghost * features.ghost_depletion;
+            + self.beta_ghost * features.ghost_depletion
+            + self.beta_continuation * features.continuation_probability;
 
         // Sigmoid "skeptic" regularization — prevents any single noisy feature from dominating.
         // WS1: Increased from 1.5 to 2.5 to accommodate wider feature range (12 features now).
@@ -364,6 +375,7 @@ impl CalibratedRiskModel {
             beta_drawdown: self.beta_drawdown * (1.0 - alpha) + defaults.beta_drawdown * alpha,
             beta_regime: self.beta_regime * (1.0 - alpha) + defaults.beta_regime * alpha,
             beta_ghost: self.beta_ghost * (1.0 - alpha) + defaults.beta_ghost * alpha,
+            beta_continuation: self.beta_continuation * (1.0 - alpha) + defaults.beta_continuation * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -432,6 +444,10 @@ pub struct RiskFeatures {
     /// Replaces multiplicative ghost_liquidity_gamma_mult in effective_gamma().
     /// ghost_mult=2.0 → feature=1.0, beta_ghost(0.5) × 1.0 → e^0.5 = 1.65×.
     pub ghost_depletion: f64,
+
+    /// Continuation probability [0, 1].
+    /// High probability means positional direction is strongly expected to continue.
+    pub continuation_probability: f64,
 }
 
 impl RiskFeatures {
@@ -517,6 +533,9 @@ impl RiskFeatures {
         // ghost_mult=1.0 → 0 (no depletion), ghost_mult=2.0 → 1.0 (capped)
         let ghost_depletion = (params.ghost_liquidity_gamma_mult - 1.0).clamp(0.0, 1.0);
 
+        // === Continuation Probability ===
+        let continuation_probability = params.continuation_p.clamp(0.0, 1.0);
+
         Self {
             excess_volatility,
             toxicity_score,
@@ -530,6 +549,7 @@ impl RiskFeatures {
             drawdown_fraction,
             regime_risk_score,
             ghost_depletion,
+            continuation_probability,
         }
     }
 
@@ -548,6 +568,7 @@ impl RiskFeatures {
             drawdown_fraction: 0.0,
             regime_risk_score: 0.0,
             ghost_depletion: 0.0,
+            continuation_probability: 0.5, // Neutral continuation probability
         }
     }
 
@@ -566,6 +587,7 @@ impl RiskFeatures {
             drawdown_fraction: 0.5,  // 50% drawdown
             regime_risk_score: 0.59, // ln(1.8) — extreme regime
             ghost_depletion: 1.0,    // Full ghost depletion
+            continuation_probability: 0.0, // No continuation -> higher gamma
         }
     }
 
@@ -653,6 +675,7 @@ impl RiskFeatures {
             drawdown_fraction: 0.0,   // Not available from MarketState
             regime_risk_score: 0.0,   // Not available from MarketState
             ghost_depletion: 0.0,     // Not available from MarketState
+            continuation_probability: 0.5, // Not available from MarketState, use neutral
         }
     }
 }
@@ -897,11 +920,12 @@ mod tests {
         // - All risk features are 0
         // - position_direction_confidence = 0.5 (neutral)
         // - beta_confidence = -0.4
-        // raw_sum = -0.4 * 0.5 = -0.2
+        // - beta_continuation = -0.25
+        // raw_sum = (-0.4 * 0.5) + (-0.25 * 0.5) = -0.325
         // WS1: MAX_GAMMA_CONTRIBUTION=2.5, STEEPNESS=2.0
-        // After sigmoid: regulated = 2.5 * tanh(-0.2 / 5.0) ≈ -0.0999
-        // gamma = exp(log(0.15) + regulated) ≈ 0.136
-        let raw_sum = -0.4 * 0.5;
+        // After sigmoid: regulated = 2.5 * tanh(-0.325 / 5.0)
+        // gamma = exp(log(0.15) + regulated)
+        let raw_sum = (-0.4 * 0.5) + (-0.25 * 0.5);
         let regulated = 2.5 * (raw_sum / 5.0_f64).tanh();
         let expected = (0.15_f64.ln() + regulated).exp();
         assert!(
@@ -1305,6 +1329,7 @@ mod tests {
             drawdown_fraction: 0.15,
             regime_risk_score: 0.59, // ln(1.8)
             ghost_depletion: 0.5,
+            continuation_probability: 0.5,
         };
 
         let gamma = model.compute_gamma(&everything);

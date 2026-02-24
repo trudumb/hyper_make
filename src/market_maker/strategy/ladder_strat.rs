@@ -470,73 +470,6 @@ impl LadderStrategy {
         (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
     }
 
-    /// Compute Bayesian-informed gamma adjustment for spread calculation.
-    ///
-    /// Combines four components from Bayesian posteriors:
-    /// 1. **Trend confidence discount**: High confidence → tighter spreads
-    /// 2. **Bootstrap fill encouragement**: Low P(calibrated) → need fills → tighter
-    /// 3. **Adverse selection uncertainty premium**: High uncertainty → wider spreads
-    /// 4. **Regime adjustment**: Volatile regime → wider spreads
-    ///
-    /// # Arguments
-    /// * `market_params` - Contains Bayesian components (trend_confidence, bootstrap_confidence, etc.)
-    ///
-    /// # Returns
-    /// Multiplier for base gamma, typically in [0.7, 1.5]
-    pub fn compute_bayesian_gamma_adjustment(&self, market_params: &MarketParams) -> f64 {
-        let cfg = &self.risk_config;
-
-        // Component 1: Trend confidence discount
-        // High confidence in direction → can quote tighter
-        // trend_confidence ∈ [0, 1], capped at 0.6 for safety
-        let capped_confidence = market_params.trend_confidence.clamp(0.0, 0.6);
-        let trend_discount = 1.0 - capped_confidence * 0.4; // [0.76, 1.0]
-
-        // Component 2: Bootstrap fill encouragement
-        // Low calibration confidence → need fills → quote tighter
-        // bootstrap_confidence ∈ [0, 1], 0 = uncalibrated, 1 = fully calibrated
-        let bootstrap_discount = 0.8 + 0.2 * market_params.bootstrap_confidence; // [0.8, 1.0]
-
-        // Component 3: Adverse selection uncertainty premium
-        // High uncertainty in adverse posterior → quote wider for safety
-        // adverse_uncertainty is std dev of posterior, typically 0.01-0.15
-        let uncertainty_premium = 1.0 + market_params.adverse_uncertainty * 2.0; // [1.0, ~1.3]
-
-        // Component 4: Regime adjustment
-        // Volatile regime → wider spreads
-        let regime_mult = match market_params.adverse_regime {
-            0 => 0.9, // Calm: slightly tighter
-            1 => 1.0, // Normal: baseline
-            2 => 1.3, // Volatile: significantly wider
-            _ => 1.0, // Fallback
-        };
-
-        // Combine multiplicatively
-        let raw_mult = trend_discount * bootstrap_discount * uncertainty_premium * regime_mult;
-
-        // Bound to reasonable range
-        let bayesian_mult = raw_mult.clamp(
-            cfg.gamma_min / cfg.gamma_base,
-            cfg.gamma_max / cfg.gamma_base,
-        );
-
-        tracing::debug!(
-            trend_confidence = %format!("{:.3}", market_params.trend_confidence),
-            trend_discount = %format!("{:.3}", trend_discount),
-            bootstrap_confidence = %format!("{:.3}", market_params.bootstrap_confidence),
-            bootstrap_discount = %format!("{:.3}", bootstrap_discount),
-            adverse_uncertainty = %format!("{:.3}", market_params.adverse_uncertainty),
-            uncertainty_premium = %format!("{:.3}", uncertainty_premium),
-            adverse_regime = market_params.adverse_regime,
-            regime_mult = %format!("{:.2}", regime_mult),
-            raw_mult = %format!("{:.3}", raw_mult),
-            bayesian_mult = %format!("{:.3}", bayesian_mult),
-            "Bayesian gamma adjustment computed"
-        );
-
-        bayesian_mult
-    }
-
     /// Build a MarketRegime from MarketParams for entropy-based allocation.
     ///
     /// The MarketRegime provides market state signals that the entropy optimizer
@@ -723,8 +656,7 @@ impl LadderStrategy {
             quota_addon_bps,
             warmup_addon_bps,
             fee_bps,
-            cascade_bid_addon_bps: market_params.cascade_bid_addon_bps,
-            cascade_ask_addon_bps: market_params.cascade_ask_addon_bps,
+            // Removed cascade addons, relying on risk model beta_cascade
         }
     }
 
@@ -1025,8 +957,6 @@ impl LadderStrategy {
             rl_ask_skew_bps: market_params.rl_ask_skew_bps,
             rl_confidence: market_params.rl_confidence,
             // Position Continuation Model (HOLD/ADD/REDUCE)
-            position_action: market_params.position_action,
-            effective_inventory_ratio: market_params.effective_inventory_ratio,
             warmup_pct: market_params.adaptive_warmup_progress,
             // Use actual L2 book BBO when available; fall back to market_mid ± spread
             cached_best_bid: if market_params.cached_best_bid > 0.0 {
@@ -1184,10 +1114,8 @@ impl LadderStrategy {
         // === KEPT INFRASTRUCTURE ADDONS (correct AS extensions, not protection) ===
         // Governor (API rate limit) + cascade (fill cascade tracker) + self_impact + funding_carry.
         // WS4: staleness and flow_toxicity addons REMOVED — routed through estimators.
-        let kept_bid_addon_bps =
-            (market_params.governor_bid_addon_bps + market_params.cascade_bid_addon_bps).min(25.0);
-        let kept_ask_addon_bps =
-            (market_params.governor_ask_addon_bps + market_params.cascade_ask_addon_bps).min(25.0);
+        let kept_bid_addon_bps = market_params.governor_bid_addon_bps.min(25.0);
+        let kept_ask_addon_bps = market_params.governor_ask_addon_bps.min(25.0);
         if kept_bid_addon_bps > 0.01 {
             for depth in dynamic_depths.bid.iter_mut() {
                 *depth += kept_bid_addon_bps;
@@ -1202,8 +1130,6 @@ impl LadderStrategy {
             tracing::info!(
                 governor_bid = %format!("{:.1}", market_params.governor_bid_addon_bps),
                 governor_ask = %format!("{:.1}", market_params.governor_ask_addon_bps),
-                cascade_bid = %format!("{:.1}", market_params.cascade_bid_addon_bps),
-                cascade_ask = %format!("{:.1}", market_params.cascade_ask_addon_bps),
                 total_bid = %format!("{:.1}", kept_bid_addon_bps),
                 total_ask = %format!("{:.1}", kept_ask_addon_bps),
                 "Infrastructure addons applied (additive bps)"
@@ -1305,14 +1231,12 @@ impl LadderStrategy {
                 circuit_breaker_active: market_params.should_pull_quotes,
                 drawdown_frac: 0.0,   // handled by capital coordinator
                 self_impact_bps: 0.0, // self impact handled by actuary later
-                cascade_addon_bps: market_params.cascade_bid_addon_bps,
                 inventory_beta: self.risk_model.beta_inventory,
             };
 
             let mut ask_params = bid_params.clone();
             ask_params.is_bid = false;
             ask_params.kappa_side = market_params.kappa_ask;
-            ask_params.cascade_addon_bps = market_params.cascade_ask_addon_bps;
 
             // Position-convex threshold: reducing side gets negative E[PnL] carve-out
             // proportional to position urgency. Accumulating side still requires E[PnL] > 0.
@@ -1342,9 +1266,7 @@ impl LadderStrategy {
                 0.0
             };
 
-            // Save closest levels before filtering — needed for cascade exemption
-            let closest_bid_depth = dynamic_depths.bid.first().copied();
-            let closest_ask_depth = dynamic_depths.ask.first().copied();
+            // (closest levels tracking removed)
 
             dynamic_depths.bid.retain(|&depth| {
                 bid_params.depth_bps = depth;
@@ -1355,37 +1277,9 @@ impl LadderStrategy {
                 super::glft::expected_pnl_bps_enhanced(&ask_params) > ask_threshold
             });
 
-            // Cascade exemption: when cascade addons push depths so wide that ALL levels
-            // have negative E[PnL], exempt the closest level to prevent complete side
-            // starvation. Without this, a 20+ bps cascade addon kills all levels because
-            // fill probability at extreme depths ≈ 0, making E[PnL] ≈ 0 - AS < 0.
-            const CASCADE_EXEMPT_THRESHOLD_BPS: f64 = 10.0;
-            if dynamic_depths.bid.is_empty()
-                && pre_bid_count > 0
-                && market_params.cascade_bid_addon_bps > CASCADE_EXEMPT_THRESHOLD_BPS
-            {
-                if let Some(depth) = closest_bid_depth {
-                    dynamic_depths.bid.push(depth);
-                    tracing::info!(
-                        depth_bps = %format!("{:.2}", depth),
-                        cascade_addon_bps = %format!("{:.1}", market_params.cascade_bid_addon_bps),
-                        "E[PnL] cascade exemption: kept closest bid level"
-                    );
-                }
-            }
-            if dynamic_depths.ask.is_empty()
-                && pre_ask_count > 0
-                && market_params.cascade_ask_addon_bps > CASCADE_EXEMPT_THRESHOLD_BPS
-            {
-                if let Some(depth) = closest_ask_depth {
-                    dynamic_depths.ask.push(depth);
-                    tracing::info!(
-                        depth_bps = %format!("{:.2}", depth),
-                        cascade_addon_bps = %format!("{:.1}", market_params.cascade_ask_addon_bps),
-                        "E[PnL] cascade exemption: kept closest ask level"
-                    );
-                }
-            }
+            // Legacy cascade E[PnL] exemption removed: cascade risk is now handled
+            // multiplicatively via beta_cascade in the risk model, which naturally
+            // widens spreads without artificially suppressing E[PnL] below zero.
 
             let bid_dropped = pre_bid_count - dynamic_depths.bid.len();
             let ask_dropped = pre_ask_count - dynamic_depths.ask.len();

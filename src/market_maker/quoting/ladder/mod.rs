@@ -238,15 +238,6 @@ pub struct LadderParams {
     pub rl_confidence: f64,
 
     // === Position Continuation Model ===
-    /// Position action from PositionDecisionEngine (HOLD/ADD/REDUCE).
-    /// Used to transform inventory_ratio for skew calculation.
-    pub position_action: crate::market_maker::strategy::PositionAction,
-    /// Effective inventory ratio after HOLD/ADD/REDUCE transformation.
-    /// - HOLD: 0.0 (no skew, symmetric quotes)
-    /// - ADD: negative (reverse skew, tighter on position-building side)
-    /// - REDUCE: positive × urgency (normal mean-reversion)
-    pub effective_inventory_ratio: f64,
-
     /// Warmup progress [0.0, 1.0]. Used to gate RL adjustments (disabled when < 0.5).
     pub warmup_pct: f64,
 
@@ -316,8 +307,6 @@ mod tests {
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
             // Position continuation disabled for this test
-            position_action: crate::market_maker::strategy::PositionAction::default(),
-            effective_inventory_ratio: 0.0,
             warmup_pct: 1.0,
             cached_best_bid: 99.99,
             cached_best_ask: 100.01,
@@ -375,8 +364,6 @@ mod tests {
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
             // Position continuation disabled for this test
-            position_action: crate::market_maker::strategy::PositionAction::default(),
-            effective_inventory_ratio: 0.0,
             warmup_pct: 1.0,
             cached_best_bid: 999.9,
             cached_best_ask: 1000.1,
@@ -385,9 +372,6 @@ mod tests {
 
         let params_long = LadderParams {
             inventory_ratio: 0.5,
-            // IMPORTANT: Generator now uses effective_inventory_ratio for skew
-            // Set it to match inventory_ratio to test inventory skew behavior
-            effective_inventory_ratio: 0.5,
             ..params_neutral.clone()
         };
 
@@ -448,8 +432,6 @@ mod tests {
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
             // Position continuation disabled for this test
-            position_action: crate::market_maker::strategy::PositionAction::default(),
-            effective_inventory_ratio: 0.0,
             warmup_pct: 1.0,
             cached_best_bid: 99.99,
             cached_best_ask: 100.01,
@@ -511,8 +493,6 @@ mod tests {
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
             // Position continuation disabled for this test
-            position_action: crate::market_maker::strategy::PositionAction::default(),
-            effective_inventory_ratio: 0.3, // Matches inventory_ratio for REDUCE
             warmup_pct: 1.0,
             // Wide BBO so drift skew offset (15.79 bps) isn't capped by half-spread bound
             cached_best_bid: 99.80,

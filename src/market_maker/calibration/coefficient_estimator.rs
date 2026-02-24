@@ -232,6 +232,7 @@ impl CoefficientEstimator {
                 beta_drawdown: 1.4,
                 beta_regime: 1.0,
                 beta_ghost: 0.5,
+                beta_continuation: -0.5,
                 gamma_min: 0.05,
                 gamma_max: 5.0,
                 n_samples: self.samples.len(),

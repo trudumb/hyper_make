@@ -18,7 +18,7 @@ use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
-use crate::market_maker::strategy::action_to_inventory_ratio;
+
 use crate::market_maker::strategy::drift_estimator::{
     SignalObservation, BASE_FLOW_VAR, BASE_LL_VAR, BASE_MOMENTUM_VAR,
 };
@@ -1378,60 +1378,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
-            // Get belief drift and confidence for alignment check
-            let belief_drift = market_params.belief_predictive_bias;
-            let belief_confidence = market_params.belief_confidence;
-
-            // Compute expected edge from current AS model (approximate)
-            let edge_bps = market_params.current_edge_bps;
-
-            // Compute raw trend momentum from price returns (NOT from belief system)
-            // Robust to changepoint resets that zero belief_drift/confidence
-            let trend_momentum_bps = 0.5 * trend_signal.short_momentum_bps
-                + 0.3 * trend_signal.medium_momentum_bps
-                + 0.2 * trend_signal.long_momentum_bps;
-
-            // Decide position action using the engine
-            let position_action =
-                self.stochastic
-                    .position_decision
-                    .decide(&super::super::PositionDecisionInput {
-                        position,
-                        max_position,
-                        belief_drift,
-                        belief_confidence,
-                        edge_bps,
-                        trend_momentum_bps,
-                        unrealized_pnl_bps: market_params.unrealized_pnl_bps,
-                    });
-
-            // Compute raw inventory ratio
-            let raw_inventory_ratio = if max_position > 1e-9 {
-                position / max_position
-            } else {
-                0.0
-            };
-
-            // Transform inventory_ratio based on position action
-            let effective_inventory_ratio =
-                action_to_inventory_ratio(position_action, raw_inventory_ratio);
-
             // Update market_params with position continuation values
-            market_params.position_action = position_action;
             market_params.continuation_p = self.stochastic.position_decision.prob_continuation();
             market_params.continuation_confidence = self.stochastic.position_decision.confidence();
-            market_params.effective_inventory_ratio = effective_inventory_ratio;
 
             // Log position decisions when position is significant (>1% of max)
             if position.abs() > max_position * 0.01 {
                 info!(
-                    position_action = ?position_action,
                     continuation_p = %format!("{:.3}", market_params.continuation_p),
                     continuation_conf = %format!("{:.3}", market_params.continuation_confidence),
-                    raw_inv_ratio = %format!("{:.3}", raw_inventory_ratio),
-                    effective_inv_ratio = %format!("{:.3}", effective_inventory_ratio),
-                    belief_drift_bps = %format!("{:.2}", belief_drift * 10000.0),
-                    belief_conf = %format!("{:.3}", belief_confidence),
+                    belief_drift_bps = %format!("{:.2}", market_params.belief_predictive_bias * 10000.0),
+                    belief_conf = %format!("{:.3}", market_params.belief_confidence),
                     "Position continuation decision"
                 );
             }
@@ -2980,11 +2937,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         market_params.self_impact_addon_bps = self.self_impact.impact_addon_bps();
 
         // === KEPT INFRASTRUCTURE ADDONS (not protection) ===
-        // Fill cascade tracker per-side addons (still useful for echo detection).
-        market_params.cascade_bid_addon_bps = self.fill_cascade_tracker.spread_addon_bps(Side::Buy);
-        market_params.cascade_ask_addon_bps =
-            self.fill_cascade_tracker.spread_addon_bps(Side::Sell);
-
         // WS4: Staleness addon REMOVED — WS5 latency-aware mid handles price displacement.
         // WS4: Flow toxicity addon REMOVED — β_toxicity in CalibratedRiskModel routes
         //   informed flow through γ. Higher toxicity → higher γ → wider spreads automatically.
@@ -3467,7 +3419,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     circuit_breaker_active: market_params.should_pull_quotes,
                     drawdown_frac: 0.0,
                     self_impact_bps: 0.0,
-                    cascade_addon_bps: market_params.cascade_bid_addon_bps,
                     inventory_beta: 0.0,
                 };
                 if let Some(best_bid) = viable.bids.first() {
@@ -3476,7 +3427,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     bid_params.depth_bps = half_spread_bps;
                     bid_params.is_bid = true;
                     bid_params.kappa_side = market_params.kappa_bid;
-                    bid_params.cascade_addon_bps = market_params.cascade_bid_addon_bps;
                     let epnl = expected_pnl_bps_enhanced(&bid_params);
                     self.quote_outcome_tracker.register_quote(PendingQuote {
                         timestamp_ms: now_ms,
@@ -3492,7 +3442,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     ask_params.depth_bps = half_spread_bps;
                     ask_params.is_bid = false;
                     ask_params.kappa_side = market_params.kappa_ask;
-                    ask_params.cascade_addon_bps = market_params.cascade_ask_addon_bps;
                     let epnl = expected_pnl_bps_enhanced(&ask_params);
                     self.quote_outcome_tracker.register_quote(PendingQuote {
                         timestamp_ms: now_ms,
