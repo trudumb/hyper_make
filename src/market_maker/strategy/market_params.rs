@@ -122,6 +122,16 @@ pub struct MarketParams {
     /// Use for asymmetric inventory skew in falling markets
     pub sigma_leverage_adjusted: f64,
 
+    // === WS2: Dual-Timescale Inventory Control ===
+    /// EWMA of reducing-fill holding durations (seconds).
+    /// Measured quantity: how long inventory is held before a reducing fill.
+    /// Default: 60s. Updated by FillProcessor on each reducing fill.
+    pub tau_inventory_s: f64,
+
+    /// Variance of τ_inventory (seconds²).
+    /// Used by PPIP timing_uncertainty term.
+    pub tau_variance_s2: f64,
+
     // === Order Book ===
     /// Estimated order book depth decay (κ) - from weighted L2 book regression
     pub kappa: f64,
@@ -912,11 +922,7 @@ pub struct MarketParams {
     /// Updated when price moves against position direction.
     pub time_since_adverse_move: f64,
 
-    // ==================== Position Continuation Model ====================
-    /// Position action decided by PositionDecisionEngine.
-    /// HOLD/ADD/REDUCE based on Bayesian continuation probability.
-    /// Used to transform inventory_ratio for GLFT skew calculation.
-    pub position_action: super::PositionAction,
+    // Used to transform inventory_ratio for GLFT skew calculation.
 
     /// P(continuation) from Beta-Binomial posterior.
     /// Higher values indicate the position direction is likely to continue.
@@ -928,11 +934,7 @@ pub struct MarketParams {
     /// Higher with more fill observations.
     pub continuation_confidence: f64,
 
-    /// Effective inventory ratio after HOLD/ADD/REDUCE transformation.
-    /// - HOLD: 0.0 (no skew)
-    /// - ADD: negative (reverse skew to build position)
-    /// - REDUCE: positive (normal mean-reversion)
-    pub effective_inventory_ratio: f64,
+    pub continuation_confidence: f64,
 
     // ==================== Bayesian Learned Parameters (Phase 6) ====================
     /// Whether using Bayesian learned parameters instead of static config values.
@@ -1105,11 +1107,14 @@ impl Default for MarketParams {
             sigma_total: 0.0001,             // Same initially
             sigma_effective: 0.0001,         // Same initially
             sigma_leverage_adjusted: 0.0001, // Same initially (no leverage effect)
-            kappa: 100.0,                    // Moderate depth decay
-            kappa_bid: 100.0,                // Same as kappa initially
-            kappa_ask: 100.0,                // Same as kappa initially
-            is_heavy_tailed: false,          // Assume exponential tails
-            kappa_cv: 1.0,                   // CV=1 for exponential
+            // WS2: Dual-timescale inventory control
+            tau_inventory_s: 60.0,  // Default 60s holding period
+            tau_variance_s2: 900.0, // Default 30s std dev
+            kappa: 100.0,           // Moderate depth decay
+            kappa_bid: 100.0,       // Same as kappa initially
+            kappa_ask: 100.0,       // Same as kappa initially
+            is_heavy_tailed: false, // Assume exponential tails
+            kappa_cv: 1.0,          // CV=1 for exponential
             // V3: Robust Kappa Orchestrator
             kappa_robust: 2000.0, // Start at prior (will be updated from orchestrator)
             use_kappa_robust: true, // Default ON - use robust kappa for spreads

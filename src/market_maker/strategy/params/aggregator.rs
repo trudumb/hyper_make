@@ -127,6 +127,23 @@ pub struct ParameterSources<'a> {
     /// When realized vol > predicted vol, this inflates sigma (> 1.0).
     /// Default 1.0 (no correction, model-only sigma).
     pub sigma_correction_factor: f64,
+
+    // === WS4: Bayesian Hawkes Cascade Score ===
+    /// Cascade score [0, 1] from BayesianHawkes posterior predictive.
+    /// Uses cascade_score_upper() (2σ credible bound) for defense-first.
+    pub bayesian_hawkes_score: f64,
+
+    // === WS3: BMA Sigma Variance ===
+    /// BMA posterior variance of σ² (includes between-model variance).
+    /// Feeds PPIP's ambiguity aversion term (CV²(σ²) scaling).
+    /// 0.0 when BMA not yet warmed up.
+    pub sigma_sq_variance_bma: f64,
+
+    // === WS2: Measured Tau Inventory ===
+    /// EWMA of reducing-fill holding durations (seconds).
+    pub tau_inventory_s: f64,
+    /// Online variance of reducing-fill holding durations (seconds²).
+    pub tau_variance_s2: f64,
 }
 
 /// Learned parameter values for use in quoting calculations.
@@ -298,7 +315,9 @@ impl ParameterAggregator {
                 / 4.0)
                 .clamp(0.0, 1.0),
             should_pull_quotes: sources.liquidation_detector.should_pull_quotes(),
-            cascade_intensity: 1.0 - sources.liquidation_detector.size_reduction_factor(),
+            // WS4: Blend liquidation cascade with BayesianHawkes score (take max for defense-first)
+            cascade_intensity: (1.0 - sources.liquidation_detector.size_reduction_factor())
+                .max(sources.bayesian_hawkes_score),
 
             // === Tier 2: Hawkes Order Flow ===
             hawkes_buy_intensity: sources.hawkes.lambda_buy(),
@@ -820,6 +839,13 @@ impl ParameterAggregator {
             // Bayesian Fair Value Model
             fv_cascade_score: 0.0,
             fv_confidence: 0.0,
+
+            // === Dual-Timescale Inventory Control (WS2) ===
+            // τ_inventory: EWMA of reducing-fill holding durations (seconds)
+            // τ_variance: variance of τ_inventory (seconds²)
+            // Measured from actual reducing-fill holding durations (WS2 integration)
+            tau_inventory_s: sources.tau_inventory_s,
+            tau_variance_s2: sources.tau_variance_s2,
         }
     }
 }

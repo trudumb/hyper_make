@@ -76,7 +76,10 @@
       "Bash(which mold:*)",
       "Bash(sudo apt-get:*)",
       "Bash(mold:*)",
-      "Bash(cargo fmt:*)"
+      "Bash(cargo fmt:*)",
+      "Bash(grep clang:*)",
+      "Bash(git worktree remove .claude/worktrees/agent-af551995 2>&1 && git worktree remove .claude/worktrees/agent-a4f1b977 2>&1)",
+      "Bash(git worktree:*)"
     ]
   }
 }

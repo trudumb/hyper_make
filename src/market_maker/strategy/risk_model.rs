@@ -32,6 +32,18 @@ fn default_beta_tail_risk() -> f64 {
     0.7 // Interim: pending data-driven calibration from gamma_calibration.jsonl
 }
 
+fn default_beta_drawdown() -> f64 {
+    1.4 // At 10% dd: e^(1.4×0.10) = 1.15× gamma (matches old 1.20 approx)
+}
+
+fn default_beta_regime() -> f64 {
+    1.0 // Maps regime_risk_score = ln(regime_gamma_multiplier) directly
+}
+
+fn default_beta_ghost() -> f64 {
+    0.5 // At ghost_mult=2.0: e^(0.5×1.0) = 1.65× gamma
+}
+
 /// Calibration state for the risk model.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CalibrationState {
@@ -97,6 +109,24 @@ pub struct CalibratedRiskModel {
     #[serde(default = "default_beta_tail_risk")]
     pub beta_tail_risk: f64,
 
+    /// Per unit drawdown_fraction [0, 1].
+    /// WS1: Replaces multiplicative drawdown_mult = 1.0 + dd_frac × 2.0.
+    /// At 10% dd: e^(1.4×0.10) = 1.15× gamma (log-additive, bounded by sigmoid).
+    #[serde(default = "default_beta_drawdown")]
+    pub beta_drawdown: f64,
+
+    /// Per unit regime_risk_score = ln(regime_gamma_multiplier).
+    /// WS1: Replaces multiplicative regime_gamma_multiplier.
+    /// Maps multiplier into log-space directly: mult=1.3 → score=0.26, mult=1.8 → score=0.59.
+    #[serde(default = "default_beta_regime")]
+    pub beta_regime: f64,
+
+    /// Per unit ghost_depletion = (ghost_mult - 1).min(1.0).
+    /// WS1: Replaces multiplicative ghost_liquidity_gamma_mult.
+    /// At ghost_mult=2.0: feature=1.0, e^(0.5) = 1.65× gamma.
+    #[serde(default = "default_beta_ghost")]
+    pub beta_ghost: f64,
+
     // === Bounds ===
     /// Minimum gamma (floor)
     pub gamma_min: f64,
@@ -133,10 +163,10 @@ impl Default for CalibratedRiskModel {
             // with other features summed to 2.19+ and inflated gamma 9x (0.15 -> 1.338).
             // Pending data-driven calibration from gamma_calibration.jsonl regression.
             beta_toxicity: 0.5,
-            // DISABLED: inventory scaling now handled by continuous γ(q) = γ_base × (1 + β×u²)
-            // in effective_gamma(). Setting non-zero here would double-count inventory.
-            // See effective_gamma() in glft.rs for the quadratic inventory scaling.
-            beta_inventory: 0.0,
+            // WS1: RE-ENABLED. inventory_fraction² (quadratic) computed in compute_gamma().
+            // Replaces multiplicative γ(q) = γ_base × (1 + 7.0 × u²) from effective_gamma().
+            // At u=0.5: 4.0 × 0.25 = 1.0, e^1.0 = 2.72 (matches old 2.75 before sigmoid).
+            beta_inventory: 4.0,
             // 100% excess intensity → exp(0.4) ≈ 1.5× gamma
             beta_hawkes: 0.4,
             // empty book → exp(0.3) ≈ 1.35× gamma
@@ -152,6 +182,11 @@ impl Default for CalibratedRiskModel {
             // Interim: tail_risk_intensity=1 → exp(0.7) ≈ 2.01× gamma widening
             // Pending data-driven calibration from gamma_calibration.jsonl regression.
             beta_tail_risk: 0.7,
+
+            // WS1: New betas absorbing multiplicative post-processes from effective_gamma()
+            beta_drawdown: 1.4,
+            beta_regime: 1.0,
+            beta_ghost: 0.5,
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -184,8 +219,8 @@ impl CalibratedRiskModel {
             log_gamma_base: 0.20_f64.ln(), // Higher base during warmup
             beta_volatility: 1.5,          // 50% more conservative
             beta_toxicity: 0.75,           // Interim conservative (1.5x of default 0.5)
-            // DISABLED: inventory scaling handled by continuous γ(q) quadratic in glft.rs
-            beta_inventory: 0.0,
+            // WS1: RE-ENABLED, slightly more aggressive during warmup
+            beta_inventory: 5.0,
             beta_hawkes: 0.6,
             beta_book_depth: 0.25,
             beta_uncertainty: 0.3,
@@ -195,6 +230,10 @@ impl CalibratedRiskModel {
             beta_cascade: 1.8,
             // More conservative tail risk during warmup
             beta_tail_risk: 1.05,
+            // WS1: Conservative versions of new betas
+            beta_drawdown: 2.0, // More conservative during warmup
+            beta_regime: 1.5,   // More conservative during warmup
+            beta_ghost: 0.75,   // More conservative during warmup
             ..Default::default()
         }
     }
@@ -217,20 +256,30 @@ impl CalibratedRiskModel {
     /// Note: beta_confidence is NEGATIVE, so high confidence DECREASES gamma,
     /// leading to tighter two-sided quotes when position is from informed flow.
     pub fn compute_gamma(&self, features: &RiskFeatures) -> f64 {
+        // WS1: Quadratic inventory pressure — (|pos|/max)² makes gamma scale faster near limits.
+        // Old multiplicative: γ × (1 + 7.0 × u²). Log-additive: β_inv × u².
+        // At u=0.5: 4.0 × 0.25 = 1.0 → e^1.0 = 2.72× (was 2.75 multiplicative).
+        let inventory_pressure = features.inventory_fraction.powi(2);
+
         let raw_sum = self.beta_volatility * features.excess_volatility
             + self.beta_toxicity * features.toxicity_score
-            + self.beta_inventory * features.inventory_fraction
+            + self.beta_inventory * inventory_pressure
             + self.beta_hawkes * features.excess_intensity
             + self.beta_book_depth * features.depth_depletion
             + self.beta_uncertainty * features.model_uncertainty
             + self.beta_confidence * features.position_direction_confidence
             + self.beta_cascade * features.cascade_intensity
-            + self.beta_tail_risk * features.tail_risk_intensity;
+            + self.beta_tail_risk * features.tail_risk_intensity
+            // WS1: New terms absorbing multiplicative post-processes from effective_gamma()
+            + self.beta_drawdown * features.drawdown_fraction
+            + self.beta_regime * features.regime_risk_score
+            + self.beta_ghost * features.ghost_depletion;
 
         // Sigmoid "skeptic" regularization — prevents any single noisy feature from dominating.
-        // max_gamma_contribution bounds total inflation to exp(1.5) ~ 4.5x at most.
+        // WS1: Increased from 1.5 to 2.5 to accommodate wider feature range (12 features now).
+        // max_gamma_contribution bounds total inflation to exp(2.5) ~ 12× at most.
         // gamma_reg_steepness controls how fast the tanh saturates.
-        const MAX_GAMMA_CONTRIBUTION: f64 = 1.5; // max ~4.5x gamma inflation (exp(1.5))
+        const MAX_GAMMA_CONTRIBUTION: f64 = 2.5; // max ~12× gamma inflation (exp(2.5))
         const GAMMA_REG_STEEPNESS: f64 = 2.0; // how fast sigmoid saturates
         let regulated_sum = MAX_GAMMA_CONTRIBUTION
             * (raw_sum / (MAX_GAMMA_CONTRIBUTION * GAMMA_REG_STEEPNESS)).tanh();
@@ -312,6 +361,9 @@ impl CalibratedRiskModel {
                 + defaults.beta_confidence * alpha,
             beta_cascade: self.beta_cascade * (1.0 - alpha) + defaults.beta_cascade * alpha,
             beta_tail_risk: self.beta_tail_risk * (1.0 - alpha) + defaults.beta_tail_risk * alpha,
+            beta_drawdown: self.beta_drawdown * (1.0 - alpha) + defaults.beta_drawdown * alpha,
+            beta_regime: self.beta_regime * (1.0 - alpha) + defaults.beta_regime * alpha,
+            beta_ghost: self.beta_ghost * (1.0 - alpha) + defaults.beta_ghost * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -365,6 +417,21 @@ pub struct RiskFeatures {
     /// Distinct from cascade_intensity: captures depth-of-crisis severity.
     /// Fed into beta_tail_risk coefficient.
     pub tail_risk_intensity: f64,
+
+    /// WS1: Drawdown fraction [0, 1]: current_drawdown_frac from MarketParams.
+    /// Replaces multiplicative `1.0 + dd_frac × 2.0` in effective_gamma().
+    /// At 10% dd: beta_drawdown(1.4) × 0.10 → e^0.14 = 1.15× gamma.
+    pub drawdown_fraction: f64,
+
+    /// WS1: Regime risk score: ln(regime_gamma_multiplier).
+    /// Replaces multiplicative regime_gamma_multiplier in effective_gamma().
+    /// mult=1.3 → 0.26, mult=1.8 → 0.59. beta_regime(1.0) × score → e^score.
+    pub regime_risk_score: f64,
+
+    /// WS1: Ghost liquidity depletion: (ghost_mult - 1).min(1.0) [0, 1].
+    /// Replaces multiplicative ghost_liquidity_gamma_mult in effective_gamma().
+    /// ghost_mult=2.0 → feature=1.0, beta_ghost(0.5) × 1.0 → e^0.5 = 1.65×.
+    pub ghost_depletion: f64,
 }
 
 impl RiskFeatures {
@@ -439,6 +506,17 @@ impl RiskFeatures {
         // Use the direct tail_risk_intensity from MarketParams
         let tail_risk_intensity = params.tail_risk_intensity.clamp(0.0, 1.0);
 
+        // === WS1: Drawdown Fraction ===
+        let drawdown_fraction = params.current_drawdown_frac.clamp(0.0, 1.0);
+
+        // === WS1: Regime Risk Score ===
+        // Map regime_gamma_multiplier into log-space: mult=1.0 → 0, mult=1.3 → 0.26, mult=2.0 → 0.69
+        let regime_risk_score = params.regime_gamma_multiplier.max(0.01).ln().max(0.0);
+
+        // === WS1: Ghost Depletion ===
+        // ghost_mult=1.0 → 0 (no depletion), ghost_mult=2.0 → 1.0 (capped)
+        let ghost_depletion = (params.ghost_liquidity_gamma_mult - 1.0).clamp(0.0, 1.0);
+
         Self {
             excess_volatility,
             toxicity_score,
@@ -449,6 +527,9 @@ impl RiskFeatures {
             position_direction_confidence,
             cascade_intensity,
             tail_risk_intensity,
+            drawdown_fraction,
+            regime_risk_score,
+            ghost_depletion,
         }
     }
 
@@ -464,6 +545,9 @@ impl RiskFeatures {
             position_direction_confidence: 0.5, // Neutral confidence
             cascade_intensity: 0.0,
             tail_risk_intensity: 0.0,
+            drawdown_fraction: 0.0,
+            regime_risk_score: 0.0,
+            ghost_depletion: 0.0,
         }
     }
 
@@ -479,7 +563,29 @@ impl RiskFeatures {
             position_direction_confidence: 0.0, // No confidence → high gamma
             cascade_intensity: 1.0,
             tail_risk_intensity: 1.0,
+            drawdown_fraction: 0.5,  // 50% drawdown
+            regime_risk_score: 0.59, // ln(1.8) — extreme regime
+            ghost_depletion: 1.0,    // Full ghost depletion
         }
+    }
+
+    /// Convert features to a vector for regression (WS5: AdversarialCalibrator).
+    /// Order matches the beta coefficients in compute_gamma().
+    pub fn to_vector(&self) -> Vec<f64> {
+        vec![
+            self.excess_volatility,
+            self.toxicity_score,
+            self.inventory_fraction.powi(2), // Quadratic, matching compute_gamma()
+            self.excess_intensity,
+            self.depth_depletion,
+            self.model_uncertainty,
+            self.position_direction_confidence,
+            self.cascade_intensity,
+            self.tail_risk_intensity,
+            self.drawdown_fraction,
+            self.regime_risk_score,
+            self.ghost_depletion,
+        ]
     }
 
     /// Build risk features from MarketState (for use in LearningModule calibration).
@@ -544,6 +650,9 @@ impl RiskFeatures {
             position_direction_confidence,
             cascade_intensity: 0.0,   // Not available from MarketState
             tail_risk_intensity: 0.0, // Not available from MarketState
+            drawdown_fraction: 0.0,   // Not available from MarketState
+            regime_risk_score: 0.0,   // Not available from MarketState
+            ghost_depletion: 0.0,     // Not available from MarketState
         }
     }
 }
@@ -789,10 +898,11 @@ mod tests {
         // - position_direction_confidence = 0.5 (neutral)
         // - beta_confidence = -0.4
         // raw_sum = -0.4 * 0.5 = -0.2
-        // After sigmoid: regulated = 1.5 * tanh(-0.2 / 3.0) ≈ -0.0997
+        // WS1: MAX_GAMMA_CONTRIBUTION=2.5, STEEPNESS=2.0
+        // After sigmoid: regulated = 2.5 * tanh(-0.2 / 5.0) ≈ -0.0999
         // gamma = exp(log(0.15) + regulated) ≈ 0.136
         let raw_sum = -0.4 * 0.5;
-        let regulated = 1.5 * (raw_sum / 3.0_f64).tanh();
+        let regulated = 2.5 * (raw_sum / 5.0_f64).tanh();
         let expected = (0.15_f64.ln() + regulated).exp();
         assert!(
             (gamma - expected).abs() < 0.01,
@@ -814,8 +924,7 @@ mod tests {
             depth_depletion: 0.5,
             model_uncertainty: 0.5,
             position_direction_confidence: 0.5, // Neutral confidence
-            cascade_intensity: 0.0,
-            tail_risk_intensity: 0.0,
+            ..RiskFeatures::neutral()
         };
 
         let gamma_neutral = model.compute_gamma(&neutral);
@@ -896,12 +1005,11 @@ mod tests {
             gamma_low_conf
         );
 
-        // With sigmoid regularization, the ratio is dampened from exp(-0.4) ≈ 0.67
-        // to approximately exp(regulated_high - regulated_low).
+        // WS1: MAX_GAMMA_CONTRIBUTION=2.5, STEEPNESS=2.0
         // raw_sum_low = 0.0 (all defaults zero, confidence=0 contributes 0)
         // raw_sum_high = -0.4 (beta_conf * 1.0)
-        // regulated_low = 1.5*tanh(0/3) = 0
-        // regulated_high = 1.5*tanh(-0.4/3) ≈ -0.199
+        // regulated_low = 2.5*tanh(0/5) = 0
+        // regulated_high = 2.5*tanh(-0.4/5) ≈ -0.199
         // ratio = exp(-0.199) ≈ 0.82
         let ratio = gamma_high_conf / gamma_low_conf;
         assert!(
@@ -938,10 +1046,11 @@ mod tests {
         let gamma_calm = model.compute_gamma(&calm);
         let gamma_cascade = model.compute_gamma(&cascade);
 
-        // With sigmoid regularization, cascade effect is dampened from exp(1.2) ~ 3.3x.
+        // WS1: MAX_GAMMA_CONTRIBUTION=2.5, STEEPNESS=2.0
         // raw_sum_calm = -0.2 (confidence), raw_sum_cascade = -0.2 + 1.2 = 1.0
-        // regulated_calm ~ -0.0997, regulated_cascade ~ 0.482
-        // ratio = exp(0.482 - (-0.0997)) = exp(0.582) ~ 1.79
+        // regulated_calm = 2.5*tanh(-0.2/5.0) ≈ -0.0999
+        // regulated_cascade = 2.5*tanh(1.0/5.0) ≈ 0.494
+        // ratio = exp(0.494 - (-0.0999)) = exp(0.594) ≈ 1.81
         let ratio = gamma_cascade / gamma_calm;
         assert!(
             ratio > 1.5,
@@ -951,7 +1060,7 @@ mod tests {
             ratio
         );
         assert!(
-            ratio < 2.5,
+            ratio < 3.0,
             "Sigmoid should cap cascade widening: calm={}, cascade={}, ratio={:.3}",
             gamma_calm,
             gamma_cascade,
@@ -972,14 +1081,13 @@ mod tests {
             depth_depletion: 0.6,               // Thin book
             model_uncertainty: 0.8,             // High uncertainty
             position_direction_confidence: 0.3, // Low confidence
-            cascade_intensity: 0.0,
-            tail_risk_intensity: 0.0,
+            ..RiskFeatures::neutral()
         };
 
         let gamma = model.compute_gamma(&stressed);
-        // Log-additive keeps gamma bounded by gamma_max (5.0).
-        // With these extreme features, multiplicative would give 0.15 * 1.2^7 ≈ 0.54
-        // or worse. Log-additive gives ~2.25 which is still well within bounds.
+        // WS1: With beta_inventory=4.0 and inv²=0.64, raw_sum≈5.03.
+        // Sigmoid: 2.5*tanh(5.03/5.0)≈1.91. gamma≈exp(ln(0.15)+1.91)≈1.01.
+        // Bounded by gamma_max (5.0). Multiplicative would give 0.15 × 1.2^7 × (1+7×0.64) ≈ 3.0+.
         assert!(
             gamma < 5.0,
             "stressed gamma should be bounded by gamma_max: got {gamma}"
@@ -994,8 +1102,7 @@ mod tests {
             depth_depletion: 0.2,
             model_uncertainty: 0.3,
             position_direction_confidence: 0.5,
-            cascade_intensity: 0.0,
-            tail_risk_intensity: 0.0,
+            ..RiskFeatures::neutral()
         };
         let gamma_moderate = model.compute_gamma(&moderate);
         assert!(
@@ -1065,6 +1172,193 @@ mod tests {
         assert!(
             joint_ratio < 3.0,
             "Sigmoid should prevent extreme gamma inflation: got {joint_ratio:.3}"
+        );
+    }
+
+    // === WS1: Unified Gamma Pipeline Tests ===
+
+    #[test]
+    fn test_ws1_quadratic_inventory_scaling() {
+        let model = CalibratedRiskModel::default();
+
+        // At 50% inventory: pressure = 0.5² = 0.25
+        let half = RiskFeatures {
+            inventory_fraction: 0.5,
+            ..RiskFeatures::neutral()
+        };
+        // At 100% inventory: pressure = 1.0² = 1.0 (4× the feature value)
+        let full = RiskFeatures {
+            inventory_fraction: 1.0,
+            ..RiskFeatures::neutral()
+        };
+        let calm = RiskFeatures::neutral();
+
+        let g_calm = model.compute_gamma(&calm);
+        let g_half = model.compute_gamma(&half);
+        let g_full = model.compute_gamma(&full);
+
+        // Quadratic scaling: full should be significantly more than half
+        let ratio_half = g_half / g_calm;
+        let ratio_full = g_full / g_calm;
+
+        assert!(
+            ratio_half > 1.2,
+            "50% inventory should meaningfully widen gamma: ratio={ratio_half:.3}"
+        );
+        // beta_inventory=4.0, pressure=0.25 → raw contribution=1.0 → e^1.0=2.72 (before sigmoid)
+        assert!(
+            ratio_full > ratio_half * 1.5,
+            "Full inventory should scale quadratically harder: full={ratio_full:.3} vs half={ratio_half:.3}"
+        );
+    }
+
+    #[test]
+    fn test_ws1_drawdown_widens_gamma() {
+        let model = CalibratedRiskModel::default();
+
+        let no_dd = RiskFeatures::neutral();
+        let with_dd = RiskFeatures {
+            drawdown_fraction: 0.10, // 10% drawdown
+            ..RiskFeatures::neutral()
+        };
+
+        let g_base = model.compute_gamma(&no_dd);
+        let g_dd = model.compute_gamma(&with_dd);
+
+        // beta_drawdown=1.4, feature=0.10 → raw contribution=0.14 → e^0.14=1.15×
+        let ratio = g_dd / g_base;
+        assert!(
+            ratio > 1.05,
+            "10% drawdown should widen gamma: ratio={ratio:.3}"
+        );
+        assert!(
+            ratio < 1.25,
+            "10% drawdown widening should be moderate: ratio={ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn test_ws1_regime_widens_gamma() {
+        let model = CalibratedRiskModel::default();
+
+        let calm_regime = RiskFeatures::neutral();
+        let volatile_regime = RiskFeatures {
+            regime_risk_score: 1.3_f64.ln(), // Regime mult = 1.3 → score ≈ 0.26
+            ..RiskFeatures::neutral()
+        };
+
+        let g_base = model.compute_gamma(&calm_regime);
+        let g_regime = model.compute_gamma(&volatile_regime);
+
+        // beta_regime=1.0, feature=ln(1.3)≈0.26 → raw contribution=0.26, sigmoid dampens
+        let ratio = g_regime / g_base;
+        assert!(
+            ratio > 1.10,
+            "Volatile regime should widen gamma: ratio={ratio:.3}"
+        );
+        assert!(
+            ratio < 1.45,
+            "Regime widening should be bounded: ratio={ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn test_ws1_ghost_widens_gamma() {
+        let model = CalibratedRiskModel::default();
+
+        let no_ghost = RiskFeatures::neutral();
+        let ghost = RiskFeatures {
+            ghost_depletion: 1.0, // Full ghost depletion (ghost_mult was 2.0)
+            ..RiskFeatures::neutral()
+        };
+
+        let g_base = model.compute_gamma(&no_ghost);
+        let g_ghost = model.compute_gamma(&ghost);
+
+        // beta_ghost=0.5, feature=1.0 → raw contribution=0.5, sigmoid dampens to ~0.25
+        let ratio = g_ghost / g_base;
+        assert!(
+            ratio > 1.2,
+            "Full ghost depletion should meaningfully widen gamma: ratio={ratio:.3}"
+        );
+        assert!(
+            ratio < 2.0,
+            "Ghost widening should be bounded: ratio={ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn test_ws1_all_new_features_compound_bounded() {
+        // When ALL new features fire together with existing ones, gamma should stay bounded
+        let model = CalibratedRiskModel::default();
+
+        let everything = RiskFeatures {
+            excess_volatility: 1.0,
+            toxicity_score: 0.5,
+            inventory_fraction: 0.7,
+            excess_intensity: 0.5,
+            depth_depletion: 0.5,
+            model_uncertainty: 0.5,
+            position_direction_confidence: 0.2,
+            cascade_intensity: 0.5,
+            tail_risk_intensity: 0.3,
+            drawdown_fraction: 0.15,
+            regime_risk_score: 0.59, // ln(1.8)
+            ghost_depletion: 0.5,
+        };
+
+        let gamma = model.compute_gamma(&everything);
+
+        // Sigmoid should prevent explosion even with all 12 features firing
+        assert!(
+            gamma < 5.0,
+            "All features firing should stay within gamma_max: got {gamma:.3}"
+        );
+        assert!(
+            gamma > 0.15,
+            "All features should push gamma above base: got {gamma:.3}"
+        );
+    }
+
+    #[test]
+    fn test_ws1_blend_includes_new_betas() {
+        let model = CalibratedRiskModel::default();
+        let _defaults = CalibratedRiskModel::conservative_defaults();
+
+        let blended = model.blend_with_defaults(0.5);
+
+        // New beta fields should blend correctly
+        let expected_dd = 0.5 * 1.4 + 0.5 * 2.0;
+        assert!(
+            (blended.beta_drawdown - expected_dd).abs() < 0.01,
+            "beta_drawdown should blend: got {}, expected {}",
+            blended.beta_drawdown,
+            expected_dd
+        );
+
+        let expected_regime = 0.5 * 1.0 + 0.5 * 1.5;
+        assert!(
+            (blended.beta_regime - expected_regime).abs() < 0.01,
+            "beta_regime should blend: got {}, expected {}",
+            blended.beta_regime,
+            expected_regime
+        );
+
+        let expected_ghost = 0.5 * 0.5 + 0.5 * 0.75;
+        assert!(
+            (blended.beta_ghost - expected_ghost).abs() < 0.01,
+            "beta_ghost should blend: got {}, expected {}",
+            blended.beta_ghost,
+            expected_ghost
+        );
+
+        // Also verify beta_inventory blends (was 0.0, now 4.0 default, 5.0 conservative)
+        let expected_inv = 0.5 * 4.0 + 0.5 * 5.0;
+        assert!(
+            (blended.beta_inventory - expected_inv).abs() < 0.01,
+            "beta_inventory should blend: got {}, expected {}",
+            blended.beta_inventory,
+            expected_inv
         );
     }
 

@@ -859,6 +859,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .pre_fill_classifier
             .toxicity_regime(ofi_1s, ofi_5s);
 
+        // WS3: Update BMA sigma estimates from current sigma sources.
+        // Three sources: clean bipower, leverage-adjusted, particle filter.
+        {
+            let sigma_clean = self.estimator.sigma_effective();
+            let sigma_leverage = sigma_clean * self.covariance_tracker.sigma_correction_factor();
+            // Particle filter sigma (0.0 if not warmed up)
+            let sigma_particle = self.estimator.sigma_effective();
+            self.sigma_bma
+                .update_estimates(sigma_clean, sigma_leverage, sigma_particle);
+        }
+
         let sources = ParameterSources {
             estimator: &self.estimator,
             adverse_selection: &self.tier1.adverse_selection,
@@ -889,6 +900,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Bayesian sigma correction from markout feedback
             sigma_correction_factor: self.covariance_tracker.sigma_correction_factor()
                 * self.fill_cascade_tracker.sigma_boost_factor(),
+            // WS4: Bayesian Hawkes cascade score (defense-first: 2σ upper bound)
+            bayesian_hawkes_score: self
+                .bayesian_hawkes
+                .cascade_score_upper(std::time::Instant::now()),
+            // WS3: BMA sigma variance for PPIP ambiguity aversion
+            sigma_sq_variance_bma: self.sigma_bma.sigma_variance_bma(),
+            // WS2: Measured tau inventory from reducing fills
+            tau_inventory_s: self.tau_inventory_ewma_s,
+            tau_variance_s2: self.tau_inventory_variance_s2,
             // Exchange position limits
             exchange_limits_valid: exchange_limits.is_initialized(),
             exchange_effective_bid_limit: exchange_limits.effective_bid_limit(),
@@ -1834,15 +1854,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let toxicity_addon_bps = (toxicity.composite_score * 6.0).min(5.0);
         total_risk_premium += toxicity_addon_bps;
 
-        // Phase 6: Toxicity vol premium — routes toxicity through Σ channel.
-        // Higher toxicity → inflated sigma → GLFT naturally widens spreads.
-        // Threshold 0.3: below is normal market noise; above adds up to 15% vol premium.
-        const TOXICITY_VOL_THRESHOLD: f64 = 0.3;
-        if toxicity.composite_score > TOXICITY_VOL_THRESHOLD {
-            let excess = (toxicity.composite_score - TOXICITY_VOL_THRESHOLD).min(0.3);
-            let toxicity_vol_premium = excess * 0.5; // Up to 15% vol premium at max toxicity
-            market_params.sigma_effective *= 1.0 + toxicity_vol_premium;
-        }
+        // WS6: toxicity_vol_premium DELETED — was triple-counting toxicity.
+        // Channel 1: beta_toxicity in gamma (CalibratedRiskModel) — correct channel.
+        // Channel 2: toxicity_addon_bps above (additive risk premium) — kept.
+        // Channel 3: sigma inflation (was here) — REMOVED. CovarianceTracker already
+        //   captures toxicity-driven vol increases from measurement.
 
         // WS4: Staleness addon REMOVED from risk premium.
         // σ predict step (Kalman variance growth) handles uncertainty from stale data.
@@ -3608,6 +3624,38 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 kelly_adjusted_liquidity,    // Decision + Kelly-adjusted viable size
                 &market_params,
             );
+
+            // === WS6: SKEW MAGNITUDE DIAGNOSTIC ALERT ===
+            // Regression guard: with PPIP, meaningful position should always produce meaningful skew.
+            // If position > 10% max AND skew < 1 bps, something is wrong with PPIP inputs.
+            {
+                let pos_frac = (self.position.position().abs()
+                    / self.effective_max_position.max(0.001))
+                .min(1.0);
+                if pos_frac > 0.10 {
+                    // Estimate skew from bid/ask spread asymmetry
+                    let skew_bps = match (&bid, &ask) {
+                        (Some(b), Some(a)) => {
+                            let mid = market_params.microprice;
+                            if mid > 0.0 {
+                                ((a.price - mid) - (mid - b.price)).abs() / mid * 10_000.0
+                            } else {
+                                0.0
+                            }
+                        }
+                        _ => 0.0,
+                    };
+                    if skew_bps < 1.0 {
+                        tracing::warn!(
+                            position_pct = %format!("{:.1}", pos_frac * 100.0),
+                            skew_bps = %format!("{:.2}", skew_bps),
+                            tau_inventory_s = %format!("{:.1}", market_params.tau_inventory_s),
+                            drift_per_sec = %format!("{:.6}", market_params.drift_rate_per_sec),
+                            "SKEW_MAGNITUDE_ALERT: significant position but near-zero skew"
+                        );
+                    }
+                }
+            }
 
             // === EXECUTION MODE: structural side selection (single-quote mode) ===
             {

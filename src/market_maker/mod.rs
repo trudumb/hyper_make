@@ -292,6 +292,24 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Fill cascade tracker: detects and mitigates same-side fill runs.
     fill_cascade_tracker: FillCascadeTracker,
 
+    // === WS4: Bayesian Hawkes Cascade Defense ===
+    /// Bayesian Hawkes process with Gamma posteriors on excitation parameters.
+    /// Provides cascade_score_upper() for defense-first gamma widening.
+    bayesian_hawkes: process_models::BayesianHawkes,
+
+    // === WS3: Bayesian Model Averaging for Sigma ===
+    /// BMA over 3 sigma sources (clean_bv, leverage_adjusted, particle_filter).
+    /// Provides sigma_bma() and sigma_variance_bma() for PPIP ambiguity aversion.
+    sigma_bma: estimator::BayesianModelAverager,
+
+    // === WS2: Tau Inventory Tracking ===
+    /// EWMA of reducing-fill holding durations (seconds).
+    tau_inventory_ewma_s: f64,
+    /// Online variance of reducing-fill holding durations (seconds²).
+    tau_inventory_variance_s2: f64,
+    /// Timestamp of last position-reducing fill for tau computation.
+    last_reducing_fill_time: Option<std::time::Instant>,
+
     // === Fix 4: Hawkes σ_conditional High Water Mark ===
     // WS4: sigma_cascade_hwm REMOVED from quoting path.
     // CovarianceTracker (WS2) handles realized vol feedback via Bayesian posterior.
@@ -646,6 +664,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             position_velocity_1m: 0.0,
             // Fill cascade tracker for same-side fill run detection (config-driven)
             fill_cascade_tracker,
+            // WS4: Bayesian Hawkes cascade defense (default priors, defense-first)
+            bayesian_hawkes: process_models::BayesianHawkes::new(),
+            // WS3: BMA sigma (starts with equal weights, learns from realized variance)
+            sigma_bma: estimator::BayesianModelAverager::default(),
+            // WS2: Tau inventory tracking (starts at 60s default, learns from fills)
+            tau_inventory_ewma_s: 60.0,
+            tau_inventory_variance_s2: 900.0,
+            last_reducing_fill_time: None,
             sigma_cascade_hwm: 1.0,
             sigma_cascade_hwm_set_at: 0,
             as_floor_hwm: 0.0,

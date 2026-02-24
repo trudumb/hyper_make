@@ -65,6 +65,9 @@ pub mod trade_flow_tracker;
 mod trend_persistence;
 mod volatility;
 pub mod volatility_filter;
+
+// WS3: BMA sigma re-export for MarketMaker integration
+pub(crate) use volatility::bma::BayesianModelAverager;
 mod volume;
 pub mod vpin;
 

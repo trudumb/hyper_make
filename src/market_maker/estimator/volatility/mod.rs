@@ -16,6 +16,7 @@
 //! - O(1) incremental calibration instead of O(n²) batch computation
 
 mod bipower;
+pub(crate) mod bma;
 mod incremental;
 mod multi_scale;
 mod regime;
@@ -35,3 +36,6 @@ pub use regime::{
     BlendedParameters, RegimeBeliefState, RegimeParameterBlender, RegimeParameterConfig,
 };
 pub use stochastic::StochasticVolParams;
+
+// WS3: Bayesian Model Averaging for sigma — used in integration wiring (WS7)
+// Re-exported when BMA is wired into ParameterAggregator

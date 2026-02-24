@@ -228,6 +228,10 @@ impl CoefficientEstimator {
                 beta_cascade: 1.2,
                 // Tail risk not learned from AS data - use interim default
                 beta_tail_risk: 0.7,
+                // WS1: New betas not learned from AS data - use defaults
+                beta_drawdown: 1.4,
+                beta_regime: 1.0,
+                beta_ghost: 0.5,
                 gamma_min: 0.05,
                 gamma_max: 5.0,
                 n_samples: self.samples.len(),

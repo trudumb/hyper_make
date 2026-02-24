@@ -1399,6 +1399,336 @@ impl Default for HawkesExcitationPredictor {
 }
 
 // ============================================================================
+// Bayesian Hawkes Cascade Defense (WS4)
+// ============================================================================
+
+/// Bayesian Hawkes cascade detector with Gamma posteriors on excitation parameters.
+///
+/// Uses conjugate Gamma priors on the excitation strength (alpha) and decay rate (beta)
+/// to provide posterior predictive intensity estimates with proper uncertainty quantification.
+///
+/// # Key Property: Heavier-Tailed Decay
+///
+/// The posterior predictive uses `(b/(b + dt))^a` decay instead of `exp(-beta_hat * dt)`.
+/// This is a Lomax (Pareto Type II) tail — HEAVIER than exponential. When few cascades
+/// have been observed, the system stays cautious LONGER because:
+/// - Exponential: `exp(-0.01 * 120) = 0.30` (optimistic after 2 min)
+/// - Posterior predictive: `(200/(200 + 120))^2 = 0.39` (still cautious)
+///
+/// As more data arrives and the posterior tightens, the two converge.
+///
+/// # Theory
+///
+/// For excitation alpha ~ Gamma(a_alpha, b_alpha):
+/// - Prior: a=2.0, b=4.0 -> E[alpha] = 0.5 (moderate excitation expected)
+/// - Each cascade event updates: a += 1, b += sum of decayed kernel
+///
+/// For decay rate beta ~ Gamma(a_beta, b_beta):
+/// - Prior: a=2.0, b=200.0 -> E[beta] = 0.01 (slow decay expected, defense-first)
+/// - Each inter-event interval updates: a += 1, b += interval duration
+///
+/// # Usage
+///
+/// ```text
+/// bayesian_hawkes.observe_cascade(magnitude, now);  // on each cascade event
+/// let score = bayesian_hawkes.cascade_score(now);    // [0, 1] for risk model
+/// let upper = bayesian_hawkes.cascade_score_upper(now);  // 2-sigma for defense
+/// ```
+#[derive(Debug, Clone)]
+pub struct BayesianHawkes {
+    /// Recent cascade events: (timestamp, magnitude)
+    events: VecDeque<(Instant, f64)>,
+
+    // --- Posterior on alpha (excitation strength): Gamma(a_alpha, b_alpha) ---
+    /// Shape parameter of Gamma posterior on alpha
+    alpha_shape: f64,
+    /// Rate parameter of Gamma posterior on alpha
+    alpha_rate: f64,
+
+    // --- Posterior on beta (decay rate): Gamma(a_beta, b_beta) ---
+    /// Shape parameter of Gamma posterior on beta
+    beta_shape: f64,
+    /// Rate parameter of Gamma posterior on beta
+    beta_rate: f64,
+
+    // --- Point estimates (cached after each update) ---
+    /// Posterior mean of alpha: alpha_shape / alpha_rate
+    alpha_mean: f64,
+    /// Posterior mean of beta: beta_shape / beta_rate
+    beta_mean: f64,
+
+    /// Baseline intensity (fills per second) derived from kappa estimate.
+    /// Used as denominator for cascade_score normalization.
+    lambda_0: f64,
+
+    /// Maximum events to retain (bounds memory).
+    max_events: usize,
+}
+
+/// Default prior constants for BayesianHawkes.
+///
+/// Defense-first philosophy: priors assume moderate excitation with slow decay,
+/// so the system starts cautious and learns to relax from data.
+const BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR: f64 = 2.0;
+const BAYESIAN_HAWKES_ALPHA_RATE_PRIOR: f64 = 4.0;
+const BAYESIAN_HAWKES_BETA_SHAPE_PRIOR: f64 = 2.0;
+const BAYESIAN_HAWKES_BETA_RATE_PRIOR: f64 = 200.0;
+const BAYESIAN_HAWKES_LAMBDA_0_DEFAULT: f64 = 100.0;
+const BAYESIAN_HAWKES_MAX_EVENTS: usize = 500;
+
+/// Sigmoid normalization threshold: intensity ratio at which cascade_score = 0.5.
+/// With k=3.0 steepness, score reaches 0.73 at 2x baseline, 0.95 at 4x baseline.
+const BAYESIAN_HAWKES_SIGMOID_MIDPOINT: f64 = 2.0;
+const BAYESIAN_HAWKES_SIGMOID_STEEPNESS: f64 = 3.0;
+
+/// EWMA smoothing factor for the alpha excitation estimate.
+/// 0.2 gives ~5-event half-life: responsive but not noisy.
+const BAYESIAN_HAWKES_ALPHA_EWMA: f64 = 0.2;
+
+impl BayesianHawkes {
+    /// Create a new BayesianHawkes with default priors.
+    ///
+    /// Priors are defense-first:
+    /// - alpha ~ Gamma(2.0, 4.0): E[alpha] = 0.5 (moderate excitation)
+    /// - beta ~ Gamma(2.0, 200.0): E[beta] = 0.01 (slow decay -> stays cautious)
+    pub fn new() -> Self {
+        Self {
+            events: VecDeque::with_capacity(BAYESIAN_HAWKES_MAX_EVENTS),
+            alpha_shape: BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR,
+            alpha_rate: BAYESIAN_HAWKES_ALPHA_RATE_PRIOR,
+            beta_shape: BAYESIAN_HAWKES_BETA_SHAPE_PRIOR,
+            beta_rate: BAYESIAN_HAWKES_BETA_RATE_PRIOR,
+            alpha_mean: BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR / BAYESIAN_HAWKES_ALPHA_RATE_PRIOR,
+            beta_mean: BAYESIAN_HAWKES_BETA_SHAPE_PRIOR / BAYESIAN_HAWKES_BETA_RATE_PRIOR,
+            lambda_0: BAYESIAN_HAWKES_LAMBDA_0_DEFAULT,
+            max_events: BAYESIAN_HAWKES_MAX_EVENTS,
+        }
+    }
+
+    /// Create with custom baseline intensity.
+    ///
+    /// # Arguments
+    /// - `lambda_0`: Baseline fill rate (fills per second). Must be > 0.
+    pub fn with_lambda_0(mut self, lambda_0: f64) -> Self {
+        self.lambda_0 = lambda_0.max(1e-6);
+        self
+    }
+
+    /// Record a cascade event and update posteriors.
+    ///
+    /// # Arguments
+    /// - `magnitude`: Severity of the cascade event (e.g., fill size in lots,
+    ///   or normalized intensity burst). Must be >= 0.
+    /// - `now`: Current timestamp.
+    ///
+    /// # Posterior Updates
+    ///
+    /// For beta (decay rate): conjugate Gamma update from inter-event times.
+    /// - `a_beta += 1` (one more observation)
+    /// - `b_beta += dt` (inter-event time contributes to rate)
+    ///
+    /// For alpha (excitation strength): EWMA of observed excitation ratios.
+    /// - Compares current kernel_sum to lambda_0 to estimate excitation level
+    /// - EWMA smoothing with prior regression prevents collapse or runaway
+    pub fn observe_cascade(&mut self, magnitude: f64, now: Instant) {
+        let magnitude = magnitude.max(0.0);
+
+        // Update beta posterior from inter-event time (conjugate Gamma update)
+        if let Some(&(last_time, _)) = self.events.back() {
+            let dt_s = now.duration_since(last_time).as_secs_f64().max(1e-9);
+            self.beta_shape += 1.0;
+            self.beta_rate += dt_s;
+        }
+
+        // Store the event FIRST so it contributes to kernel sum
+        self.events.push_back((now, magnitude));
+
+        // Evict oldest if over capacity
+        while self.events.len() > self.max_events {
+            self.events.pop_front();
+        }
+
+        // Update alpha via EWMA of observed excitation contribution.
+        // The observed alpha is inferred from: what alpha would explain the
+        // current kernel_sum producing the observed excitation level?
+        // alpha_obs = kernel_sum / (n_events * mean_magnitude)
+        // We EWMA this toward prior to prevent collapse on sparse data.
+        let kernel_sum_raw = self.compute_kernel_sum_raw(now);
+        if kernel_sum_raw > 1e-9 {
+            // Observed alpha: how much excitation per unit kernel
+            // Higher kernel_sum_raw with events present -> higher alpha estimate
+            let n_events = self.events.len() as f64;
+            let alpha_obs = (kernel_sum_raw / n_events).clamp(0.01, 10.0);
+            self.alpha_mean = BAYESIAN_HAWKES_ALPHA_EWMA * alpha_obs
+                + (1.0 - BAYESIAN_HAWKES_ALPHA_EWMA) * self.alpha_mean;
+        }
+
+        // Track shape for uncertainty (grows with observations)
+        self.alpha_shape += 1.0;
+        // Rate tracks to keep alpha_mean = alpha_shape / alpha_rate consistent
+        self.alpha_rate = self.alpha_shape / self.alpha_mean.max(1e-9);
+
+        // Update beta point estimate
+        self.beta_mean = self.beta_shape / self.beta_rate;
+    }
+
+    /// Compute raw kernel sum: sum of magnitude_i * posterior_kernel(dt_i).
+    ///
+    /// Uses the posterior predictive kernel `(b_beta / (b_beta + dt))^a_beta` which is
+    /// heavier-tailed than `exp(-beta_mean * dt)`.
+    fn compute_kernel_sum_raw(&self, now: Instant) -> f64 {
+        let mut sum = 0.0;
+        for &(event_time, mag) in &self.events {
+            let dt_s = now.duration_since(event_time).as_secs_f64().max(0.0);
+            let kernel = self.posterior_kernel(dt_s);
+            sum += mag * kernel;
+        }
+        sum
+    }
+
+    /// Posterior predictive kernel: `(b / (b + dt))^a`.
+    ///
+    /// This is the expected value of `exp(-beta * dt)` when `beta ~ Gamma(a, b)`.
+    /// It equals the moment generating function of the Gamma evaluated at -dt,
+    /// which gives the Lomax (Pareto Type II) survival function.
+    ///
+    /// # Key Property
+    /// At large dt, this decays as `(b/dt)^a` (power law), which is HEAVIER
+    /// than `exp(-beta_hat * dt)`. The system stays cautious longer when
+    /// uncertainty about the decay rate is high (small a).
+    fn posterior_kernel(&self, dt_s: f64) -> f64 {
+        if dt_s <= 0.0 {
+            return 1.0;
+        }
+        // (b / (b + dt))^a
+        (self.beta_rate / (self.beta_rate + dt_s)).powf(self.beta_shape)
+    }
+
+    /// Posterior predictive intensity at time `now`.
+    ///
+    /// ```text
+    /// lambda(t) = lambda_0 + alpha_mean * sum_i magnitude_i * (b/(b + dt_i))^a
+    /// ```
+    ///
+    /// Returns the expected intensity under the posterior, incorporating
+    /// heavy-tailed uncertainty about the decay rate.
+    pub fn posterior_intensity(&self, now: Instant) -> f64 {
+        let excitation = self.alpha_mean * self.compute_kernel_sum_raw(now);
+        self.lambda_0 + excitation
+    }
+
+    /// Cascade score normalized to [0, 1] for the risk model.
+    ///
+    /// Uses a sigmoid mapping of the intensity ratio above baseline:
+    /// ```text
+    /// score = 1 / (1 + exp(-k * (ratio - midpoint)))
+    /// ```
+    ///
+    /// where ratio = posterior_intensity / lambda_0.
+    ///
+    /// - ratio = 1.0 (at baseline) -> score approx 0.05
+    /// - ratio = 2.0 (2x baseline) -> score = 0.5
+    /// - ratio = 4.0 (4x baseline) -> score approx 0.95
+    pub fn cascade_score(&self, now: Instant) -> f64 {
+        let intensity = self.posterior_intensity(now);
+        let ratio = intensity / self.lambda_0.max(1e-9);
+        sigmoid_score(ratio)
+    }
+
+    /// Cascade score upper credible bound (2-sigma) for defense-first quoting.
+    ///
+    /// Uses the Gamma posterior variance on alpha to compute an upper bound
+    /// on excitation, then maps through the same sigmoid normalization.
+    ///
+    /// The variance of `Gamma(a, b)` is `a / b^2`, so:
+    /// ```text
+    /// alpha_upper = alpha_mean + 2 * sqrt(alpha_shape / alpha_rate^2)
+    /// ```
+    ///
+    /// This makes the system MORE cautious when:
+    /// - Few events observed (small alpha_shape -> high variance)
+    /// - High baseline uncertainty
+    pub fn cascade_score_upper(&self, now: Instant) -> f64 {
+        // Gamma(a, b) has variance = a / b^2
+        let alpha_variance = self.alpha_shape / (self.alpha_rate * self.alpha_rate);
+        let alpha_std = alpha_variance.sqrt();
+        let alpha_upper = self.alpha_mean + 2.0 * alpha_std;
+
+        let kernel_sum = self.compute_kernel_sum_raw(now);
+        let excitation_upper = alpha_upper * kernel_sum;
+        let intensity_upper = self.lambda_0 + excitation_upper;
+        let ratio = intensity_upper / self.lambda_0.max(1e-9);
+        sigmoid_score(ratio)
+    }
+
+    /// Get the posterior mean of alpha (excitation strength).
+    pub fn alpha_mean(&self) -> f64 {
+        self.alpha_mean
+    }
+
+    /// Get the posterior mean of beta (decay rate per second).
+    pub fn beta_mean(&self) -> f64 {
+        self.beta_mean
+    }
+
+    /// Get the posterior shape parameter for alpha.
+    pub fn alpha_shape(&self) -> f64 {
+        self.alpha_shape
+    }
+
+    /// Get the number of stored events.
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Check if warmed up (at least 5 cascade events observed).
+    pub fn is_warmed_up(&self) -> bool {
+        self.events.len() >= 5
+    }
+
+    /// Reset to prior state.
+    pub fn reset(&mut self) {
+        self.events.clear();
+        self.alpha_shape = BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR;
+        self.alpha_rate = BAYESIAN_HAWKES_ALPHA_RATE_PRIOR;
+        self.beta_shape = BAYESIAN_HAWKES_BETA_SHAPE_PRIOR;
+        self.beta_rate = BAYESIAN_HAWKES_BETA_RATE_PRIOR;
+        self.alpha_mean = BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR / BAYESIAN_HAWKES_ALPHA_RATE_PRIOR;
+        self.beta_mean = BAYESIAN_HAWKES_BETA_SHAPE_PRIOR / BAYESIAN_HAWKES_BETA_RATE_PRIOR;
+    }
+
+    /// Diagnostic summary for logging.
+    pub fn diagnostic_summary(&self, now: Instant) -> String {
+        format!(
+            "BayesianHawkes: events={} alpha={:.4} beta={:.6} score={:.3} upper={:.3} intensity={:.1}",
+            self.events.len(),
+            self.alpha_mean,
+            self.beta_mean,
+            self.cascade_score(now),
+            self.cascade_score_upper(now),
+            self.posterior_intensity(now),
+        )
+    }
+}
+
+impl Default for BayesianHawkes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sigmoid score mapping for cascade intensity ratio.
+///
+/// Maps an intensity ratio to [0, 1]:
+/// - ratio = 1.0 (baseline) -> approx 0.047
+/// - ratio = midpoint (2.0) -> 0.5
+/// - ratio = 4.0 -> approx 0.998
+fn sigmoid_score(ratio: f64) -> f64 {
+    let z = BAYESIAN_HAWKES_SIGMOID_STEEPNESS * (ratio - BAYESIAN_HAWKES_SIGMOID_MIDPOINT);
+    1.0 / (1.0 + (-z).exp())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2259,6 +2589,400 @@ mod tests {
             "Variance alpha ({}) should be slower than mean alpha ({})",
             calibrator.ewma_alpha_var,
             calibrator.ewma_alpha
+        );
+    }
+
+    // ============================================================================
+    // WS4: Bayesian Hawkes Cascade Defense Tests
+    // ============================================================================
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_calm_market() {
+        // No cascade events observed → cascade_score should be near 0.
+        // The sigmoid maps ratio=1.0 (baseline only) to approximately 0.047.
+        let hawkes = BayesianHawkes::new();
+        let now = Instant::now();
+
+        let score = hawkes.cascade_score(now);
+        assert!(
+            score < 0.1,
+            "Calm market cascade_score should be near 0, got {}",
+            score
+        );
+
+        let upper = hawkes.cascade_score_upper(now);
+        assert!(
+            upper < 0.15,
+            "Calm market upper bound should be near 0, got {}",
+            upper
+        );
+
+        // Posterior intensity should be at baseline
+        let intensity = hawkes.posterior_intensity(now);
+        assert!(
+            (intensity - BAYESIAN_HAWKES_LAMBDA_0_DEFAULT).abs() < 1.0,
+            "Intensity should be near lambda_0={}, got {}",
+            BAYESIAN_HAWKES_LAMBDA_0_DEFAULT,
+            intensity
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_burst() {
+        // 7 cascade events in rapid succession → cascade_score should exceed 0.3.
+        // Use realistic cascade magnitudes: each event represents a burst of fills
+        // with significant volume (e.g., 50 lots per cascade event vs lambda_0=100 baseline).
+        let mut hawkes = BayesianHawkes::new();
+        let start = Instant::now();
+
+        // Simulate 7 events within ~1 second, each with large magnitude
+        // (represents significant fill volume bursts relative to lambda_0=100 baseline)
+        for i in 0..7 {
+            // Space events ~140ms apart (7 events in ~1s)
+            let offset = Duration::from_millis(i * 140);
+            let event_time = start + offset;
+            hawkes.observe_cascade(50.0, event_time);
+        }
+
+        // Check score shortly after the burst
+        let check_time = start + Duration::from_secs(1);
+        let score = hawkes.cascade_score(check_time);
+        assert!(
+            score > 0.3,
+            "Burst of 7 large cascade events should produce cascade_score > 0.3, got {}",
+            score
+        );
+
+        // Upper bound should be even higher
+        let upper = hawkes.cascade_score_upper(check_time);
+        assert!(
+            upper >= score,
+            "Upper bound {} should be >= score {}",
+            upper,
+            score
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_decay() {
+        // After a burst, the score should decay over 2 minutes.
+        // Uses large magnitudes to produce meaningful initial score.
+        let mut hawkes = BayesianHawkes::new();
+        let start = Instant::now();
+
+        // Create a burst of 7 events in ~1 second with large magnitude
+        for i in 0..7 {
+            let offset = Duration::from_millis(i * 140);
+            hawkes.observe_cascade(50.0, start + offset);
+        }
+
+        // Score right after burst
+        let score_0s = hawkes.cascade_score(start + Duration::from_secs(1));
+
+        // Score after 30 seconds
+        let score_30s = hawkes.cascade_score(start + Duration::from_secs(31));
+
+        // Score after 60 seconds
+        let score_60s = hawkes.cascade_score(start + Duration::from_secs(61));
+
+        // Score after 120 seconds
+        let score_120s = hawkes.cascade_score(start + Duration::from_secs(121));
+
+        // Scores should monotonically decrease
+        assert!(
+            score_0s > score_30s,
+            "Score should decay: 0s={} > 30s={}",
+            score_0s,
+            score_30s
+        );
+        assert!(
+            score_30s > score_60s,
+            "Score should decay: 30s={} > 60s={}",
+            score_30s,
+            score_60s
+        );
+        assert!(
+            score_60s > score_120s,
+            "Score should decay: 60s={} > 120s={}",
+            score_60s,
+            score_120s
+        );
+
+        // After 2 minutes, score should have decayed significantly but not instantly
+        // (heavier tail means it stays elevated longer than exponential)
+        assert!(
+            score_120s < score_0s * 0.8,
+            "Score after 120s ({}) should be meaningfully less than at 0s ({})",
+            score_120s,
+            score_0s
+        );
+    }
+
+    #[test]
+    fn test_ws4_posterior_predictive_heavier_tail() {
+        // Verify that (b/(b+dt))^a > exp(-beta_hat*dt) at large dt.
+        // This is the critical property: posterior predictive stays cautious longer.
+        let hawkes = BayesianHawkes::new();
+
+        // Test at several large time horizons
+        for &dt_s in &[60.0, 120.0, 300.0, 600.0] {
+            let posterior_kernel = hawkes.posterior_kernel(dt_s);
+            let exponential_kernel = (-hawkes.beta_mean * dt_s).exp();
+
+            assert!(
+                posterior_kernel > exponential_kernel,
+                "At dt={}s: posterior_kernel ({:.6}) should be > exp_kernel ({:.6}). \
+                 Posterior is heavier-tailed.",
+                dt_s,
+                posterior_kernel,
+                exponential_kernel
+            );
+        }
+
+        // At very small dt, they should be approximately equal
+        let dt_small = 0.001;
+        let posterior_small = hawkes.posterior_kernel(dt_small);
+        let exp_small = (-hawkes.beta_mean * dt_small).exp();
+        assert!(
+            (posterior_small - exp_small).abs() < 0.01,
+            "At small dt, kernels should be similar: posterior={:.6}, exp={:.6}",
+            posterior_small,
+            exp_small
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_learns_from_data() {
+        // After 20 cascade observations, alpha_mean should change from its prior.
+        let mut hawkes = BayesianHawkes::new();
+        let prior_alpha_mean = hawkes.alpha_mean();
+
+        let start = Instant::now();
+
+        // Simulate 20 cascade events with varying inter-arrival times
+        for i in 0..20 {
+            // Events every ~2 seconds with magnitude proportional to index
+            let offset = Duration::from_millis(i * 2000);
+            let magnitude = 0.5 + (i as f64) * 0.1; // 0.5, 0.6, ..., 2.4
+            hawkes.observe_cascade(magnitude, start + offset);
+        }
+
+        let learned_alpha_mean = hawkes.alpha_mean();
+
+        // Alpha should have moved from prior
+        assert!(
+            (learned_alpha_mean - prior_alpha_mean).abs() > 0.01,
+            "After 20 cascades, alpha_mean should change from prior. \
+             Prior={:.4}, Learned={:.4}",
+            prior_alpha_mean,
+            learned_alpha_mean
+        );
+
+        // Beta should also have learned from inter-event times
+        let prior_beta_mean = BAYESIAN_HAWKES_BETA_SHAPE_PRIOR / BAYESIAN_HAWKES_BETA_RATE_PRIOR;
+        let learned_beta_mean = hawkes.beta_mean();
+        assert!(
+            (learned_beta_mean - prior_beta_mean).abs() > 0.001,
+            "After 20 cascades, beta_mean should change from prior. \
+             Prior={:.6}, Learned={:.6}",
+            prior_beta_mean,
+            learned_beta_mean
+        );
+
+        // Shape parameters should have grown (more data → tighter posterior)
+        assert!(
+            hawkes.alpha_shape() > BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR,
+            "alpha_shape should have grown: {} > {}",
+            hawkes.alpha_shape(),
+            BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_default_impl() {
+        // Verify Default trait implementation
+        let hawkes = BayesianHawkes::default();
+        assert_eq!(hawkes.event_count(), 0);
+        assert!(!hawkes.is_warmed_up());
+        assert!(
+            (hawkes.alpha_mean() - 0.5).abs() < 1e-9,
+            "Default alpha_mean should be 0.5"
+        );
+        assert!(
+            (hawkes.beta_mean() - 0.01).abs() < 1e-9,
+            "Default beta_mean should be 0.01"
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_reset() {
+        let mut hawkes = BayesianHawkes::new();
+        let start = Instant::now();
+
+        // Add some events
+        for i in 0..10 {
+            hawkes.observe_cascade(1.0, start + Duration::from_millis(i * 100));
+        }
+        assert_eq!(hawkes.event_count(), 10);
+        assert!(hawkes.is_warmed_up());
+
+        // Reset and verify return to prior
+        hawkes.reset();
+        assert_eq!(hawkes.event_count(), 0);
+        assert!(!hawkes.is_warmed_up());
+        assert!(
+            (hawkes.alpha_mean() - 0.5).abs() < 1e-9,
+            "After reset, alpha_mean should return to prior"
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_max_events_bounded() {
+        // Verify that events are evicted when max_events is exceeded
+        let mut hawkes = BayesianHawkes::new();
+        let start = Instant::now();
+
+        // Add more than max_events
+        for i in 0..(BAYESIAN_HAWKES_MAX_EVENTS + 100) {
+            let offset = Duration::from_millis(i as u64 * 10);
+            hawkes.observe_cascade(1.0, start + offset);
+        }
+
+        assert!(
+            hawkes.event_count() <= BAYESIAN_HAWKES_MAX_EVENTS,
+            "Events should be bounded at {}, got {}",
+            BAYESIAN_HAWKES_MAX_EVENTS,
+            hawkes.event_count()
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_cascade_score_bounded() {
+        // Score must always be in [0, 1] regardless of input
+        let mut hawkes = BayesianHawkes::new();
+        let start = Instant::now();
+
+        // Extreme burst: 50 events with large magnitude in 100ms
+        for i in 0..50 {
+            let offset = Duration::from_millis(i * 2);
+            hawkes.observe_cascade(10.0, start + offset);
+        }
+
+        let now = start + Duration::from_millis(100);
+        let score = hawkes.cascade_score(now);
+        let upper = hawkes.cascade_score_upper(now);
+
+        assert!(
+            score >= 0.0 && score <= 1.0,
+            "cascade_score must be in [0,1], got {}",
+            score
+        );
+        assert!(
+            upper >= 0.0 && upper <= 1.0,
+            "cascade_score_upper must be in [0,1], got {}",
+            upper
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_upper_geq_point() {
+        // The upper credible bound should always be >= the point estimate
+        let mut hawkes = BayesianHawkes::new();
+        let start = Instant::now();
+
+        // Add some events
+        for i in 0..5 {
+            hawkes.observe_cascade(1.5, start + Duration::from_millis(i * 500));
+        }
+
+        let now = start + Duration::from_secs(3);
+        let score = hawkes.cascade_score(now);
+        let upper = hawkes.cascade_score_upper(now);
+
+        assert!(
+            upper >= score,
+            "Upper bound ({}) must be >= point estimate ({})",
+            upper,
+            score
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_with_lambda_0() {
+        // Custom lambda_0 should change normalization
+        let hawkes_default = BayesianHawkes::new();
+        let hawkes_custom = BayesianHawkes::new().with_lambda_0(50.0);
+
+        let now = Instant::now();
+        // With lower lambda_0, the baseline is lower, so the same excitation
+        // produces a higher ratio → higher score. But with no events, both should be low.
+        let score_default = hawkes_default.cascade_score(now);
+        let score_custom = hawkes_custom.cascade_score(now);
+
+        // Both should be near zero with no events (intensity near baseline in both cases)
+        assert!(
+            score_default < 0.1,
+            "Default lambda_0 calm score: {}",
+            score_default
+        );
+        assert!(
+            score_custom < 0.1,
+            "Custom lambda_0 calm score: {}",
+            score_custom
+        );
+    }
+
+    #[test]
+    fn test_ws4_bayesian_hawkes_diagnostic_summary() {
+        let hawkes = BayesianHawkes::new();
+        let now = Instant::now();
+        let summary = hawkes.diagnostic_summary(now);
+
+        assert!(summary.contains("BayesianHawkes:"));
+        assert!(summary.contains("events="));
+        assert!(summary.contains("alpha="));
+        assert!(summary.contains("beta="));
+        assert!(summary.contains("score="));
+        assert!(summary.contains("upper="));
+    }
+
+    #[test]
+    fn test_ws4_sigmoid_score_function() {
+        // Verify sigmoid_score mapping at key points
+        // ratio=1.0 (baseline) → small score
+        let score_baseline = sigmoid_score(1.0);
+        assert!(
+            score_baseline < 0.1,
+            "At baseline ratio=1.0, score={} should be < 0.1",
+            score_baseline
+        );
+
+        // ratio=midpoint (2.0) → 0.5
+        let score_mid = sigmoid_score(BAYESIAN_HAWKES_SIGMOID_MIDPOINT);
+        assert!(
+            (score_mid - 0.5).abs() < 1e-9,
+            "At midpoint, score={} should be 0.5",
+            score_mid
+        );
+
+        // ratio=4.0 → high score
+        let score_high = sigmoid_score(4.0);
+        assert!(
+            score_high > 0.95,
+            "At ratio=4.0, score={} should be > 0.95",
+            score_high
+        );
+
+        // Monotonically increasing
+        let score_a = sigmoid_score(1.5);
+        let score_b = sigmoid_score(2.5);
+        let score_c = sigmoid_score(3.5);
+        assert!(
+            score_a < score_b && score_b < score_c,
+            "Sigmoid should be monotonic: {} < {} < {}",
+            score_a,
+            score_b,
+            score_c
         );
     }
 }

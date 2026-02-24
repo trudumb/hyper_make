@@ -1012,6 +1012,36 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.drift_estimator.boost_responsiveness(2.0);
             }
 
+            // WS4: Feed cascade events to BayesianHawkes for posterior updating.
+            // Magnitude = 1.0 per fill; accumulating fills are cascade-relevant.
+            let is_accumulating = (is_buy && current_pos > 0.0) || (!is_buy && current_pos < 0.0);
+            if is_accumulating {
+                self.bayesian_hawkes
+                    .observe_cascade(1.0, std::time::Instant::now());
+            }
+
+            // WS2: Track reducing-fill holding durations for τ_inventory EWMA.
+            let is_reducing = (is_buy && current_pos < 0.0) || (!is_buy && current_pos > 0.0);
+            if is_reducing {
+                let now = std::time::Instant::now();
+                if let Some(last_time) = self.last_reducing_fill_time {
+                    let holding_s = now.duration_since(last_time).as_secs_f64();
+                    // Only count reasonable durations (1s - 600s)
+                    if (1.0..=600.0).contains(&holding_s) {
+                        let tau_decay = 0.95;
+                        let old_mean = self.tau_inventory_ewma_s;
+                        self.tau_inventory_ewma_s =
+                            tau_decay * self.tau_inventory_ewma_s + (1.0 - tau_decay) * holding_s;
+                        // Welford online variance
+                        let delta = holding_s - old_mean;
+                        let delta2 = holding_s - self.tau_inventory_ewma_s;
+                        self.tau_inventory_variance_s2 = tau_decay * self.tau_inventory_variance_s2
+                            + (1.0 - tau_decay) * delta * delta2;
+                    }
+                }
+                self.last_reducing_fill_time = Some(now);
+            }
+
             let fill_price = fill.px.parse().unwrap_or(0.0);
             let fill_event = WsFillEvent {
                 oid: fill.oid,

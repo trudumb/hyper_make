@@ -1141,6 +1141,285 @@ pub struct CalibrationStatus {
     pub warmup_complete: bool,
 }
 
+// ==================== Adversarial Markout Calibrator (WS5) ====================
+
+/// Minimum predicted AS in bps to accept an observation.
+/// Guards against division by near-zero predicted values.
+const MIN_AS_PREDICTED_BPS: f64 = 0.01;
+
+/// Default ridge regularization strength.
+/// Shrinks betas toward zero (no correction) when data is scarce.
+const DEFAULT_RIDGE_LAMBDA: f64 = 1.0;
+
+/// Default exponential forgetting factor per observation.
+/// 0.999 gives a half-life of ~693 observations.
+const DEFAULT_DECAY: f64 = 0.999;
+
+/// Minimum observations before attempting to solve for betas.
+/// Need at least 2*d observations for reasonable d-dimensional regression.
+const MIN_OBS_MULTIPLIER: usize = 2;
+
+/// Clamp bounds for the multiplicative correction factor.
+/// exp(beta'x) is clamped to [0.2, 5.0] to prevent extreme corrections.
+const CORRECTION_CLAMP_MIN: f64 = 0.2;
+const CORRECTION_CLAMP_MAX: f64 = 5.0;
+
+/// EWMA smoothing for residual tracking.
+const RESIDUAL_EWMA_ALPHA: f64 = 0.01;
+
+/// Online ridge regression calibrator for adversarial markout data.
+///
+/// Regresses `y = ln(as_realized / as_predicted)` on feature vectors from `RiskFeatures`.
+/// Detects systematic bias in the risk model's adverse selection predictions and
+/// produces a multiplicative correction factor `exp(beta'x)`.
+///
+/// # Ridge Regression
+///
+/// beta = (X'X + lambda*I)^{-1} X'y
+///
+/// Where X'X and X'y are accumulated as sufficient statistics with exponential
+/// forgetting. Ridge lambda regularizes toward zero betas (no correction),
+/// which is the safe default.
+///
+/// # Forgetting
+///
+/// Each observation decays the accumulated statistics by `decay` before adding
+/// the new data point. This allows the calibrator to adapt to non-stationary
+/// bias patterns (e.g., regime-dependent AS misprediction).
+///
+/// # Checkpoint Compatibility
+///
+/// All fields use `#[serde(default)]` for backward compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdversarialCalibrator {
+    /// d x d sufficient statistic: sum of decay^(n-i) * x_i * x_i'
+    #[serde(default)]
+    xtx: Vec<Vec<f64>>,
+
+    /// d x 1 sufficient statistic: sum of decay^(n-i) * x_i * y_i
+    #[serde(default)]
+    xty: Vec<f64>,
+
+    /// Number of features (dimensionality of the regression)
+    #[serde(default)]
+    n_features: usize,
+
+    /// Ridge regularization parameter (shrinks toward zero betas)
+    #[serde(default = "default_ridge_lambda")]
+    ridge_lambda: f64,
+
+    /// Exponential forgetting factor per observation
+    #[serde(default = "default_decay")]
+    decay: f64,
+
+    /// Total observations incorporated
+    #[serde(default)]
+    n_obs: usize,
+
+    /// EWMA of squared residuals for monitoring
+    #[serde(default)]
+    residual_ewma: f64,
+}
+
+fn default_ridge_lambda() -> f64 {
+    DEFAULT_RIDGE_LAMBDA
+}
+fn default_decay() -> f64 {
+    DEFAULT_DECAY
+}
+
+impl AdversarialCalibrator {
+    /// Create a new calibrator for `n_features`-dimensional feature vectors.
+    ///
+    /// Initializes with zero sufficient statistics (no correction = safe default).
+    pub fn new(n_features: usize) -> Self {
+        Self {
+            xtx: vec![vec![0.0; n_features]; n_features],
+            xty: vec![0.0; n_features],
+            n_features,
+            ridge_lambda: DEFAULT_RIDGE_LAMBDA,
+            decay: DEFAULT_DECAY,
+            n_obs: 0,
+            residual_ewma: 0.0,
+        }
+    }
+
+    /// Create a calibrator with custom ridge lambda and decay.
+    pub fn with_params(n_features: usize, ridge_lambda: f64, decay: f64) -> Self {
+        Self {
+            xtx: vec![vec![0.0; n_features]; n_features],
+            xty: vec![0.0; n_features],
+            n_features,
+            ridge_lambda: ridge_lambda.max(0.0),
+            decay: decay.clamp(0.9, 1.0),
+            n_obs: 0,
+            residual_ewma: 0.0,
+        }
+    }
+
+    /// Observe a markout outcome and update sufficient statistics.
+    ///
+    /// The regression target is `y = ln(as_realized / as_predicted)`.
+    /// - y > 0 means the model under-predicted AS (realized was worse)
+    /// - y < 0 means the model over-predicted AS (realized was better)
+    /// - y = 0 means perfect calibration
+    ///
+    /// # Guards
+    /// - Skips if `as_predicted_bps < MIN_AS_PREDICTED_BPS` (near-zero denominator)
+    /// - Skips if `as_realized_bps <= 0.0` (log undefined)
+    /// - Skips if `features.len() != n_features` (dimension mismatch)
+    pub fn observe(&mut self, features: &[f64], as_predicted_bps: f64, as_realized_bps: f64) {
+        // Guard: dimension mismatch
+        if features.len() != self.n_features {
+            return;
+        }
+        // Guard: near-zero predicted AS
+        if as_predicted_bps.abs() < MIN_AS_PREDICTED_BPS {
+            return;
+        }
+        // Guard: non-positive realized AS (log undefined)
+        if as_realized_bps <= 0.0 {
+            return;
+        }
+
+        let y = (as_realized_bps / as_predicted_bps).ln();
+
+        // Apply exponential forgetting to existing statistics
+        for row in self.xtx.iter_mut() {
+            for val in row.iter_mut() {
+                *val *= self.decay;
+            }
+        }
+        for val in self.xty.iter_mut() {
+            *val *= self.decay;
+        }
+
+        // Rank-1 update: XTX += x * x', XTY += x * y
+        for i in 0..self.n_features {
+            for j in 0..self.n_features {
+                self.xtx[i][j] += features[i] * features[j];
+            }
+            self.xty[i] += features[i] * y;
+        }
+
+        self.n_obs += 1;
+
+        // Update residual EWMA
+        let betas = self.calibrated_betas();
+        let prediction: f64 = betas.iter().zip(features.iter()).map(|(b, x)| b * x).sum();
+        let residual_sq = (y - prediction).powi(2);
+        self.residual_ewma =
+            (1.0 - RESIDUAL_EWMA_ALPHA) * self.residual_ewma + RESIDUAL_EWMA_ALPHA * residual_sq;
+    }
+
+    /// Solve ridge regression and return calibrated betas.
+    ///
+    /// beta = (X'X + lambda*I)^{-1} X'y
+    ///
+    /// Uses Cholesky decomposition since X'X + lambda*I is symmetric positive definite.
+    /// Returns a zero vector if:
+    /// - Insufficient observations (< 2 * n_features)
+    /// - Cholesky decomposition fails (near-singular matrix)
+    pub fn calibrated_betas(&self) -> Vec<f64> {
+        let d = self.n_features;
+
+        // Need enough observations for meaningful regression
+        if self.n_obs < MIN_OBS_MULTIPLIER * d {
+            return vec![0.0; d];
+        }
+
+        // Copy XTX and add ridge penalty to diagonal
+        let mut a = self.xtx.clone();
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] += self.ridge_lambda;
+        }
+
+        // Cholesky decomposition: A = L * L'
+        // L is lower triangular
+        let mut l = vec![vec![0.0; d]; d];
+
+        for j in 0..d {
+            // Diagonal element
+            let mut sum = a[j][j];
+            for lj_k in l[j].iter().take(j) {
+                sum -= lj_k * lj_k;
+            }
+            if sum <= 0.0 {
+                // Matrix is not positive definite — return zeros (safe default)
+                return vec![0.0; d];
+            }
+            l[j][j] = sum.sqrt();
+
+            // Below-diagonal elements
+            for i in (j + 1)..d {
+                let mut sum = a[i][j];
+                for (li_k, lj_k) in l[i].iter().take(j).zip(l[j].iter().take(j)) {
+                    sum -= li_k * lj_k;
+                }
+                l[i][j] = sum / l[j][j];
+            }
+        }
+
+        // Forward substitution: L * z = xty
+        let mut z = vec![0.0; d];
+        for i in 0..d {
+            let mut sum = self.xty[i];
+            for j in 0..i {
+                sum -= l[i][j] * z[j];
+            }
+            z[i] = sum / l[i][i];
+        }
+
+        // Back substitution: L' * beta = z
+        let mut beta = vec![0.0; d];
+        for i in (0..d).rev() {
+            let mut sum = z[i];
+            for j in (i + 1)..d {
+                sum -= l[j][i] * beta[j];
+            }
+            beta[i] = sum / l[i][i];
+        }
+
+        beta
+    }
+
+    /// Compute the multiplicative correction factor for a given feature vector.
+    ///
+    /// Returns `exp(beta' * x)` clamped to [0.2, 5.0].
+    /// - correction > 1.0 means the model under-predicts AS (widen gamma)
+    /// - correction < 1.0 means the model over-predicts AS (tighten gamma)
+    /// - correction = 1.0 means no correction needed (well-calibrated)
+    ///
+    /// With zero betas (insufficient data), returns 1.0 (no correction).
+    pub fn correction_factor(&self, features: &[f64]) -> f64 {
+        let betas = self.calibrated_betas();
+
+        let log_correction: f64 = betas.iter().zip(features.iter()).map(|(b, x)| b * x).sum();
+
+        log_correction
+            .exp()
+            .clamp(CORRECTION_CLAMP_MIN, CORRECTION_CLAMP_MAX)
+    }
+
+    /// Get the EWMA of squared residuals as a monitoring metric.
+    ///
+    /// Lower values indicate better calibration.
+    /// Starts at 0.0 and converges as observations are added.
+    pub fn residual_mse(&self) -> f64 {
+        self.residual_ewma
+    }
+
+    /// Total number of observations incorporated.
+    pub fn n_observations(&self) -> usize {
+        self.n_obs
+    }
+
+    /// Whether the calibrator has enough data to produce meaningful corrections.
+    pub fn is_warm(&self) -> bool {
+        self.n_obs >= MIN_OBS_MULTIPLIER * self.n_features
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1377,5 +1656,237 @@ mod tests {
         params.observe_changepoint(0, false);
         // Non-changepoint should still update threshold
         assert_eq!(params.bocpd_threshold.n_observations, 2);
+    }
+
+    // ==================== WS5: AdversarialCalibrator Tests ====================
+
+    #[test]
+    fn test_ws5_adversarial_no_data_returns_zeros() {
+        let cal = AdversarialCalibrator::new(12);
+        let betas = cal.calibrated_betas();
+
+        assert_eq!(betas.len(), 12);
+        for b in &betas {
+            assert_eq!(*b, 0.0, "Betas should be zero with no data");
+        }
+        assert_eq!(cal.n_observations(), 0);
+        assert!(!cal.is_warm());
+    }
+
+    #[test]
+    fn test_ws5_adversarial_correction_neutral_default() {
+        let cal = AdversarialCalibrator::new(12);
+
+        // With zero betas, correction_factor should be exp(0) = 1.0
+        let features = vec![1.0; 12];
+        let correction = cal.correction_factor(&features);
+
+        assert!(
+            (correction - 1.0).abs() < 1e-10,
+            "Correction should be 1.0 with no data, got {}",
+            correction,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_detects_systematic_bias() {
+        // Test with a simple 2-feature model for tractability
+        let mut cal = AdversarialCalibrator::with_params(2, 0.01, 1.0); // Very small ridge, no decay
+
+        // Generate 100 observations where:
+        // - feature[0] = 1.0 (intercept-like)
+        // - feature[1] = 0.0
+        // - realized/predicted = 2.0, so y = ln(2) ~ 0.693
+        for _ in 0..100 {
+            let features = vec![1.0, 0.0];
+            cal.observe(&features, 5.0, 10.0); // 10/5 = 2.0
+        }
+
+        assert_eq!(cal.n_observations(), 100);
+        assert!(cal.is_warm());
+
+        let betas = cal.calibrated_betas();
+        assert_eq!(betas.len(), 2);
+
+        // beta[0] should be close to ln(2) ~ 0.693
+        let expected_ln2 = (2.0_f64).ln();
+        assert!(
+            (betas[0] - expected_ln2).abs() < 0.05,
+            "beta[0] should be close to ln(2)={:.4}, got {:.4}",
+            expected_ln2,
+            betas[0],
+        );
+
+        // beta[1] should be close to 0 (no signal in that feature)
+        assert!(
+            betas[1].abs() < 0.05,
+            "beta[1] should be near zero, got {:.4}",
+            betas[1],
+        );
+
+        // Correction factor at features=[1, 0] should be close to 2.0
+        let correction = cal.correction_factor(&[1.0, 0.0]);
+        assert!(
+            (correction - 2.0).abs() < 0.2,
+            "Correction should be ~2.0, got {:.4}",
+            correction,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_forgetting_decays_old() {
+        let mut cal = AdversarialCalibrator::with_params(1, 0.01, 0.95); // Aggressive decay
+
+        // Phase 1: 50 observations with realized/predicted = 3.0 (y = ln(3))
+        for _ in 0..50 {
+            cal.observe(&[1.0], 5.0, 15.0);
+        }
+
+        let betas_after_phase1 = cal.calibrated_betas();
+        let beta1 = betas_after_phase1[0];
+
+        // Phase 2: 50 observations with realized/predicted = 1.0 (y = 0.0, perfectly calibrated)
+        for _ in 0..50 {
+            cal.observe(&[1.0], 5.0, 5.0);
+        }
+
+        let betas_after_phase2 = cal.calibrated_betas();
+        let beta2 = betas_after_phase2[0];
+
+        // After phase 2 with aggressive decay, beta should have moved significantly
+        // toward 0 because the old phase-1 data (y=ln(3)) has decayed and
+        // phase-2 data (y=0) now dominates.
+        assert!(
+            beta2.abs() < beta1.abs(),
+            "Beta should have decayed: phase1={:.4}, phase2={:.4}",
+            beta1,
+            beta2,
+        );
+
+        // With 0.95 decay over 50 observations, old data is 0.95^50 ~ 0.077 weight
+        // So beta should be much closer to 0 than to ln(3)
+        let ln3 = (3.0_f64).ln();
+        assert!(
+            beta2.abs() < ln3 / 2.0,
+            "Beta should be well below ln(3)/2={:.4}, got {:.4}",
+            ln3 / 2.0,
+            beta2,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_ridge_prevents_explosion() {
+        // Test with perfectly collinear features: feature[1] = 2 * feature[0]
+        let mut cal = AdversarialCalibrator::with_params(2, 1.0, 1.0); // Strong ridge
+
+        for i in 0..100 {
+            let x = (i as f64) * 0.1;
+            let features = vec![x, 2.0 * x]; // Perfectly collinear
+            cal.observe(&features, 5.0, 10.0);
+        }
+
+        let betas = cal.calibrated_betas();
+
+        // Both betas should be finite and bounded (ridge prevents explosion)
+        for (i, b) in betas.iter().enumerate() {
+            assert!(b.is_finite(), "beta[{}] should be finite, got {}", i, b,);
+            assert!(b.abs() < 10.0, "beta[{}] should be bounded, got {}", i, b,);
+        }
+    }
+
+    #[test]
+    fn test_ws5_adversarial_guards_invalid_input() {
+        let mut cal = AdversarialCalibrator::new(3);
+
+        // Guard: wrong feature dimension
+        cal.observe(&[1.0, 2.0], 5.0, 10.0); // 2 features, expects 3
+        assert_eq!(cal.n_observations(), 0, "Should skip wrong dimension");
+
+        // Guard: near-zero predicted AS
+        cal.observe(&[1.0, 2.0, 3.0], 0.001, 10.0);
+        assert_eq!(cal.n_observations(), 0, "Should skip near-zero predicted");
+
+        // Guard: non-positive realized AS
+        cal.observe(&[1.0, 2.0, 3.0], 5.0, 0.0);
+        assert_eq!(cal.n_observations(), 0, "Should skip zero realized");
+
+        cal.observe(&[1.0, 2.0, 3.0], 5.0, -1.0);
+        assert_eq!(cal.n_observations(), 0, "Should skip negative realized");
+
+        // Valid observation should be accepted
+        cal.observe(&[1.0, 2.0, 3.0], 5.0, 10.0);
+        assert_eq!(cal.n_observations(), 1, "Should accept valid observation");
+    }
+
+    #[test]
+    fn test_ws5_adversarial_correction_clamped() {
+        let mut cal = AdversarialCalibrator::with_params(1, 0.01, 1.0);
+
+        // Feed extreme bias: realized/predicted = 100 (y = ln(100) ~ 4.6)
+        for _ in 0..100 {
+            cal.observe(&[1.0], 1.0, 100.0);
+        }
+
+        let correction = cal.correction_factor(&[1.0]);
+        assert!(
+            correction <= CORRECTION_CLAMP_MAX,
+            "Correction should be clamped to {}, got {}",
+            CORRECTION_CLAMP_MAX,
+            correction,
+        );
+
+        // Feed opposite extreme bias: realized/predicted = 0.01 (y = ln(0.01) ~ -4.6)
+        let mut cal2 = AdversarialCalibrator::with_params(1, 0.01, 1.0);
+        for _ in 0..100 {
+            cal2.observe(&[1.0], 100.0, 1.0);
+        }
+
+        let correction2 = cal2.correction_factor(&[1.0]);
+        assert!(
+            correction2 >= CORRECTION_CLAMP_MIN,
+            "Correction should be clamped to {}, got {}",
+            CORRECTION_CLAMP_MIN,
+            correction2,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_residual_mse() {
+        let mut cal = AdversarialCalibrator::new(2);
+
+        // Before any observations, residual should be 0
+        assert_eq!(cal.residual_mse(), 0.0);
+
+        // Feed some observations
+        for _ in 0..50 {
+            cal.observe(&[1.0, 0.5], 5.0, 10.0);
+        }
+
+        // Residual MSE should be finite and non-negative
+        let mse = cal.residual_mse();
+        assert!(mse.is_finite(), "MSE should be finite, got {}", mse);
+        assert!(mse >= 0.0, "MSE should be non-negative, got {}", mse);
+    }
+
+    #[test]
+    fn test_ws5_adversarial_serde_roundtrip() {
+        let mut cal = AdversarialCalibrator::new(3);
+        for _ in 0..20 {
+            cal.observe(&[1.0, 0.5, 0.2], 5.0, 8.0);
+        }
+
+        let json = serde_json::to_string(&cal).expect("serialize");
+        let loaded: AdversarialCalibrator = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(loaded.n_observations(), cal.n_observations());
+        assert_eq!(loaded.n_features, cal.n_features);
+        assert!((loaded.residual_mse() - cal.residual_mse()).abs() < 1e-10);
+
+        // Betas should be identical after roundtrip
+        let betas_orig = cal.calibrated_betas();
+        let betas_loaded = loaded.calibrated_betas();
+        for (a, b) in betas_orig.iter().zip(betas_loaded.iter()) {
+            assert!((a - b).abs() < 1e-10, "Betas should match after roundtrip",);
+        }
     }
 }
