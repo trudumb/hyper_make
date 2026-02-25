@@ -842,6 +842,7 @@ impl ParameterAggregator {
             // Measured from actual reducing-fill holding durations (WS2 integration)
             tau_inventory_s: sources.tau_inventory_s,
             tau_variance_s2: sources.tau_variance_s2,
+            sigma_sq_variance_bma: sources.sigma_sq_variance_bma,
         }
     }
 }

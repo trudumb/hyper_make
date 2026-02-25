@@ -22,6 +22,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::market_maker::config::auto_derive::CapitalTier;
+
 use super::MarketParams;
 
 fn default_beta_cascade() -> f64 {
@@ -305,6 +307,38 @@ impl CalibratedRiskModel {
         let log_gamma = self.log_gamma_base + regulated_sum;
 
         log_gamma.exp().clamp(self.gamma_min, self.gamma_max)
+    }
+
+    /// Compute gamma with capital-tier policy adjustments.
+    /// Single source of truth for all effective_gamma() call sites.
+    ///
+    /// Applies:
+    /// - E5: Micro-tier boost (1.5×) — single-level exposure needs higher risk aversion
+    /// - E6: Cap warmup inflation — uncertainty shouldn't inflate gamma beyond tier limit
+    pub fn compute_gamma_with_policy(
+        &self,
+        features: &RiskFeatures,
+        capital_tier: CapitalTier,
+        warmup_gamma_max_inflation: f64,
+    ) -> f64 {
+        let mut gamma = self.compute_gamma(features);
+
+        // E5: Micro-tier boost — single-level exposure needs higher risk aversion
+        if capital_tier == CapitalTier::Micro {
+            gamma *= 1.5;
+        }
+
+        // E6: Cap warmup inflation — uncertainty shouldn't inflate gamma beyond tier limit
+        if features.model_uncertainty > 0.0 {
+            let mut base_features = features.clone();
+            base_features.model_uncertainty = 0.0;
+            let base_gamma = self.compute_gamma(&base_features);
+            if base_gamma > 0.0 {
+                gamma = gamma.min(base_gamma * warmup_gamma_max_inflation);
+            }
+        }
+
+        gamma.clamp(self.gamma_min, self.gamma_max)
     }
 
     /// Check if the model is calibrated (has enough samples and recent data).

@@ -126,6 +126,10 @@ pub struct MarketParams {
     /// Used by PPIP timing_uncertainty term.
     pub tau_variance_s2: f64,
 
+    /// BMA posterior variance of σ². Feeds PPIP ambiguity aversion.
+    /// 0.0 when BMA not yet warmed up.
+    pub sigma_sq_variance_bma: f64,
+
     // === Order Book ===
     /// Estimated order book depth decay (κ) - from weighted L2 book regression
     pub kappa: f64,
@@ -1091,13 +1095,14 @@ impl Default for MarketParams {
             sigma_effective: 0.0001,         // Same initially
             sigma_leverage_adjusted: 0.0001, // Same initially (no leverage effect)
             // WS2: Dual-timescale inventory control
-            tau_inventory_s: 60.0,  // Default 60s holding period
-            tau_variance_s2: 900.0, // Default 30s std dev
-            kappa: 100.0,           // Moderate depth decay
-            kappa_bid: 100.0,       // Same as kappa initially
-            kappa_ask: 100.0,       // Same as kappa initially
-            is_heavy_tailed: false, // Assume exponential tails
-            kappa_cv: 1.0,          // CV=1 for exponential
+            tau_inventory_s: 60.0,      // Default 60s holding period
+            tau_variance_s2: 900.0,     // Default 30s std dev
+            sigma_sq_variance_bma: 0.0, // BMA not warmed up
+            kappa: 100.0,               // Moderate depth decay
+            kappa_bid: 100.0,           // Same as kappa initially
+            kappa_ask: 100.0,           // Same as kappa initially
+            is_heavy_tailed: false,     // Assume exponential tails
+            kappa_cv: 1.0,              // CV=1 for exponential
             // V3: Robust Kappa Orchestrator
             kappa_robust: 2000.0, // Start at prior (will be updated from orchestrator)
             use_kappa_robust: true, // Default ON - use robust kappa for spreads

@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_glft_cascade_size_factor() {
+    fn test_glft_cascade_widens_spread() {
         let strategy = GLFTStrategy::new(0.3);
         let quote_config = make_config(100.0);
 
@@ -765,7 +765,7 @@ mod tests {
         };
 
         let cascade_params = MarketParams {
-            cascade_intensity: 0.5, // 50% size reduction
+            cascade_intensity: 0.5, // Cascade defense via gamma (beta_cascade)
             ..normal_params.clone()
         };
 
@@ -774,9 +774,15 @@ mod tests {
         let (bid_cascade, ask_cascade) =
             strategy.calculate_quotes(&quote_config, 0.0, 1.0, 0.5, &cascade_params);
 
-        // Cascade should have smaller sizes
-        assert!(bid_cascade.unwrap().size < bid_normal.unwrap().size);
-        assert!(ask_cascade.unwrap().size < ask_normal.unwrap().size);
+        // Cascade routes through gamma via beta_cascade → wider spread
+        let normal_spread = ask_normal.unwrap().price - bid_normal.unwrap().price;
+        let cascade_spread = ask_cascade.unwrap().price - bid_cascade.unwrap().price;
+        assert!(
+            cascade_spread >= normal_spread,
+            "cascade_spread={:.6} should be >= normal_spread={:.6}",
+            cascade_spread,
+            normal_spread
+        );
     }
 
     #[test]

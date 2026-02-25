@@ -111,10 +111,14 @@ impl PosteriorPredictiveSkew {
         let sigma_frac = params.sigma_effective;
         self.sigma_sq_mean = (sigma_frac * sigma_frac).max(1e-16);
 
-        // σ² variance: use spread between sigma sources as proxy for model uncertainty
-        let sigma_spread =
-            (params.sigma_particle / 10_000.0 - params.sigma_leverage_adjusted).abs();
-        self.sigma_sq_variance = sigma_spread.powi(2).max(1e-20);
+        // σ² variance: use BMA between-model variance when available, else heuristic
+        self.sigma_sq_variance = if params.sigma_sq_variance_bma > 0.0 {
+            params.sigma_sq_variance_bma
+        } else {
+            let sigma_spread =
+                (params.sigma_particle / 10_000.0 - params.sigma_leverage_adjusted).abs();
+            sigma_spread.powi(2).max(1e-20)
+        };
 
         // τ_inventory: use measured from fill processor, or keep default
         if params.tau_inventory_s > 0.1 {
@@ -752,10 +756,9 @@ impl GLFTStrategy {
         position: f64,
         max_position: f64,
     ) -> f64 {
-        let cfg = &self.risk_config;
-
         // ============================================================
-        // UNIFIED LOG-ADDITIVE GAMMA (single path, no post-processes)
+        // UNIFIED LOG-ADDITIVE GAMMA via compute_gamma_with_policy
+        // Single source of truth shared with LadderStrat::effective_gamma
         // ============================================================
         let features = RiskFeatures::from_params(
             market_params,
@@ -763,15 +766,17 @@ impl GLFTStrategy {
             max_position,
             &self.risk_model_config,
         );
-        let gamma = self.risk_model.compute_gamma(&features);
-        let gamma_clamped = gamma.clamp(cfg.gamma_min, cfg.gamma_max);
+        let gamma_clamped = self.risk_model.compute_gamma_with_policy(
+            &features,
+            market_params.capital_tier,
+            market_params.capital_policy.warmup_gamma_max_inflation,
+        );
 
         let neutral_features = RiskFeatures::neutral();
         let gamma_neutral = self.risk_model.compute_gamma(&neutral_features);
         let defense_ratio = gamma_clamped / gamma_neutral.max(1e-9);
 
         debug!(
-            gamma_cal = %format!("{:.4}", gamma),
             inv_frac = %format!("{:.3}", features.inventory_fraction),
             drawdown = %format!("{:.3}", features.drawdown_fraction),
             regime = %format!("{:.3}", features.regime_risk_score),
@@ -1053,31 +1058,25 @@ impl QuotingStrategy for GLFTStrategy {
             .effective_max_position(max_position)
             .min(max_position);
 
-        // === 1. DYNAMIC GAMMA with Tail Risk ===
+        // === 1. DYNAMIC GAMMA ===
         // When adaptive spreads enabled: use log-additive shrinkage gamma
-        // When disabled: use multiplicative RiskConfig gamma
+        // When disabled: use CalibratedRiskModel gamma
+        //
+        // Tail risk is handled via beta_tail_risk in compute_gamma() — no multiplicative post-process.
         //
         // KEY FIX: Use `adaptive_can_estimate` instead of `adaptive_warmed_up`
         // The adaptive system provides usable values IMMEDIATELY via Bayesian priors.
         // We don't need to wait for 20+ fills - priors give reasonable starting points.
         let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
-            // Adaptive gamma: log-additive scaling prevents multiplicative explosion
-            // Still apply tail risk protection (converted to a 1.0 + intensity multiplier for this fallback)
             let adaptive_gamma = market_params.adaptive_gamma;
-            let gamma_with_tail = adaptive_gamma * (1.0 + market_params.tail_risk_intensity);
             debug!(
                 adaptive_gamma = %format!("{:.4}", adaptive_gamma),
-                tail_intensity = %format!("{:.2}", market_params.tail_risk_intensity),
-                gamma_final = %format!("{:.4}", gamma_with_tail),
                 warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
                 "Using ADAPTIVE gamma (log-additive shrinkage)"
             );
-            gamma_with_tail
+            adaptive_gamma
         } else {
-            // Legacy: multiplicative RiskConfig gamma
-            let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
-            // Apply tail risk multiplier: during cascade → much higher gamma → wider spread
-            base_gamma * (1.0 + market_params.tail_risk_intensity)
+            self.effective_gamma(market_params, position, effective_max_position)
         };
 
         // === 1a. KAPPA: Learned vs Adaptive vs Legacy ===
@@ -1513,17 +1512,18 @@ impl QuotingStrategy for GLFTStrategy {
                 let tau_mean = market_params.tau_inventory_s.max(1.0);
                 let tau_variance = market_params.tau_variance_s2.max(1.0);
 
-                // Sigma variance: use belief uncertainty when available, else heuristic
-                let sigma_sq_variance =
-                    if market_params.use_belief_system && market_params.belief_confidence > 0.1 {
-                        // Estimate Var[σ²] from belief confidence:
-                        // Low confidence → high variance → more ambiguity aversion
-                        let confidence = market_params.belief_confidence.clamp(0.1, 1.0);
-                        sigma_sq_mean.powi(2) * (1.0 / confidence - 1.0).max(0.01)
-                    } else {
-                        // Heuristic: Var[σ²] ≈ 0.5 × E[σ²]² during warmup (high uncertainty)
-                        sigma_sq_mean.powi(2) * 0.5
-                    };
+                // Sigma variance: prefer BMA between-model variance, fallback to heuristics
+                let sigma_sq_variance = if market_params.sigma_sq_variance_bma > 0.0 {
+                    market_params.sigma_sq_variance_bma
+                } else if market_params.use_belief_system && market_params.belief_confidence > 0.1 {
+                    // Estimate Var[σ²] from belief confidence:
+                    // Low confidence → high variance → more ambiguity aversion
+                    let confidence = market_params.belief_confidence.clamp(0.1, 1.0);
+                    sigma_sq_mean.powi(2) * (1.0 / confidence - 1.0).max(0.01)
+                } else {
+                    // Heuristic: Var[σ²] ≈ 0.5 × E[σ²]² during warmup (high uncertainty)
+                    sigma_sq_mean.powi(2) * 0.5
+                };
 
                 let q = inventory_ratio * effective_max_position;
 
@@ -1919,13 +1919,11 @@ impl QuotingStrategy for GLFTStrategy {
             .min(target_liquidity)
             .max(0.0);
 
-        // === Apply cascade size reduction for graceful degradation ===
-        // During moderate cascade (before quote pulling), reduce size gradually
-        let buy_size_adjusted = buy_size_raw * (1.0 - market_params.cascade_intensity).max(0.0);
-        let sell_size_adjusted = sell_size_raw * (1.0 - market_params.cascade_intensity).max(0.0);
-
-        let buy_size = truncate_float(buy_size_adjusted, config.sz_decimals, false);
-        let sell_size = truncate_float(sell_size_adjusted, config.sz_decimals, false);
+        // Cascade defense routed through gamma via beta_cascade — no size reduction needed.
+        // At cascade_intensity=0.7, gamma inflates ~2.3× (capped by sigmoid regularization),
+        // which widens spreads without zeroing out sizes.
+        let buy_size = truncate_float(buy_size_raw, config.sz_decimals, false);
+        let sell_size = truncate_float(sell_size_raw, config.sz_decimals, false);
 
         // Build quotes, checking minimum notional
         let bid = if buy_size > EPSILON {

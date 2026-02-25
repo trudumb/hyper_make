@@ -4,7 +4,6 @@ use tracing::{debug, info, warn};
 
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
-use crate::market_maker::config::auto_derive::CapitalTier;
 use crate::market_maker::config::{Quote, QuoteConfig, SizeQuantum};
 // VolatilityRegime removed - regime_scalar was redundant with vol_scalar
 use crate::market_maker::quoting::ladder::risk_budget::{
@@ -418,18 +417,9 @@ impl LadderStrategy {
         position: f64,
         max_position: f64,
     ) -> f64 {
-        let cfg = &self.risk_config;
-        let blend = self.risk_model_config.risk_model_blend.clamp(0.0, 1.0);
-
-        if blend < 1.0 {
-            tracing::debug!(
-                blend = %format!("{:.2}", blend),
-                "risk_model_blend < 1.0 but legacy path removed; using calibrated-only"
-            );
-        }
-
         // ============================================================
-        // CALIBRATED LOG-ADDITIVE GAMMA (only path)
+        // UNIFIED LOG-ADDITIVE GAMMA via compute_gamma_with_policy
+        // Single source of truth shared with GLFTStrategy::effective_gamma
         // ============================================================
         let features = RiskFeatures::from_params(
             market_params,
@@ -437,31 +427,11 @@ impl LadderStrategy {
             max_position,
             &self.risk_model_config,
         );
-        let mut gamma = self.risk_model.compute_gamma(&features);
-
-        // E5: Micro-tier gamma boost — concentrated single-level exposure
-        // needs higher risk aversion to compensate for lack of diversification
-        if market_params.capital_tier == CapitalTier::Micro {
-            gamma *= 1.5;
-        }
-
-        // E6: Cap warmup gamma inflation — prevent uncertainty from inflating gamma
-        // beyond tier-specific limits. Compute gamma with zero uncertainty to get
-        // the "base" gamma, then cap the ratio to warmup_gamma_max_inflation.
-        if features.model_uncertainty > 0.0 {
-            let mut base_features = features.clone();
-            base_features.model_uncertainty = 0.0;
-            let base_gamma = self.risk_model.compute_gamma(&base_features);
-            if base_gamma > 0.0 {
-                let max_inflation = market_params.capital_policy.warmup_gamma_max_inflation;
-                let max_gamma = base_gamma * max_inflation;
-                if gamma > max_gamma {
-                    gamma = max_gamma;
-                }
-            }
-        }
-
-        gamma.clamp(cfg.gamma_min, cfg.gamma_max)
+        self.risk_model.compute_gamma_with_policy(
+            &features,
+            market_params.capital_tier,
+            market_params.capital_policy.warmup_gamma_max_inflation,
+        )
     }
 
     /// Calculate holding time from arrival intensity.
