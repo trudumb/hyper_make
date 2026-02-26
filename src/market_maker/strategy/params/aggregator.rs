@@ -745,6 +745,11 @@ impl ParameterAggregator {
                 // DEPRECATED fallback: beliefs_builder is no longer updated
                 sources.beliefs_builder.beliefs().overall_confidence()
             },
+            prob_bearish: if let Some(beliefs) = sources.beliefs {
+                beliefs.drift_vol.prob_bearish
+            } else {
+                0.5 // Neutral prior when beliefs unavailable
+            },
             use_belief_system: sources.beliefs_builder.config().enable_belief_system,
             // Position direction confidence - will be computed in RiskFeatures::from_params
             // using the fields above (belief_predictive_bias, belief_confidence, flow_imbalance)

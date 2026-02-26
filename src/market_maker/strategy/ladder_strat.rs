@@ -1401,38 +1401,25 @@ impl LadderStrategy {
             );
             let usable_margin = available_margin * margin_utilization;
 
-            // === TWO-SIDED MARGIN ALLOCATION (STOCHASTIC-WEIGHTED) ===
-            // Split usable margin using three components:
-            // 1. INVENTORY: Mean-revert position (primary driver)
-            // 2. MOMENTUM: Follow flow when flat to capture directional edge
-            // 3. URGENCY: Amplify reduction when position opposes momentum (danger zone)
-            //
-            // FIRST PRINCIPLES:
-            // - When flat: follow momentum to capture directional alpha
-            // - When positioned: prioritize mean-reversion
-            // - When position opposes momentum: urgently reduce exposure
-
-            // Simple inventory-driven margin split.
-            // Long → more margin to asks (mean-revert), Short → more to bids.
-            // Directional skew is already in the microprice offset above.
-            let inventory_ratio = if effective_max_position > EPSILON {
-                (position / effective_max_position).clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-            let inv_factor = (inventory_ratio * 0.3).clamp(-0.20, 0.20);
-            let ask_margin_weight = (0.5 + inv_factor).clamp(0.30, 0.70);
-            let bid_margin_weight = 1.0 - ask_margin_weight;
+            // === TWO-SIDED MARGIN ALLOCATION (POSTERIOR-DRIVEN) ===
+            // Split usable margin using Bayesian posterior P(drift < 0).
+            // p_down ≈ 1.0 → most margin to asks (selling), minimal to bids.
+            // p_down ≈ 0.0 → most margin to bids (buying), minimal to asks.
+            // p_down ≈ 0.5 → symmetric 50/50 split.
+            // No floor clamps — Guaranteed Quote Floor ensures minimum market presence.
+            let p_down = market_params.prob_bearish;
+            let ask_margin_weight = p_down;
+            let bid_margin_weight = 1.0 - p_down;
             let margin_for_bids = usable_margin * bid_margin_weight;
             let margin_for_asks = usable_margin * ask_margin_weight;
 
             info!(
                 usable_margin = %format!("{:.2}", usable_margin),
-                inventory_ratio = %format!("{:.3}", inventory_ratio),
-                inv_factor = %format!("{:.3}", inv_factor),
+                p_down = %format!("{:.3}", p_down),
+                bid_margin_weight = %format!("{:.3}", bid_margin_weight),
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
-                "Margin allocation (inventory-driven split)"
+                "Margin allocation (posterior-driven split)"
             );
 
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
@@ -2135,7 +2122,7 @@ impl LadderStrategy {
                         let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
                             entropy_config,
                             market_params.microprice,
-                            margin_for_bids, // Use inventory-weighted margin split (not full margin)
+                            margin_for_bids, // Use posterior-weighted margin split (not full margin)
                             available_for_bids,
                             leverage,
                         );
@@ -2225,7 +2212,7 @@ impl LadderStrategy {
                         let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
                             entropy_config,
                             market_params.microprice,
-                            margin_for_asks, // Use inventory-weighted margin split (not full margin)
+                            margin_for_asks, // Use posterior-weighted margin split (not full margin)
                             available_for_asks,
                             leverage,
                         );
@@ -2847,49 +2834,57 @@ fn adverse_selection_at_depth(depth_bps: f64, params: &LadderParams) -> f64 {
 mod tests {
     use super::*;
 
-    /// Compute simplified inventory-driven margin split weight.
-    fn compute_margin_split(inventory_ratio: f64) -> (f64, f64) {
-        let inv_factor = (inventory_ratio * 0.3).clamp(-0.20, 0.20);
-        let ask_w = (0.5 + inv_factor).clamp(0.30, 0.70);
-        (1.0 - ask_w, ask_w) // (bid_weight, ask_weight)
+    /// Compute posterior-driven margin split weights.
+    /// p_down = P(drift < 0) from Bayesian belief system.
+    /// Returns (bid_weight, ask_weight).
+    fn compute_posterior_margin_split(p_down: f64) -> (f64, f64) {
+        let ask_w = p_down;
+        let bid_w = 1.0 - p_down;
+        (bid_w, ask_w)
     }
 
     #[test]
-    fn test_margin_split_flat_is_equal() {
-        let (bid_w, ask_w) = compute_margin_split(0.0);
+    fn test_margin_split_neutral_is_equal() {
+        // p_down = 0.5 → symmetric split
+        let (bid_w, ask_w) = compute_posterior_margin_split(0.5);
         assert!((bid_w - 0.5).abs() < 1e-10);
         assert!((ask_w - 0.5).abs() < 1e-10);
     }
 
     #[test]
-    fn test_margin_split_long_favors_asks() {
-        // Long position → more margin to asks (mean-revert)
-        let (bid_w, ask_w) = compute_margin_split(0.5);
+    fn test_margin_split_bearish_favors_asks() {
+        // p_down = 0.8 → bearish → more margin to asks (selling)
+        let (bid_w, ask_w) = compute_posterior_margin_split(0.8);
         assert!(
             ask_w > bid_w,
-            "Long should favor asks: bid={bid_w:.3}, ask={ask_w:.3}"
+            "Bearish should favor asks: bid={bid_w:.3}, ask={ask_w:.3}"
         );
+        assert!((ask_w - 0.8).abs() < 1e-10);
+        assert!((bid_w - 0.2).abs() < 1e-10);
     }
 
     #[test]
-    fn test_margin_split_short_favors_bids() {
-        // Short position → more margin to bids (mean-revert)
-        let (bid_w, ask_w) = compute_margin_split(-0.5);
+    fn test_margin_split_bullish_favors_bids() {
+        // p_down = 0.2 → bullish → more margin to bids (buying)
+        let (bid_w, ask_w) = compute_posterior_margin_split(0.2);
         assert!(
             bid_w > ask_w,
-            "Short should favor bids: bid={bid_w:.3}, ask={ask_w:.3}"
+            "Bullish should favor bids: bid={bid_w:.3}, ask={ask_w:.3}"
         );
+        assert!((bid_w - 0.8).abs() < 1e-10);
+        assert!((ask_w - 0.2).abs() < 1e-10);
     }
 
     #[test]
-    fn test_margin_split_clamped() {
-        // Even extreme inventory, split stays within [0.30, 0.70]
-        let (bid_w, ask_w) = compute_margin_split(1.0);
-        assert!(ask_w <= 0.70 + 1e-10);
-        assert!(bid_w >= 0.30 - 1e-10);
-        let (bid_w2, ask_w2) = compute_margin_split(-1.0);
-        assert!(bid_w2 <= 0.70 + 1e-10);
-        assert!(ask_w2 >= 0.30 - 1e-10);
+    fn test_margin_split_extreme_conviction() {
+        // p_down = 0.98 → strong bearish → 2% bids, 98% asks
+        let (bid_w, ask_w) = compute_posterior_margin_split(0.98);
+        assert!((bid_w - 0.02).abs() < 1e-10);
+        assert!((ask_w - 0.98).abs() < 1e-10);
+        // p_down = 0.02 → strong bullish → 98% bids, 2% asks
+        let (bid_w2, ask_w2) = compute_posterior_margin_split(0.02);
+        assert!((bid_w2 - 0.98).abs() < 1e-10);
+        assert!((ask_w2 - 0.02).abs() < 1e-10);
     }
 
     #[test]

@@ -897,6 +897,11 @@ pub struct MarketParams {
     /// Low values → blend toward legacy behavior.
     pub belief_confidence: f64,
 
+    /// Bayesian posterior P(drift < 0) from belief system.
+    /// Used for posterior-driven margin allocation:
+    /// p_down ≈ 1.0 → most margin to asks, p_down ≈ 0.0 → most margin to bids.
+    pub prob_bearish: f64,
+
     /// Whether to use belief-derived parameters instead of heuristics.
     /// Feature flag for gradual rollout.
     pub use_belief_system: bool,
@@ -1355,6 +1360,7 @@ impl Default for MarketParams {
             belief_expected_sigma: 0.0001, // Default sigma
             belief_expected_kappa: 200.0, // Conservative default for thin DEX
             belief_confidence: 0.0,      // Not confident until warmed up
+            prob_bearish: 0.5,           // Neutral prior (symmetric margin split)
             use_belief_system: true,     // Use first-principles belief system
             // Position Direction Confidence
             position_direction_confidence: 0.5, // Neutral confidence initially
