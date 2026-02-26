@@ -50,6 +50,14 @@ fn default_beta_continuation() -> f64 {
     -0.5 // High continuation probability reduces gamma for more two-sided quoting
 }
 
+fn default_beta_edge_uncertainty() -> f64 {
+    1.5 // At unc=0.5 (no data): e^(1.5×0.5) = 2.12× gamma. At unc=0.05: e^(0.075) = 1.08×
+}
+
+fn default_beta_calibration() -> f64 {
+    0.8 // At error=0.25: e^(0.8×0.25) = 1.22× gamma. At error=0.5: e^(0.8×0.5) = 1.49×
+}
+
 /// Calibration state for the risk model.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CalibrationState {
@@ -139,6 +147,19 @@ pub struct CalibratedRiskModel {
     #[serde(default = "default_beta_continuation")]
     pub beta_continuation: f64,
 
+    /// Per unit edge_uncertainty [0, 1]: P(edge ≤ 0) from Bayesian fill statistics.
+    /// edge_uncertainty=0.5 (no data) → exp(0.75) ≈ 2.12× gamma (automatic defensive warmup).
+    /// edge_uncertainty=0.05 (strong positive) → exp(0.075) ≈ 1.08× (nearly no penalty).
+    /// Replaces warmup_spread_discount(), max_defensive_multiplier(), negative_edge_alarm().
+    #[serde(default = "default_beta_edge_uncertainty")]
+    pub beta_edge_uncertainty: f64,
+
+    /// Per unit calibration_deficit [0, 1]: mean |P_predicted - P_realized| across fill-rate bins × 2.
+    /// Well-calibrated (0.05) → exp(0.04) ≈ 1.04×. Poorly calibrated (0.25) → exp(0.20) ≈ 1.22×.
+    /// Replaces spread_multiplier_from_confidence().
+    #[serde(default = "default_beta_calibration")]
+    pub beta_calibration: f64,
+
     // === Bounds ===
     /// Minimum gamma (floor)
     pub gamma_min: f64,
@@ -199,6 +220,8 @@ impl Default for CalibratedRiskModel {
             beta_regime: 1.0,
             beta_ghost: 0.5,
             beta_continuation: -0.5,
+            beta_edge_uncertainty: 1.5,
+            beta_calibration: 0.8,
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -242,10 +265,12 @@ impl CalibratedRiskModel {
             beta_cascade: 1.8,
             // More conservative tail risk during warmup
             beta_tail_risk: 1.05,
-            beta_drawdown: 2.0,       // More conservative during warmup
-            beta_regime: 1.5,         // More conservative during warmup
-            beta_ghost: 0.75,         // More conservative during warmup
-            beta_continuation: -0.25, // Less confident in continuation during warmup
+            beta_drawdown: 2.0,         // More conservative during warmup
+            beta_regime: 1.5,           // More conservative during warmup
+            beta_ghost: 0.75,           // More conservative during warmup
+            beta_continuation: -0.25,   // Less confident in continuation during warmup
+            beta_edge_uncertainty: 2.0, // More conservative during warmup
+            beta_calibration: 1.2,      // More conservative during warmup
             ..Default::default()
         }
     }
@@ -286,7 +311,9 @@ impl CalibratedRiskModel {
             + self.beta_drawdown * features.drawdown_fraction
             + self.beta_regime * features.regime_risk_score
             + self.beta_ghost * features.ghost_depletion
-            + self.beta_continuation * features.continuation_probability;
+            + self.beta_continuation * features.continuation_probability
+            + self.beta_edge_uncertainty * features.edge_uncertainty
+            + self.beta_calibration * features.calibration_deficit;
 
         // Sigmoid "skeptic" regularization — prevents any single noisy feature from dominating.
         // WS1: Increased from 1.5 to 2.5 to accommodate wider feature range (12 features now).
@@ -411,6 +438,10 @@ impl CalibratedRiskModel {
             beta_ghost: self.beta_ghost * (1.0 - alpha) + defaults.beta_ghost * alpha,
             beta_continuation: self.beta_continuation * (1.0 - alpha)
                 + defaults.beta_continuation * alpha,
+            beta_edge_uncertainty: self.beta_edge_uncertainty * (1.0 - alpha)
+                + defaults.beta_edge_uncertainty * alpha,
+            beta_calibration: self.beta_calibration * (1.0 - alpha)
+                + defaults.beta_calibration * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -483,6 +514,16 @@ pub struct RiskFeatures {
     /// Continuation probability [0, 1].
     /// High probability means positional direction is strongly expected to continue.
     pub continuation_probability: f64,
+
+    /// Edge uncertainty [0, 1]: P(edge ≤ 0) from EdgeTracker fill statistics.
+    /// 0.5 = maximum ignorance (no data), 0.0 = confident positive edge, 1.0 = confident negative.
+    /// Computed as 1 - Φ(μ / (σ / √n)) where μ, σ are mean/std of gross edge.
+    pub edge_uncertainty: f64,
+
+    /// Calibration deficit [0, 1]: mean |P_predicted(fill) - P_realized(fill)| across bins × 2.
+    /// 0.0 = perfectly calibrated, 1.0 = completely miscalibrated.
+    /// From QuoteOutcomeTracker fill-rate bin comparison.
+    pub calibration_deficit: f64,
 }
 
 impl RiskFeatures {
@@ -585,6 +626,8 @@ impl RiskFeatures {
             regime_risk_score,
             ghost_depletion,
             continuation_probability,
+            edge_uncertainty: params.edge_uncertainty.clamp(0.0, 1.0),
+            calibration_deficit: params.calibration_deficit.clamp(0.0, 1.0),
         }
     }
 
@@ -604,6 +647,8 @@ impl RiskFeatures {
             regime_risk_score: 0.0,
             ghost_depletion: 0.0,
             continuation_probability: 0.5, // Neutral continuation probability
+            edge_uncertainty: 0.5,         // Maximum ignorance — no data
+            calibration_deficit: 0.0,      // Assume calibrated until proven otherwise
         }
     }
 
@@ -623,6 +668,8 @@ impl RiskFeatures {
             regime_risk_score: 0.59,       // ln(1.8) — extreme regime
             ghost_depletion: 1.0,          // Full ghost depletion
             continuation_probability: 0.0, // No continuation -> higher gamma
+            edge_uncertainty: 0.95,        // Strong negative edge signal
+            calibration_deficit: 0.5,      // Poorly calibrated
         }
     }
 
@@ -642,6 +689,9 @@ impl RiskFeatures {
             self.drawdown_fraction,
             self.regime_risk_score,
             self.ghost_depletion,
+            self.continuation_probability,
+            self.edge_uncertainty,
+            self.calibration_deficit,
         ]
     }
 
@@ -711,6 +761,8 @@ impl RiskFeatures {
             regime_risk_score: 0.0,        // Not available from MarketState
             ghost_depletion: 0.0,          // Not available from MarketState
             continuation_probability: 0.5, // Not available from MarketState, use neutral
+            edge_uncertainty: 0.5,         // Not available from MarketState, use maximum ignorance
+            calibration_deficit: 0.0,      // Not available from MarketState
         }
     }
 }
@@ -1365,6 +1417,8 @@ mod tests {
             regime_risk_score: 0.59, // ln(1.8)
             ghost_depletion: 0.5,
             continuation_probability: 0.5,
+            edge_uncertainty: 0.5,
+            calibration_deficit: 0.3,
         };
 
         let gamma = model.compute_gamma(&everything);
@@ -1488,6 +1542,61 @@ mod tests {
             tracker.tracking_error() < 0.05,
             "Well-calibrated gamma should have near-zero tracking error: {}",
             tracker.tracking_error()
+        );
+    }
+
+    #[test]
+    fn test_edge_uncertainty_widens_gamma() {
+        let model = CalibratedRiskModel::default();
+
+        // No data: uncertainty = 0.5 → meaningful gamma widening
+        let uncertain = RiskFeatures {
+            edge_uncertainty: 0.5,
+            ..RiskFeatures::neutral()
+        };
+        let confident = RiskFeatures {
+            edge_uncertainty: 0.05,
+            ..RiskFeatures::neutral()
+        };
+
+        let g_uncertain = model.compute_gamma(&uncertain);
+        let g_confident = model.compute_gamma(&confident);
+
+        let ratio = g_uncertain / g_confident;
+        assert!(
+            ratio > 1.3,
+            "Uncertain edge should widen gamma: ratio={ratio:.3}"
+        );
+        assert!(
+            ratio < 3.0,
+            "Sigmoid should cap edge uncertainty widening: ratio={ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn test_calibration_deficit_widens_gamma() {
+        let model = CalibratedRiskModel::default();
+
+        let well_calibrated = RiskFeatures {
+            calibration_deficit: 0.05,
+            ..RiskFeatures::neutral()
+        };
+        let poorly_calibrated = RiskFeatures {
+            calibration_deficit: 0.5,
+            ..RiskFeatures::neutral()
+        };
+
+        let g_good = model.compute_gamma(&well_calibrated);
+        let g_bad = model.compute_gamma(&poorly_calibrated);
+
+        let ratio = g_bad / g_good;
+        assert!(
+            ratio > 1.1,
+            "Poor calibration should widen gamma: ratio={ratio:.3}"
+        );
+        assert!(
+            ratio < 2.0,
+            "Calibration widening should be moderate: ratio={ratio:.3}"
         );
     }
 }

@@ -83,7 +83,7 @@ impl Default for KellySizer {
             min_edge_bps: 2.0,
             max_position_fraction: 0.5,
             win_loss_tracker: WinLossTracker::default(),
-            enabled: false, // Conservative: disabled by default
+            enabled: true, // Enabled by default with Bayesian prior warmup
         }
     }
 }
@@ -390,7 +390,7 @@ pub struct KellyConfig {
 impl Default for KellyConfig {
     fn default() -> Self {
         Self {
-            use_kelly_sizing: false, // Conservative: disabled by default
+            use_kelly_sizing: true, // Enabled by default with Bayesian prior warmup
             kelly_fraction: 0.25,
             min_p_win: 0.55,
             min_edge_bps: 2.0,

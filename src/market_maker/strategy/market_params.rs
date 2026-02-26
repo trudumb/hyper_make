@@ -965,7 +965,8 @@ pub struct MarketParams {
     /// Fractional per second, same units as drift_rate_per_sec.
     pub drift_rate_per_sec_raw: f64,
 
-    /// Kalman posterior drift uncertainty √P (bps).
+    /// Kalman posterior drift uncertainty √P (bps/sec, despite the name).
+    /// The Kalman state is drift in bps/sec, so √P has units bps/sec.
     /// Lower = more confident. Used for logging and E[PnL] confidence.
     pub drift_uncertainty_bps: f64,
 
@@ -975,6 +976,17 @@ pub struct MarketParams {
     pub hysteresis_bid_gamma_mult: f64,
     /// Ask-side gamma multiplier from hysteresis (>1.0 = wider asks).
     pub hysteresis_ask_gamma_mult: f64,
+
+    // === Edge Accountability ===
+    /// Edge uncertainty: P(edge ≤ 0) from Bayesian fill statistics.
+    /// 0.5 = maximum ignorance (no data), 0.0 = confident positive edge, 1.0 = confident negative.
+    /// Fed into CalibratedRiskModel beta_edge_uncertainty.
+    pub edge_uncertainty: f64,
+
+    /// Calibration deficit: mean |P_predicted - P_realized| across fill-rate bins × 2.
+    /// 0.0 = perfectly calibrated, 1.0 = completely miscalibrated.
+    /// Fed into CalibratedRiskModel beta_calibration.
+    pub calibration_deficit: f64,
 
     /// Enable per-level E[PnL] filter (replaces binary quote gate).
     /// When true, levels with E[PnL] ≤ 0 are dropped instead of using
@@ -1365,6 +1377,8 @@ impl Default for MarketParams {
             drift_uncertainty_bps: 0.0,
             hysteresis_bid_gamma_mult: 1.0,
             hysteresis_ask_gamma_mult: 1.0,
+            edge_uncertainty: 0.5,    // Maximum ignorance — no data initially
+            calibration_deficit: 0.0, // Assume calibrated until proven otherwise
             current_drawdown_frac: 0.0,
             // Capital tier
             capital_tier: CapitalTier::Large,

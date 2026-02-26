@@ -88,10 +88,17 @@ impl DirectionHysteresis {
         }
     }
 
+    /// Get the penalized direction sign.
+    /// +1 = was long (penalizing bids), -1 = was short (penalizing asks), 0 = no penalty.
+    pub fn penalized_sign(&self) -> i8 {
+        self.penalized_sign
+    }
+
     /// Get per-side gamma adjustments.
     /// Penalty applied to the side that would re-accumulate the previous direction.
-    pub fn gamma_adjustments(&self, now_ms: u64) -> HysteresisAdjustment {
-        if self.zero_cross_time_ms == 0 || self.penalized_sign == 0 {
+    /// If `suppress` is true (informed flip detected), returns neutral 1.0 multipliers.
+    pub fn gamma_adjustments(&self, now_ms: u64, suppress: bool) -> HysteresisAdjustment {
+        if suppress || self.zero_cross_time_ms == 0 || self.penalized_sign == 0 {
             return HysteresisAdjustment {
                 bid_gamma_mult: 1.0,
                 ask_gamma_mult: 1.0,
@@ -142,7 +149,7 @@ mod tests {
     #[test]
     fn test_no_hysteresis_initially() {
         let h = DirectionHysteresis::new();
-        let adj = h.gamma_adjustments(1000);
+        let adj = h.gamma_adjustments(1000, false);
         assert_eq!(adj.bid_gamma_mult, 1.0);
         assert_eq!(adj.ask_gamma_mult, 1.0);
     }
@@ -156,7 +163,7 @@ mod tests {
         h.update_position(-0.1, 2000);
 
         // Immediately after crossing: penalty on bids (re-accumulating long)
-        let adj = h.gamma_adjustments(2000);
+        let adj = h.gamma_adjustments(2000, false);
         assert!(
             adj.bid_gamma_mult > 1.5,
             "Bids should be penalized after long→short"
@@ -170,7 +177,7 @@ mod tests {
         h.update_position(-1.0, 1000);
         h.update_position(0.1, 2000);
 
-        let adj = h.gamma_adjustments(2000);
+        let adj = h.gamma_adjustments(2000, false);
         assert_eq!(adj.bid_gamma_mult, 1.0);
         assert!(
             adj.ask_gamma_mult > 1.5,
@@ -185,11 +192,11 @@ mod tests {
         h.update_position(-0.1, 2000);
 
         // At t=2000 (crossing): full penalty
-        let adj_immediate = h.gamma_adjustments(2000);
+        let adj_immediate = h.gamma_adjustments(2000, false);
         // At t=92000 (90s later, ≈1τ): penalty ≈ 37%
-        let adj_later = h.gamma_adjustments(92_000);
+        let adj_later = h.gamma_adjustments(92_000, false);
         // At t=272000 (270s, ≈3τ): penalty ≈ 5%
-        let adj_much_later = h.gamma_adjustments(272_000);
+        let adj_much_later = h.gamma_adjustments(272_000, false);
 
         assert!(adj_immediate.bid_gamma_mult > adj_later.bid_gamma_mult);
         assert!(adj_later.bid_gamma_mult > adj_much_later.bid_gamma_mult);
@@ -197,5 +204,33 @@ mod tests {
             adj_much_later.bid_gamma_mult < 1.1,
             "Should have decayed substantially"
         );
+    }
+
+    #[test]
+    fn test_suppress_returns_neutral() {
+        let mut h = DirectionHysteresis::new();
+        h.update_position(1.0, 1000);
+        h.update_position(-0.1, 2000);
+
+        // Without suppress: penalty active
+        let adj_normal = h.gamma_adjustments(2000, false);
+        assert!(adj_normal.bid_gamma_mult > 1.5);
+
+        // With suppress (informed flip): neutral multipliers
+        let adj_suppressed = h.gamma_adjustments(2000, true);
+        assert_eq!(adj_suppressed.bid_gamma_mult, 1.0);
+        assert_eq!(adj_suppressed.ask_gamma_mult, 1.0);
+    }
+
+    #[test]
+    fn test_penalized_sign_getter() {
+        let mut h = DirectionHysteresis::new();
+        assert_eq!(h.penalized_sign(), 0);
+
+        h.update_position(1.0, 1000);
+        assert_eq!(h.penalized_sign(), 0); // No crossing yet
+
+        h.update_position(-0.1, 2000);
+        assert_eq!(h.penalized_sign(), 1); // Was long → penalize bids
     }
 }

@@ -1495,7 +1495,9 @@ impl LadderStrategy {
                 if abs_pos > near_flat_threshold {
                     // Check Bayesian conditions for informed flip
                     let raw_drift = market_params.drift_rate_per_sec_raw;
-                    let drift_unc = market_params.drift_uncertainty_bps / 10_000.0; // convert to per-sec scale
+                    // drift_uncertainty_bps is actually bps/sec (Kalman state is drift rate).
+                    // Convert to fraction/sec for comparison with drift_rate_per_sec_raw.
+                    let drift_unc_frac_per_sec = market_params.drift_uncertainty_bps / 10_000.0;
                     let cp_prob = market_params.changepoint_prob;
                     let p_cont = market_params.continuation_p;
                     let trend_bps = market_params.drift_signal_bps;
@@ -1503,9 +1505,9 @@ impl LadderStrategy {
 
                     // Condition 1: Drift opposes position with Kalman SNR > 0.5
                     let drift_opposes = if position > 0.0 {
-                        raw_drift < 0.0 && raw_drift.abs() > 0.5 * drift_unc.max(1e-10)
+                        raw_drift < 0.0 && raw_drift.abs() > 0.5 * drift_unc_frac_per_sec.max(1e-10)
                     } else {
-                        raw_drift > 0.0 && raw_drift.abs() > 0.5 * drift_unc.max(1e-10)
+                        raw_drift > 0.0 && raw_drift.abs() > 0.5 * drift_unc_frac_per_sec.max(1e-10)
                     };
 
                     // Condition 2: Changepoint detected (BOCD)

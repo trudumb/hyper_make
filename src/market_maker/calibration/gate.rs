@@ -37,6 +37,10 @@ pub struct PriorConfidence {
     pub overall: f64,
 }
 
+/// **Deprecated**: Replaced by `beta_calibration` in log-additive gamma model.
+/// Calibration deficit feeds directly into gamma instead of being a bolt-on multiplier.
+/// Kept for backward compatibility during transition.
+///
 /// Spread multiplier from confidence: wider spreads when confidence is low.
 ///
 /// Returns [1.0, 3.0] — at confidence=1.0 returns 1.0 (no widening),
@@ -47,6 +51,9 @@ pub fn spread_multiplier_from_confidence(confidence: f64) -> f64 {
     3.0 - 2.0 * c
 }
 
+/// **Deprecated**: Replaced by Kelly `kelly_position_fraction()` with Bayesian prior.
+/// Kept for backward compatibility during transition.
+///
 /// Size multiplier from confidence: smaller size when confidence is low.
 ///
 /// Returns [0.1, 1.0] — at confidence=1.0 returns 1.0 (full size),
@@ -204,6 +211,9 @@ impl CalibrationGate {
             kelly_fills,
             session_duration_s,
             estimators_ready,
+            mean_gross_edge_bps: 0.0, // Populated by caller (quote_engine)
+            edge_significantly_negative: false, // Populated by caller (quote_engine)
+            calibration_error: 0.0,   // Populated by caller (quote_engine)
         }
     }
 
@@ -347,6 +357,10 @@ impl CalibrationGate {
 // quote slightly tighter during warmup to attract fills for calibration,
 // with small size to limit learning cost.
 
+/// **Deprecated**: Replaced by `beta_edge_uncertainty` in log-additive gamma model.
+/// The edge uncertainty feature provides continuous, principled warmup defense
+/// instead of this step function. Kept for backward compatibility during transition.
+///
 /// Spread discount during warmup to attract fills.
 ///
 /// Returns a multiplier [0.85, 1.0] applied to gamma (lower gamma -> tighter spreads).
@@ -361,6 +375,10 @@ pub fn warmup_spread_discount(fill_count: usize) -> f64 {
     }
 }
 
+/// **Deprecated**: Replaced by Kelly `kelly_position_fraction()` with Bayesian prior.
+/// Smooth √n warmup curve replaces discrete [0.3, 0.7, 1.0] steps.
+/// Kept for backward compatibility during transition.
+///
 /// Size multiplier during warmup to limit learning cost.
 ///
 /// Returns a multiplier [0.3, 1.0] applied to target_liquidity.

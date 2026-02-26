@@ -403,6 +403,35 @@ impl ModelEnsemble {
         self.update_count += 1;
     }
 
+    /// Update model weights using realized per-signal Sharpe ratios.
+    ///
+    /// Signals with positive Sharpe get weight proportional to their Sharpe ratio.
+    /// Signals with negative or zero Sharpe get the minimum weight floor.
+    /// This is SNR-proportional weighting, equivalent to mutual information under Gaussian.
+    pub fn update_weights_from_sharpe(&mut self, signal_weights: &[(String, f64)]) {
+        if signal_weights.is_empty() {
+            return; // No data — keep current weights
+        }
+
+        for (i, model) in self.models.iter().enumerate() {
+            let model_name = model.name();
+            if let Some((_, weight)) = signal_weights.iter().find(|(name, _)| name == model_name) {
+                self.weights[i] = weight.max(self.min_weight);
+            } else {
+                // Signal not in positive Sharpe set — use minimum weight
+                self.weights[i] = self.min_weight;
+            }
+        }
+
+        // Renormalize
+        let sum: f64 = self.weights.iter().sum();
+        if sum > 0.0 {
+            for w in &mut self.weights {
+                *w /= sum;
+            }
+        }
+    }
+
     /// Get current model weights.
     pub fn weights(&self) -> &[f64] {
         &self.weights
@@ -582,5 +611,46 @@ mod tests {
         let (edge, _) = model.predict_edge(&state);
         // Should still work without actual spread (backward compat)
         assert!(edge.is_finite(), "edge should be finite");
+    }
+
+    #[test]
+    fn test_update_weights_from_sharpe() {
+        let mut ensemble = ModelEnsemble::new();
+        // Default has 3 models: GLFT, Empirical, Funding
+
+        let signal_weights = vec![
+            ("GLFT".to_string(), 0.7),
+            ("Empirical".to_string(), 0.3),
+            // Funding not present — gets min_weight
+        ];
+
+        ensemble.update_weights_from_sharpe(&signal_weights);
+
+        let w = ensemble.weights();
+        // GLFT should have highest weight
+        assert!(
+            w[0] > w[2],
+            "GLFT should outweigh Funding: {} vs {}",
+            w[0],
+            w[2]
+        );
+        // All weights should be positive
+        for &wi in w {
+            assert!(wi > 0.0, "All weights should be positive");
+        }
+        // Weights should sum to 1.0
+        let sum: f64 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 0.01, "Weights should sum to 1.0: {sum}");
+    }
+
+    #[test]
+    fn test_update_weights_from_sharpe_empty() {
+        let mut ensemble = ModelEnsemble::new();
+        let original_weights = ensemble.weights().to_vec();
+
+        ensemble.update_weights_from_sharpe(&[]);
+
+        // Should keep original weights when no data
+        assert_eq!(ensemble.weights(), &original_weights[..]);
     }
 }

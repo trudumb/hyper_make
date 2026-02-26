@@ -58,10 +58,10 @@ pub const BASE_FLOW_VAR: f64 = 200.0;
 /// Base variance for belief system drift signal.
 pub const BASE_BELIEF_VAR: f64 = 150.0;
 
-/// Minimum posterior variance floor (bps²).
+/// Minimum posterior variance floor ((bps/sec)²).
 /// Prevents overconfidence when many features feed the filter.
-/// At P_MIN=2.0, uncertainty floor is √2 ≈ 1.4 bps — filter can still track
-/// 5+ bps shifts but retains enough uncertainty to reverse within a few cycles.
+/// At P_MIN=2.0, uncertainty floor is √2 ≈ 1.4 bps/sec — filter can still track
+/// 5+ bps/sec shifts but retains enough uncertainty to reverse within a few cycles.
 const P_MIN: f64 = 2.0;
 
 /// Kalman-filtered drift estimator with OU mean-reversion dynamics.
@@ -75,7 +75,7 @@ const P_MIN: f64 = 2.0;
 pub struct KalmanDriftEstimator {
     /// Posterior mean drift (bps/sec).
     state_mean: f64,
-    /// Posterior variance P (bps²).
+    /// Posterior variance P ((bps/sec)²). Kalman state is drift in bps/sec.
     state_variance: f64,
     /// OU mean-reversion rate (1/sec). ~0.02 = 35s half-life.
     theta: f64,
@@ -302,6 +302,8 @@ impl KalmanDriftEstimator {
     }
 
     /// Posterior uncertainty: √P (in bps).
+    /// Returns √P in bps/sec (NOT bps, despite the name).
+    /// The Kalman state tracks drift in bps/sec, so P is (bps/sec)².
     pub fn drift_uncertainty_bps(&self) -> f64 {
         self.state_variance.max(0.0).sqrt()
     }

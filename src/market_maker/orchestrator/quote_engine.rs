@@ -1641,8 +1641,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         if signals.lead_lag_actionable {
             // Real cross-exchange signal from Binance feed
             market_params.lead_lag_signal_bps = signals.combined_skew_bps + position_guard_skew_bps;
-            // Uncapped drift for reservation mid — bounded only by ±95% GLFT half-spread clamp
-            market_params.drift_signal_bps = signals.drift_signal_bps + position_guard_skew_bps;
+            // Uncapped drift for reservation mid — bounded only by ±95% GLFT half-spread clamp.
+            // position_guard_skew goes into lead_lag_signal_bps (quote asymmetry) only,
+            // NOT into drift_signal_bps (reservation mid). GLFT q-term already handles inventory.
+            market_params.drift_signal_bps = signals.drift_signal_bps;
             market_params.lead_lag_confidence = signals.model_confidence;
 
             if signals.combined_skew_bps.abs() > 1.0 {
@@ -1671,7 +1673,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // Amplify momentum signal by confidence (fallback mode)
                     market_params.lead_lag_signal_bps =
                         market_params.momentum_bps * confidence * 0.5;
-                    // Fallback drift = same as skew (no separate uncapped source)
+                    // Fallback drift = same as skew (no separate uncapped source).
+                    // NOTE: drift_signal_bps must be set BEFORE position_guard_skew is added
+                    // to lead_lag_signal_bps at line ~1689. Reordering would leak inventory
+                    // skew into the reservation mid.
                     market_params.drift_signal_bps = market_params.lead_lag_signal_bps;
 
                     if market_params.lead_lag_signal_bps.abs() > 1.0 {
@@ -1876,15 +1881,59 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Phase 3B: Wire direction hysteresis gamma adjustments.
         // Penalizes re-accumulation of previous direction after zero-crossing.
+        // Suppress hysteresis when Bayesian conditions indicate an informed flip —
+        // otherwise hysteresis fights the signal by widening the re-accumulating side.
         {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let adj = self.safety.direction_hysteresis.gamma_adjustments(now_ms);
+
+            // Evaluate whether current position resulted from an informed flip.
+            // If so, suppress hysteresis to avoid fighting Bayesian signal.
+            let penalized = self.safety.direction_hysteresis.penalized_sign();
+            let position = self.position.position();
+            let abs_pos = position.abs();
+            let near_flat_threshold = self.effective_max_position * 0.02;
+            let informed_flip = if abs_pos > near_flat_threshold && penalized != 0 {
+                let raw_drift = market_params.drift_rate_per_sec_raw;
+                // drift_uncertainty_bps is bps/sec; convert to fraction/sec
+                let drift_unc = market_params.drift_uncertainty_bps / 10_000.0;
+                let cp_prob = market_params.changepoint_prob;
+                let p_cont = market_params.continuation_p;
+                let trend_bps = market_params.drift_signal_bps;
+                let trend_conf = market_params.trend_confidence;
+
+                // Drift opposes old direction (the direction that would be re-accumulated)
+                let drift_opposes_old = if penalized > 0 {
+                    // Was long, now short: drift should be negative (confirming short)
+                    raw_drift < 0.0 && raw_drift.abs() > 0.5 * drift_unc.max(1e-10)
+                } else {
+                    // Was short, now long: drift should be positive (confirming long)
+                    raw_drift > 0.0 && raw_drift.abs() > 0.5 * drift_unc.max(1e-10)
+                };
+                let changepoint = cp_prob > 0.3;
+                let continuation_exhausted = p_cont < 0.35;
+                let trend_reversal = if penalized > 0 {
+                    trend_bps < -2.0 && trend_conf > 0.3
+                } else {
+                    trend_bps > 2.0 && trend_conf > 0.3
+                };
+                drift_opposes_old || changepoint || continuation_exhausted || trend_reversal
+            } else {
+                false
+            };
+
+            let adj = self
+                .safety
+                .direction_hysteresis
+                .gamma_adjustments(now_ms, informed_flip);
             market_params.hysteresis_bid_gamma_mult = adj.bid_gamma_mult;
             market_params.hysteresis_ask_gamma_mult = adj.ask_gamma_mult;
-            if adj.bid_gamma_mult > 1.01 || adj.ask_gamma_mult > 1.01 {
+
+            if informed_flip && self.safety.direction_hysteresis.is_active(now_ms) {
+                tracing::debug!("HYSTERESIS: suppressed — informed flip detected");
+            } else if adj.bid_gamma_mult > 1.01 || adj.ask_gamma_mult > 1.01 {
                 tracing::debug!(
                     bid_mult = %format!("{:.2}", adj.bid_gamma_mult),
                     ask_mult = %format!("{:.2}", adj.ask_gamma_mult),
@@ -1892,6 +1941,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 );
             }
         }
+
+        // === EDGE ACCOUNTABILITY: Feed edge/calibration features into gamma ===
+        // These are routed through CalibratedRiskModel as beta_edge_uncertainty and
+        // beta_calibration terms in the log-additive gamma. No new multiplicative layers.
+        market_params.edge_uncertainty = self.tier2.edge_tracker.edge_uncertainty();
+        market_params.calibration_deficit = self.quote_outcome_tracker.calibration_error();
 
         // Apply position-based size reduction from risk checker and drawdown tracker
         let risk_size_mult = self
@@ -1967,19 +2022,37 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         } else {
             unified.max_position_fraction // Clamped to [0.3, 1.0] by unified_regime()
         };
-        // Kelly-aware position scaling (Sprint 5.3): when Kelly tracker recommends
-        // reducing exposure (low win rate or bad odds), scale down position limits.
-        // Gated by kelly_warmed_up() to avoid reducing limits during warmup.
-        let kelly_position_mult = if self.stochastic.stochastic_config.use_kelly_sizing {
-            if let Some(raw_kelly) = self.learning.kelly_recommendation() {
-                // Scale: full Kelly of 0.25 → mult 1.0, Kelly of 0.05 → mult 0.2
-                // Floor at 0.1 to always keep some market presence
-                (raw_kelly / self.stochastic.stochastic_config.kelly_fraction).clamp(0.1, 1.0)
+        // Kelly-derived position scaling with Bayesian prior warmup.
+        // Smooth sqrt(n) curve replaces discrete step function.
+        // Routes through effective_max_position so GLFT inventory penalty handles the rest.
+        let kelly_position_mult = {
+            let n = fill_count as f64;
+            if self.stochastic.stochastic_config.use_kelly_sizing {
+                if let Some(raw_kelly) = self.learning.kelly_recommendation() {
+                    // Kelly warmed up: use real f* from win/loss statistics
+                    (raw_kelly / self.stochastic.stochastic_config.kelly_fraction).clamp(0.3, 1.0)
+                } else {
+                    // Bayesian prior warmup: smooth sqrt(n) curve starting at 0.3
+                    const MIN_PRIOR: f64 = 0.3;
+                    const WARMUP_FILLS: f64 = 50.0;
+                    if n < 1.0 {
+                        MIN_PRIOR
+                    } else {
+                        let progress = (n / WARMUP_FILLS).sqrt().min(1.0);
+                        MIN_PRIOR + (1.0 - MIN_PRIOR) * progress
+                    }
+                }
             } else {
-                1.0 // Not warmed up yet
+                // Kelly disabled: use Bayesian prior warmup only
+                const MIN_PRIOR: f64 = 0.3;
+                const WARMUP_FILLS: f64 = 50.0;
+                if n < 1.0 {
+                    MIN_PRIOR
+                } else {
+                    let progress = (n / WARMUP_FILLS).sqrt().min(1.0);
+                    MIN_PRIOR + (1.0 - MIN_PRIOR) * progress
+                }
             }
-        } else {
-            1.0
         };
         let new_effective =
             margin_effective.min(self.config.max_position) * regime_fraction * kelly_position_mult;

@@ -847,6 +847,12 @@ impl ParameterAggregator {
             tau_inventory_s: sources.tau_inventory_s,
             tau_variance_s2: sources.tau_variance_s2,
             sigma_sq_variance_bma: sources.sigma_sq_variance_bma,
+
+            // === Edge Accountability ===
+            // Defaults set here; actual values computed in quote_engine.rs from
+            // EdgeTracker::edge_uncertainty() and QuoteOutcomeTracker::calibration_error().
+            edge_uncertainty: 0.5,     // Maximum ignorance until wired
+            calibration_deficit: 0.0,  // Assume calibrated until measured
         }
     }
 }

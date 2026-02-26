@@ -198,6 +198,31 @@ impl PerSignalSharpeTracker {
         result
     }
 
+    /// Compute normalized signal weights proportional to positive Sharpe ratios.
+    ///
+    /// ```text
+    /// weight_s = max(0, SR_s) / sum_i max(0, SR_i)
+    /// ```
+    ///
+    /// Signals with negative or zero Sharpe get zero weight.
+    /// Returns empty vec if no signals have positive Sharpe.
+    /// Under Gaussian assumptions, this equals mutual-information weighting.
+    pub fn normalized_signal_weights(&self) -> Vec<(String, f64)> {
+        let sharpes = self.all_sharpes();
+        let positive: Vec<(String, f64)> =
+            sharpes.into_iter().filter(|(_, sr)| *sr > 0.0).collect();
+
+        let total: f64 = positive.iter().map(|(_, sr)| sr).sum();
+        if total < 1e-12 {
+            return Vec::new();
+        }
+
+        positive
+            .into_iter()
+            .map(|(name, sr)| (name, sr / total))
+            .collect()
+    }
+
     /// Human-readable report of per-signal Sharpe ratios.
     pub fn format_report(&self) -> String {
         let sharpes = self.all_sharpes();
@@ -697,5 +722,43 @@ mod tests {
         assert!(!ec.maybe_snapshot(30_000_000_000, 1002.0)); // Still too soon
         assert!(ec.maybe_snapshot(61_000_000_000, 1003.0)); // 60s later
         assert_eq!(ec.snapshot_count(), 2);
+    }
+
+    #[test]
+    fn test_normalized_signal_weights() {
+        let mut tracker = PerSignalSharpeTracker::new();
+        for i in 0..20 {
+            let ts = (i as u64) * 1_000_000_000;
+            tracker.add_signal_return("Good", 5.0 + (i as f64) * 0.1, ts);
+            tracker.add_signal_return("Bad", -2.0 - (i as f64) * 0.1, ts);
+            tracker.add_signal_return("Mediocre", 1.0 + (i as f64) * 0.05, ts);
+        }
+
+        let weights = tracker.normalized_signal_weights();
+        // Bad signal (negative Sharpe) should be excluded
+        assert!(
+            !weights.iter().any(|(name, _)| name == "Bad"),
+            "Negative Sharpe should get zero weight"
+        );
+        // Weights should sum to 1.0 (approximately)
+        let sum: f64 = weights.iter().map(|(_, w)| w).sum();
+        if !weights.is_empty() {
+            assert!((sum - 1.0).abs() < 0.01, "Weights should sum to 1.0: {sum}");
+        }
+    }
+
+    #[test]
+    fn test_normalized_signal_weights_all_negative() {
+        let mut tracker = PerSignalSharpeTracker::new();
+        for i in 0..20 {
+            let ts = (i as u64) * 1_000_000_000;
+            tracker.add_signal_return("Bad1", -3.0 - (i as f64) * 0.1, ts);
+            tracker.add_signal_return("Bad2", -5.0 - (i as f64) * 0.1, ts);
+        }
+        let weights = tracker.normalized_signal_weights();
+        assert!(
+            weights.is_empty(),
+            "All-negative signals should give empty weights"
+        );
     }
 }

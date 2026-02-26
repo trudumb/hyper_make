@@ -214,6 +214,47 @@ impl EdgeTracker {
         false
     }
 
+    /// Edge uncertainty: P(edge <= 0) from Bayesian fill statistics.
+    ///
+    /// Bayesian sufficient statistic:
+    /// ```text
+    /// P(edge > 0) = Phi(mu / (sigma / sqrt(n)))
+    /// edge_uncertainty = 1 - P(edge > 0)
+    /// ```
+    ///
+    /// - No data: returns 0.5 (maximum ignorance)
+    /// - Strong positive edge: -> 0.0
+    /// - Strong negative edge: -> 1.0
+    ///
+    /// Uses gross edge (pre-fee) to avoid fee-drag false alarms.
+    pub fn edge_uncertainty(&self) -> f64 {
+        let n = self.snapshots.len();
+        if n < 3 {
+            return 0.5; // Maximum ignorance — not enough data
+        }
+
+        let mean = self.mean_gross_edge();
+        let n_f = n as f64;
+        let variance = self
+            .snapshots
+            .iter()
+            .map(|s| (s.gross_edge_bps - mean).powi(2))
+            .sum::<f64>()
+            / (n_f - 1.0);
+        let std = variance.sqrt();
+
+        if std < 1e-12 {
+            // Zero variance: if mean > 0, uncertainty ~ 0; if mean <= 0, uncertainty ~ 1
+            return if mean > 0.0 { 0.01 } else { 0.99 };
+        }
+
+        // z-score: mu / (sigma/sqrt(n))
+        let z = mean / (std / n_f.sqrt());
+        // P(edge > 0) = Phi(z) — use normal CDF approximation
+        let p_positive = normal_cdf_approx(z);
+        (1.0 - p_positive).clamp(0.0, 1.0)
+    }
+
     /// Smooth defensive spread multiplier based on gross edge.
     ///
     /// Returns a multiplier in `[1.0, 5.0]`:
@@ -288,6 +329,24 @@ impl EdgeTracker {
             sig,
         )
     }
+}
+
+/// Standard normal CDF approximation (Abramowitz and Stegun).
+fn normal_cdf_approx(x: f64) -> f64 {
+    const A1: f64 = 0.254829592;
+    const A2: f64 = -0.284496736;
+    const A3: f64 = 1.421413741;
+    const A4: f64 = -1.453152027;
+    const A5: f64 = 1.061405429;
+    const P: f64 = 0.3275911;
+
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs() / std::f64::consts::SQRT_2;
+
+    let t = 1.0 / (1.0 + P * x);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-x * x).exp();
+
+    0.5 * (1.0 + sign * y)
 }
 
 impl Default for EdgeTracker {
@@ -684,6 +743,60 @@ mod tests {
         // Original fields preserved
         assert!((resolved.mid_at_placement - 50_000.0).abs() < f64::EPSILON);
         assert!((resolved.realized_edge_bps - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_edge_uncertainty_no_data() {
+        let tracker = EdgeTracker::new();
+        assert!(
+            (tracker.edge_uncertainty() - 0.5).abs() < 0.01,
+            "No data = max ignorance"
+        );
+    }
+
+    #[test]
+    fn test_edge_uncertainty_positive_edge() {
+        let mut tracker = EdgeTracker::new();
+        // 50 fills with consistent positive gross edge
+        for _ in 0..50 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, 3.0, 2.0));
+        }
+        let unc = tracker.edge_uncertainty();
+        assert!(
+            unc < 0.1,
+            "Strong positive edge should give low uncertainty: {unc}"
+        );
+    }
+
+    #[test]
+    fn test_edge_uncertainty_negative_edge() {
+        let mut tracker = EdgeTracker::new();
+        // 50 fills with consistent negative gross edge
+        for _ in 0..50 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, -3.0, -1.5));
+        }
+        let unc = tracker.edge_uncertainty();
+        assert!(
+            unc > 0.9,
+            "Strong negative edge should give high uncertainty: {unc}"
+        );
+    }
+
+    #[test]
+    fn test_edge_uncertainty_mixed() {
+        let mut tracker = EdgeTracker::new();
+        // Mixed edge: some positive, some negative
+        for _ in 0..25 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, 3.0, 2.0));
+        }
+        for _ in 0..25 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, -3.0, -1.5));
+        }
+        let unc = tracker.edge_uncertainty();
+        assert!(
+            unc > 0.2 && unc < 0.8,
+            "Mixed edge should give moderate uncertainty: {unc}"
+        );
     }
 
     #[test]

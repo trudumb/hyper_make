@@ -542,6 +542,42 @@ impl QuoteOutcomeTracker {
         (bias, rmse)
     }
 
+    /// Calibration error: mean |P_predicted(fill) - P_realized(fill)| across bins.
+    ///
+    /// Compares the model-predicted fill rate (from Beta posteriors) with the
+    /// observed fill rate in each bin. Bins with fewer than 10 observations
+    /// are excluded to avoid noise.
+    ///
+    /// Returns a value in [0, 1] where:
+    /// - 0.0 = perfectly calibrated
+    /// - 0.5 = typical for uncalibrated models
+    /// - 1.0 = completely miscalibrated
+    ///
+    /// The factor of 2 stretches the [0, 0.5] natural range to [0, 1].
+    pub fn calibration_error(&self) -> f64 {
+        let mut total_error = 0.0;
+        let mut n_bins = 0;
+
+        for bin in &self.fill_rate.bins {
+            if bin.observed_total < 10 {
+                continue;
+            }
+            // Predicted fill rate from Beta posterior
+            let predicted = bin.alpha / (bin.alpha + bin.beta);
+            // Realized fill rate from raw counts
+            let realized = bin.observed_fills as f64 / bin.observed_total as f64;
+            total_error += (predicted - realized).abs();
+            n_bins += 1;
+        }
+
+        if n_bins == 0 {
+            return 0.0; // No calibrated bins — default to "no deficit"
+        }
+
+        // Scale by 2 to stretch [0, 0.5] natural range to [0, 1]
+        (total_error / n_bins as f64 * 2.0).clamp(0.0, 1.0)
+    }
+
     /// Create a checkpoint of the fill rate bins.
     pub fn to_checkpoint(&self) -> QuoteOutcomeCheckpoint {
         QuoteOutcomeCheckpoint {
@@ -1062,6 +1098,40 @@ mod tests {
         // Still only 1 reconciliation data point
         let (bias2, _) = tracker.epnl_prediction_accuracy();
         assert!((bias2 - 0.5).abs() < 0.01, "Bias unchanged. Got: {}", bias2);
+    }
+
+    #[test]
+    fn test_calibration_error_no_data() {
+        let tracker = QuoteOutcomeTracker::new();
+        assert!((tracker.calibration_error() - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_calibration_error_well_calibrated() {
+        let mut tracker = QuoteOutcomeTracker::new();
+        tracker.update_mid(100.0);
+
+        // 50 quotes at 5 bps, 25 filled (50% rate) — Beta posterior should agree
+        for i in 0..50 {
+            tracker.register_quote(PendingQuote {
+                timestamp_ms: i * 1000,
+                half_spread_bps: 2.5,
+                is_bid: true,
+                state: make_state(100.0),
+                epnl_at_registration: None,
+            });
+        }
+        for _ in 0..25 {
+            tracker.on_fill(true, 1.0);
+        }
+        tracker.expire_old_quotes(100_000);
+
+        let error = tracker.calibration_error();
+        // With 50 observations and posterior mean close to raw rate, error should be small
+        assert!(
+            error < 0.2,
+            "Well-calibrated should have low error: {error}"
+        );
     }
 
     #[test]

@@ -71,6 +71,21 @@ pub struct PriorReadiness {
     pub session_duration_s: f64,
     /// How many of the 5 core estimators met min_observations
     pub estimators_ready: u8,
+
+    /// Mean gross edge (pre-fee) in basis points at assessment time.
+    /// Positive = profitable model, negative = losing model.
+    #[serde(default)]
+    pub mean_gross_edge_bps: f64,
+
+    /// Whether edge is significantly negative (P(edge > 0) < 5% with n >= 10).
+    /// When true, the gate downgrades Ready → Marginal (wider spreads, not blocked).
+    #[serde(default)]
+    pub edge_significantly_negative: bool,
+
+    /// Mean absolute calibration error across fill-rate bins [0, 1].
+    /// 0.0 = perfectly calibrated, 0.5+ = poorly calibrated.
+    #[serde(default)]
+    pub calibration_error: f64,
 }
 
 /// Quote outcome tracker checkpoint for fill rate persistence.

@@ -233,6 +233,9 @@ impl CoefficientEstimator {
                 beta_regime: 1.0,
                 beta_ghost: 0.5,
                 beta_continuation: -0.5,
+                // Edge accountability: not learned from AS data - use defaults
+                beta_edge_uncertainty: 1.5,
+                beta_calibration: 0.8,
                 gamma_min: 0.05,
                 gamma_max: 5.0,
                 n_samples: self.samples.len(),
