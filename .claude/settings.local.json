@@ -83,7 +83,9 @@
       "Bash(cargo nextest:*)",
       "Bash(wait:*)",
       "Bash(sccache:*)",
-      "Bash(cargo install:*)"
+      "Bash(cargo install:*)",
+      "Bash(gh auth:*)",
+      "Bash(git:*)"
     ]
   }
 }
