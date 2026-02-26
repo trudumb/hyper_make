@@ -41,7 +41,8 @@ pub struct HJBConfig {
     pub max_drift_urgency: f64,
 
     /// Minimum continuation probability to apply drift adjustment [0.3, 0.7].
-    /// Below this, momentum is considered noise.
+    /// Phase 3C: Now a soft-gate upper threshold (full weight above this). Deprecated as hard gate.
+    /// Below 0.2, gate is zero. Between 0.2 and this value, gate ramps linearly.
     pub min_continuation_prob: f64,
 
     // === EWMA Smoothing for Stability (Legacy) ===

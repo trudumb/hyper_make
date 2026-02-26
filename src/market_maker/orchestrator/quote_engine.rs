@@ -960,6 +960,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Bayesian fusion of momentum, trend, lead-lag, and flow signals (Phase 5).
         // Falls back to 0.0 when no signals are active (symmetric quotes).
         market_params.drift_rate_per_sec = self.drift_estimator.shrunken_drift_rate_per_sec();
+        // Phase 0B: Wire raw (unshrunk) drift for PPIP. James-Stein shrinkage zeros
+        // any |drift| < √P_MIN ≈ 1.41 bps/sec, but PPIP needs the economic signal
+        // even at 0.028 bps/sec (session average during +33 bps uptrend).
+        market_params.drift_rate_per_sec_raw = self.drift_estimator.drift_rate_per_sec();
         market_params.drift_uncertainty_bps = self.drift_estimator.drift_uncertainty_bps();
 
         // === Directional kappa from trade flow (Phase 3) ===
@@ -1106,6 +1110,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Q19: AS posterior variance for uncertainty premium
             market_params.as_floor_variance_bps2 =
                 self.tier1.adverse_selection.as_floor_variance_bps2();
+            // Phase 3A: Diagnostic logging for AS floor visibility
+            if market_params.as_floor_bps > 0.1 {
+                tracing::trace!(
+                    as_floor_estimator = %format!("{:.2}", as_floor),
+                    as_floor_hwm = %format!("{:.2}", self.as_floor_hwm),
+                    as_floor_effective = %format!("{:.2}", market_params.as_floor_bps),
+                    as_variance = %format!("{:.2}", market_params.as_floor_variance_bps2),
+                    "AS-FLOOR: binding"
+                );
+            }
         }
 
         // Q19: Profile spread floor from SpreadProfile (static safety bound)
@@ -1617,7 +1631,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Record signal contributions for analytics attribution
         self.live_analytics.record_quote_cycle(&signals);
 
-        // Position guard inventory skew (GLFT gamma*sigma^2*q*T) — always additive
+        // Phase 0C: Update position guard with current position before reading skew.
+        // Without this call, inventory_skew_bps() returns 0.0 forever.
+        self.safety
+            .position_guard
+            .update_position(self.position.position());
         let position_guard_skew_bps = self.safety.position_guard.inventory_skew_bps();
 
         if signals.lead_lag_actionable {
@@ -1764,14 +1782,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // an additive risk premium in bps that flows to solve_min_gamma() for self-consistent spreads.
         let mut total_risk_premium = market_params.regime_risk_premium_bps;
 
-        // Hawkes synchronicity addon: 0-3 bps when synchronicity > 0.5
+        // Phase 2A: Hawkes synchronicity addon REMOVED from risk premium.
+        // Was 0-3 bps when sync > 0.5, but double-counts with beta_cascade=1.2
+        // in CalibratedRiskModel (same intensity measure feeds both).
+        // Sync coefficient still logged for diagnostics.
         let sync_coeff = self.stochastic.hawkes_predictor.synchronicity_coefficient();
-        let hawkes_addon_bps = if sync_coeff > 0.5 {
-            3.0 * (sync_coeff - 0.5) * 2.0 // 0-3 bps
-        } else {
-            0.0
-        };
-        total_risk_premium += hawkes_addon_bps;
+        let hawkes_addon_bps = 0.0_f64; // Kept as variable for diagnostic logging
 
         // Toxicity addon: 0-5 bps when composite score > 0.5
         let toxicity_input = ToxicityInput {
@@ -1856,6 +1872,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 sync_coeff = %format!("{:.2}", sync_coeff),
                 "Additive risk premium + risk overlay"
             );
+        }
+
+        // Phase 3B: Wire direction hysteresis gamma adjustments.
+        // Penalizes re-accumulation of previous direction after zero-crossing.
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let adj = self.safety.direction_hysteresis.gamma_adjustments(now_ms);
+            market_params.hysteresis_bid_gamma_mult = adj.bid_gamma_mult;
+            market_params.hysteresis_ask_gamma_mult = adj.ask_gamma_mult;
+            if adj.bid_gamma_mult > 1.01 || adj.ask_gamma_mult > 1.01 {
+                tracing::debug!(
+                    bid_mult = %format!("{:.2}", adj.bid_gamma_mult),
+                    ask_mult = %format!("{:.2}", adj.ask_gamma_mult),
+                    "HYSTERESIS: active gamma penalty"
+                );
+            }
         }
 
         // Apply position-based size reduction from risk checker and drawdown tracker

@@ -1158,6 +1158,16 @@ impl QuotingStrategy for GLFTStrategy {
         let mut half_spread_ask =
             self.half_spread_with_drift(gamma, kappa_ask, sigma, tau, drift_rate, false);
 
+        // Phase 3B: Direction hysteresis per-side widening.
+        // Multiplier > 1.0 on accumulating side → wider spread on that side.
+        // Applied as fraction of base half-spread: Δδ = base × (mult - 1).
+        if market_params.hysteresis_bid_gamma_mult > 1.01 {
+            half_spread_bid *= market_params.hysteresis_bid_gamma_mult;
+        }
+        if market_params.hysteresis_ask_gamma_mult > 1.01 {
+            half_spread_ask *= market_params.hysteresis_ask_gamma_mult;
+        }
+
         // Symmetric half-spread for logging (average of bid/ask)
         let mut half_spread = (half_spread_bid + half_spread_ask) / 2.0;
 
@@ -1507,7 +1517,12 @@ impl QuotingStrategy for GLFTStrategy {
             // We use the dual_timescale controller on self, but since calculate_quotes takes &self,
             // we compute the reservation shift from current params directly
             let ppip_shift = {
-                let drift_mean = market_params.drift_rate_per_sec;
+                // Use raw (unshrunk) drift for PPIP — James-Stein zeros sub-threshold drift
+                // that still has economic significance for position skew.
+                // Soft clamp ±5 bps/sec prevents extreme spike-driven PPIP shifts.
+                let drift_mean = market_params
+                    .drift_rate_per_sec_raw
+                    .clamp(-5.0 / 10_000.0, 5.0 / 10_000.0);
                 let sigma_sq_mean = sigma.powi(2);
                 let tau_mean = market_params.tau_inventory_s.max(1.0);
                 let tau_variance = market_params.tau_variance_s2.max(1.0);

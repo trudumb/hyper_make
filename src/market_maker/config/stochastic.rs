@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_burst_sigma_boost() -> f64 {
+    1.5
+}
+fn default_cascade_cancel_threshold() -> f64 {
+    0.8
+}
+
 /// Method for calculating Kelly time horizon for first-passage fill probability.
 ///
 /// The Kelly-Stochastic optimizer needs a time horizon τ to compute fill probabilities.
@@ -432,6 +439,19 @@ pub struct StochasticConfig {
     ///
     /// Default: 4.0
     pub learned_param_staleness_hours: f64,
+
+    /// Sigma multiplier during fill burst detection.
+    /// With BayesianHawkes feeding gamma, the vol path needs less boost.
+    /// Default: 1.5 (reduced from hardcoded 2.0).
+    #[serde(default = "default_burst_sigma_boost")]
+    pub burst_sigma_boost: f64,
+
+    /// Hawkes intensity ratio threshold for side-cancel circuit breaker.
+    /// Below this: gamma boost only (through beta_cascade).
+    /// At or above: preserve side-cancel as emergency circuit breaker.
+    /// Default: 0.8 (only extreme cascades trigger side-cancel).
+    #[serde(default = "default_cascade_cancel_threshold")]
+    pub cascade_cancel_threshold: f64,
 }
 
 impl Default for StochasticConfig {
@@ -560,6 +580,11 @@ impl Default for StochasticConfig {
             learned_param_min_observations: 100, // Power analysis: N for IR CI width < 0.2
             learned_param_max_cv: 0.5,           // 50% CV acceptable
             learned_param_staleness_hours: 4.0,  // Signal decay half-life
+
+            // Phase 2B: Configurable sigma boost (reduced from hardcoded 2.0)
+            burst_sigma_boost: 1.5,
+            // Phase 2C: Cascade cancel threshold
+            cascade_cancel_threshold: 0.8,
         }
     }
 }

@@ -39,6 +39,7 @@
 
 mod aggregator;
 mod circuit_breaker;
+pub mod direction_hysteresis;
 mod drawdown;
 pub mod exposure_budget;
 mod inventory_governor;
@@ -66,6 +67,7 @@ pub use position_guard::{
 };
 // Note: Side enum is NOT re-exported to avoid conflict with tracking::Side
 // Use position_guard::Side explicitly if needed
+pub use direction_hysteresis::{DirectionHysteresis, HysteresisAdjustment};
 pub use reentry::{ReentryConfig, ReentryManager, ReentryPhase, ReentrySummary};
 pub use state::RiskState;
 

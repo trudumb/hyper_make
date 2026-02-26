@@ -1484,6 +1484,86 @@ impl LadderStrategy {
                 );
             }
 
+            // Phase 0D: Informed Position-Flip Gate
+            // Cap reducing-side liquidity at |position| unless Bayesian conditions support a flip.
+            // Prevents uninformed sweeps through zero — all 3 zero-crossings in the baseline
+            // session were mechanical sweeps with no Bayesian support.
+            let (available_for_bids_gated, available_for_asks_gated) = {
+                let abs_pos = position.abs();
+                let near_flat_threshold = effective_max_position * 0.02; // 2% of max
+
+                if abs_pos > near_flat_threshold {
+                    // Check Bayesian conditions for informed flip
+                    let raw_drift = market_params.drift_rate_per_sec_raw;
+                    let drift_unc = market_params.drift_uncertainty_bps / 10_000.0; // convert to per-sec scale
+                    let cp_prob = market_params.changepoint_prob;
+                    let p_cont = market_params.continuation_p;
+                    let trend_bps = market_params.drift_signal_bps;
+                    let trend_conf = market_params.trend_confidence;
+
+                    // Condition 1: Drift opposes position with Kalman SNR > 0.5
+                    let drift_opposes = if position > 0.0 {
+                        raw_drift < 0.0 && raw_drift.abs() > 0.5 * drift_unc.max(1e-10)
+                    } else {
+                        raw_drift > 0.0 && raw_drift.abs() > 0.5 * drift_unc.max(1e-10)
+                    };
+
+                    // Condition 2: Changepoint detected (BOCD)
+                    let changepoint = cp_prob > 0.3;
+
+                    // Condition 3: Continuation exhausted
+                    let continuation_exhausted = p_cont < 0.35;
+
+                    // Condition 4: Trend reversal with confidence
+                    let trend_reversal = if position > 0.0 {
+                        trend_bps < -2.0 && trend_conf > 0.3
+                    } else {
+                        trend_bps > 2.0 && trend_conf > 0.3
+                    };
+
+                    // Union gate: ANY condition opens
+                    let gate_open =
+                        drift_opposes || changepoint || continuation_exhausted || trend_reversal;
+
+                    if gate_open {
+                        tracing::debug!(
+                            position = %format!("{:.4}", position),
+                            drift_opposes,
+                            changepoint,
+                            continuation_exhausted,
+                            trend_reversal,
+                            "FLIP GATE OPEN: Bayesian conditions support position flip"
+                        );
+                        (local_available_bids, local_available_asks)
+                    } else {
+                        // Gate closed: cap reducing side at |position|
+                        let (capped_bids, capped_asks) = if position > 0.0 {
+                            // Long: asks (selling) are reducing side — cap at position
+                            (local_available_bids, local_available_asks.min(abs_pos))
+                        } else {
+                            // Short: bids (buying) are reducing side — cap at |position|
+                            (local_available_bids.min(abs_pos), local_available_asks)
+                        };
+                        tracing::debug!(
+                            position = %format!("{:.4}", position),
+                            raw_drift = %format!("{:.6}", raw_drift),
+                            cp_prob = %format!("{:.2}", cp_prob),
+                            p_cont = %format!("{:.2}", p_cont),
+                            trend_bps = %format!("{:.1}", trend_bps),
+                            capped_bids = %format!("{:.4}", capped_bids),
+                            capped_asks = %format!("{:.4}", capped_asks),
+                            "FLIP GATE CLOSED: reducing-side capped at |position|"
+                        );
+                        (capped_bids, capped_asks)
+                    }
+                } else {
+                    // Near flat — no gate needed
+                    (local_available_bids, local_available_asks)
+                }
+            };
+            let local_available_bids = available_for_bids_gated;
+            let local_available_asks = available_for_asks_gated;
+
             // 3. Apply exchange-enforced limits (prevents order rejections)
             // Exchange limits are direction-specific: available_buy for bids, available_sell for asks
             let exchange_limits = market_params.exchange_limits();

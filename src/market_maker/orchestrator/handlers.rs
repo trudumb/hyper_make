@@ -982,23 +982,44 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.fill_cascade_tracker
                     .record_fill(fill_side, current_pos, fill_size)
             {
-                // Cascade threshold newly crossed — cancel resting orders on the
-                // accumulating side immediately, before they get filled in the race.
-                let cancel_side = match cascade_event {
-                    CascadeEvent::Widen(s) | CascadeEvent::Suppress(s) => s,
-                };
-                let side_orders = self.orders.get_all_by_side(cancel_side);
-                let oids: Vec<u64> = side_orders.iter().map(|o| o.oid).collect();
-                if !oids.is_empty() {
-                    warn!(
+                // Phase 2C: Graduated cascade response.
+                // Moderate cascade (λ_ratio < threshold): gamma boost only via beta_cascade.
+                // Extreme cascade (λ_ratio ≥ threshold): preserve side-cancel as circuit breaker.
+                let cascade_cancel_threshold = self.config.stochastic.cascade_cancel_threshold;
+                let current_ratio = self.fill_cascade_tracker.max_intensity_ratio();
+
+                if current_ratio >= cascade_cancel_threshold {
+                    // Extreme cascade — preserve side-cancel as emergency circuit breaker
+                    let cancel_side = match cascade_event {
+                        CascadeEvent::Widen(s) | CascadeEvent::Suppress(s) => s,
+                    };
+                    let side_orders = self.orders.get_all_by_side(cancel_side);
+                    let oids: Vec<u64> = side_orders.iter().map(|o| o.oid).collect();
+                    if !oids.is_empty() {
+                        warn!(
+                            side = ?cancel_side,
+                            count = oids.len(),
+                            event = ?cascade_event,
+                            intensity_ratio = %format!("{:.2}", current_ratio),
+                            threshold = %format!("{:.2}", cascade_cancel_threshold),
+                            "EXTREME cascade: side-cancel circuit breaker"
+                        );
+                        self.environment
+                            .cancel_bulk_orders(&self.config.asset, oids)
+                            .await;
+                    }
+                } else {
+                    // Moderate cascade — gamma boost only (through beta_cascade in risk model)
+                    let cancel_side = match cascade_event {
+                        CascadeEvent::Widen(s) | CascadeEvent::Suppress(s) => s,
+                    };
+                    debug!(
                         side = ?cancel_side,
-                        count = oids.len(),
                         event = ?cascade_event,
-                        "Cascade trigger: cancelling resting orders on accumulating side"
+                        intensity_ratio = %format!("{:.2}", current_ratio),
+                        threshold = %format!("{:.2}", cascade_cancel_threshold),
+                        "Moderate cascade: gamma boost only (no side-cancel)"
                     );
-                    self.environment
-                        .cancel_bulk_orders(&self.config.asset, oids)
-                        .await;
                 }
                 // Boost drift estimator responsiveness on cascade events.
                 // 3x process noise → Kalman tracks rapid moves within 2-3 updates.
@@ -1184,11 +1205,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // This teaches the kappa estimator from our own fill intensity,
                 // teaching the kappa estimator from our own fills.
                 let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
+                // Phase 0A: Use mid_at_placement for kappa learning.
+                // Previously passed fill_price as both placement_price and fill_price,
+                // producing distance=0 → kappa inflating from 1500→3000+ after 16 fills.
+                // Now: orchestrator path uses mid-at-placement (depth ≈ half-spread).
                 self.estimator.on_own_fill(
-                    fill.time,  // timestamp_ms
-                    fill_price, // placement_price (best approximation)
-                    fill_price, // fill_price
-                    fill_size, is_buy,
+                    fill.time,        // timestamp_ms
+                    mid_at_placement, // placement_price (mid when order was placed)
+                    fill_price,       // fill_price (actual execution price)
+                    fill_size,
+                    is_buy,
                 );
 
                 // === AS Outcome Queue: Record fill for 5-second markout ===
@@ -1386,6 +1412,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
         }
+
+        // Phase 0C: Update position guard after fill processing.
+        // Without this, inventory_skew_bps() returns 0.0 forever.
+        self.safety
+            .position_guard
+            .update_position(self.position.position());
+
+        // Phase 3B: Update direction hysteresis for zero-crossing detection.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.safety
+            .direction_hysteresis
+            .update_position(self.position.position(), now_ms);
 
         // Record fill volume for rate limit budget calculation
         if result.total_volume_usd > 0.0 {

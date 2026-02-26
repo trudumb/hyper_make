@@ -32,6 +32,17 @@ pub struct SignalObservation {
     pub variance: f64,
 }
 
+/// Snapshot of a signal's contribution to the Kalman posterior.
+#[derive(Debug, Clone)]
+pub struct SignalContribution {
+    /// Signal name identifier.
+    pub name: String,
+    /// Current signal value (bps/sec).
+    pub value_bps_per_sec: f64,
+    /// Variance used in the filter for this signal.
+    pub variance: f64,
+}
+
 // Base variance constants for relative signal weighting.
 // These determine how much each signal contributes to the posterior.
 // CALIBRATION TARGET: replace with empirical MSE from paper trading.
@@ -82,6 +93,15 @@ pub struct KalmanDriftEstimator {
     /// High correlation = fills are echoes of our own quotes (less informative).
     #[serde(default)]
     fill_skew_history: VecDeque<(f64, f64)>,
+
+    /// Last observed signal contributions (for calibration logging).
+    /// Each entry is (name, value_bps_per_sec, variance).
+    #[serde(default)]
+    last_signals: Vec<(String, f64, f64)>,
+
+    /// Last Kalman innovation (z - predicted) for diagnostics.
+    #[serde(default)]
+    last_innovation: f64,
 }
 
 impl KalmanDriftEstimator {
@@ -103,6 +123,8 @@ impl KalmanDriftEstimator {
             prior_variance,
             last_update_ms: 0,
             fill_skew_history: VecDeque::with_capacity(MIN_FILLS_FOR_AUTOCORRELATION + 5),
+            last_signals: Vec::new(),
+            last_innovation: 0.0,
         }
     }
 
@@ -147,8 +169,11 @@ impl KalmanDriftEstimator {
             return;
         }
 
+        let innovation = z - self.state_mean;
+        self.last_innovation = innovation;
+
         let k = self.state_variance / (self.state_variance + r);
-        self.state_mean += k * (z - self.state_mean);
+        self.state_mean += k * innovation;
         self.state_variance *= 1.0 - k;
 
         // P_min floor
@@ -428,6 +453,42 @@ impl KalmanDriftEstimator {
     /// Current fill-skew history length (for diagnostics).
     pub fn fill_skew_history_len(&self) -> usize {
         self.fill_skew_history.len()
+    }
+
+    // === Signal Contribution Tracking ===
+
+    /// Record a signal contribution for calibration logging.
+    ///
+    /// Tracks the last 10 signals per cycle. When the buffer is full it
+    /// clears to make room for the next cycle's signals, preventing
+    /// unbounded growth.
+    pub fn record_signal(&mut self, name: &str, value_bps_per_sec: f64, variance: f64) {
+        if self.last_signals.len() >= 10 {
+            self.last_signals.clear();
+        }
+        self.last_signals
+            .push((name.to_string(), value_bps_per_sec, variance));
+    }
+
+    /// Returns the last observed signal contributions for calibration logging.
+    pub fn signal_contributions(&self) -> Vec<SignalContribution> {
+        self.last_signals
+            .iter()
+            .map(|(name, value, var)| SignalContribution {
+                name: name.clone(),
+                value_bps_per_sec: *value,
+                variance: *var,
+            })
+            .collect()
+    }
+
+    /// Returns the last Kalman innovation (observation - predicted).
+    ///
+    /// Autocorrelation in the innovation sequence indicates model
+    /// miscalibration: a well-specified filter produces white-noise
+    /// innovations.
+    pub fn last_innovation(&self) -> f64 {
+        self.last_innovation
     }
 }
 

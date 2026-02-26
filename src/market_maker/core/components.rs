@@ -181,6 +181,8 @@ pub struct SafetyComponents {
     pub signal_store: FillSignalStore,
     /// Pre-order position guard (hard entry gate)
     pub position_guard: PositionGuard,
+    /// Phase 3B: Direction hysteresis — penalizes re-accumulation after reducing to flat
+    pub direction_hysteresis: crate::market_maker::risk::DirectionHysteresis,
 }
 
 impl SafetyComponents {
@@ -219,6 +221,7 @@ impl SafetyComponents {
             drawdown_tracker: DrawdownTracker::new(drawdown_config, 10_000.0),
             signal_store: FillSignalStore::new(),
             position_guard: PositionGuard::new(max_position, gamma),
+            direction_hysteresis: crate::market_maker::risk::DirectionHysteresis::new(),
         }
     }
 }

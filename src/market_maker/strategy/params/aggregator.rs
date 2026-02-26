@@ -777,7 +777,11 @@ impl ParameterAggregator {
             learned_params_calibrated: sources.learned_params.is_some_and(|l| l.calibrated),
             // Drift rate defaults to 0.0 (no drift); set by KalmanDriftEstimator
             drift_rate_per_sec: 0.0,
+            drift_rate_per_sec_raw: 0.0,
             drift_uncertainty_bps: 0.0,
+            // Phase 3B: Direction hysteresis — defaults neutral, wired from quote_engine
+            hysteresis_bid_gamma_mult: 1.0,
+            hysteresis_ask_gamma_mult: 1.0,
             // Drawdown fraction — set by quote_engine from risk state
             current_drawdown_frac: 0.0,
             // Capital tier — set by quote_engine after build, default Large

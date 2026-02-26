@@ -584,7 +584,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         );
 
         // Build fill cascade tracker before moving config into Self
-        let fill_cascade_tracker = FillCascadeTracker::new_with_config(&config.cascade);
+        let mut fill_cascade_tracker = FillCascadeTracker::new_with_config(&config.cascade);
+        // Phase 2B: Wire configurable sigma boost from stochastic config
+        fill_cascade_tracker.set_sigma_boost(config.stochastic.burst_sigma_boost);
 
         // Capture asset name before config is moved (Sprint 4.1)
         // BTC has no lead-lag against itself — use for_btc() to avoid self-referential model
@@ -1624,6 +1626,8 @@ pub struct FillCascadeTracker {
     suppress_addon_bps: f64,
     burst_sigma_boost_until: Option<std::time::Instant>,
     burst_sigma_boost_duration: std::time::Duration,
+    /// Phase 2B: Configurable sigma boost factor (default 1.5, was hardcoded 2.0).
+    configured_sigma_boost: f64,
     last_level_buy: CascadeLevel,
     last_level_sell: CascadeLevel,
 }
@@ -1655,6 +1659,7 @@ impl FillCascadeTracker {
             suppress_addon_bps: cfg.suppress_addon_bps,
             burst_sigma_boost_until: None,
             burst_sigma_boost_duration: std::time::Duration::from_secs(cfg.burst_sigma_boost_secs),
+            configured_sigma_boost: 1.5, // Default; override via set_sigma_boost()
             last_level_buy: CascadeLevel::None,
             last_level_sell: CascadeLevel::None,
         }
@@ -1828,6 +1833,14 @@ impl FillCascadeTracker {
         false
     }
 
+    /// Phase 2C: Current max intensity ratio across both sides (snapshot, no mutation).
+    /// Used to gate side-cancel: below cascade_cancel_threshold → gamma boost only.
+    pub fn max_intensity_ratio(&self) -> f64 {
+        let buy_ratio = self.hawkes_buy.intensity_ratio_snapshot();
+        let sell_ratio = self.hawkes_sell.intensity_ratio_snapshot();
+        buy_ratio.max(sell_ratio)
+    }
+
     /// Whether sigma boost from burst detection is currently active.
     pub fn sigma_boost_active(&self) -> bool {
         if let Some(expiry) = self.burst_sigma_boost_until {
@@ -1837,13 +1850,19 @@ impl FillCascadeTracker {
         }
     }
 
-    /// Sigma multiplier from burst detection: 2.0 when active, 1.0 otherwise.
+    /// Sigma multiplier from burst detection: configured value when active, 1.0 otherwise.
+    /// Phase 2B: Configurable (default 1.5, was hardcoded 2.0).
     pub fn sigma_boost_factor(&self) -> f64 {
         if self.sigma_boost_active() {
-            2.0
+            self.configured_sigma_boost
         } else {
             1.0
         }
+    }
+
+    /// Set the configured sigma boost factor from StochasticConfig.
+    pub fn set_sigma_boost(&mut self, factor: f64) {
+        self.configured_sigma_boost = factor.max(1.0);
     }
 
     /// Clear expired cooldown.
@@ -2005,8 +2024,8 @@ mod fill_cascade_tests {
             "burst should activate sigma boost"
         );
         assert!(
-            (tracker.sigma_boost_factor() - 2.0).abs() < f64::EPSILON,
-            "sigma boost factor should be 2.0"
+            (tracker.sigma_boost_factor() - 1.5).abs() < f64::EPSILON,
+            "sigma boost factor should be 1.5 (Phase 2B default)"
         );
     }
 

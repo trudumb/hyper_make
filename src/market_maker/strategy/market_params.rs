@@ -961,9 +961,20 @@ pub struct MarketParams {
     /// UNCLAMPED: no ±3 bps cap. Kalman posterior variance naturally bounds.
     pub drift_rate_per_sec: f64,
 
+    /// Raw (unshrunk) drift rate for PPIP, bypasses James-Stein shrinkage.
+    /// Fractional per second, same units as drift_rate_per_sec.
+    pub drift_rate_per_sec_raw: f64,
+
     /// Kalman posterior drift uncertainty √P (bps).
     /// Lower = more confident. Used for logging and E[PnL] confidence.
     pub drift_uncertainty_bps: f64,
+
+    // === Phase 3B: Direction Hysteresis ===
+    /// Bid-side gamma multiplier from hysteresis (>1.0 = wider bids).
+    /// Penalizes re-accumulation of previous direction after zero-crossing.
+    pub hysteresis_bid_gamma_mult: f64,
+    /// Ask-side gamma multiplier from hysteresis (>1.0 = wider asks).
+    pub hysteresis_ask_gamma_mult: f64,
 
     /// Enable per-level E[PnL] filter (replaces binary quote gate).
     /// When true, levels with E[PnL] ≤ 0 are dropped instead of using
@@ -1350,7 +1361,10 @@ impl Default for MarketParams {
             cached_best_ask: 0.0,
             // Drift rate (Kalman)
             drift_rate_per_sec: 0.0,
+            drift_rate_per_sec_raw: 0.0,
             drift_uncertainty_bps: 0.0,
+            hysteresis_bid_gamma_mult: 1.0,
+            hysteresis_ask_gamma_mult: 1.0,
             current_drawdown_frac: 0.0,
             // Capital tier
             capital_tier: CapitalTier::Large,

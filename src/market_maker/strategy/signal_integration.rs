@@ -1127,24 +1127,24 @@ impl SignalIntegrator {
             0.0
         };
 
-        // === INVENTORY SKEW: Hybrid A-S / Linear fallback ===
+        // === INVENTORY SKEW: Warmup-blended A-S / Linear fallback (Phase 4A) ===
         // A-S formula: shift = -q × γ × σ² × τ (in fractional price units)
         // At short horizons with realistic crypto σ (per-second), A-S produces
         // negligible skew (~0.006 bps at pos=7.73, σ=0.000303, γ=0.15, τ=60).
-        // Fallback to direct linear skew (position_fraction × 5 bps) when A-S < 0.5 bps,
-        // ensuring meaningful inventory control at all times.
+        //
+        // Phase 4A: Smooth warmup blend replaces hard 0.5 bps threshold.
+        // Weight ramps from 0 to 1 as A-S magnitude grows, avoiding cliff transition
+        // from "5bps linear" to "near-zero A-S" that loses all skew.
         let inventory_skew_bps = if self.config.use_inventory_skew && self.max_position > 0.0 {
             let as_shift_frac =
                 -self.position * self.as_gamma * self.as_sigma * self.as_sigma * self.as_tau_s;
             let as_shift_bps = as_shift_frac * 10_000.0;
             // Linear fallback: position_fraction × 5 bps (old proven formula)
             let linear_fallback_bps = -(self.position / self.max_position) * 5.0;
-            // Use A-S when it produces meaningful skew, otherwise linear
-            let shift_bps = if as_shift_bps.abs() > 0.5 {
-                as_shift_bps
-            } else {
-                linear_fallback_bps
-            };
+            // Smooth blend: weight ramps from 0 at |AS|=0 to 1 at |AS|≥2 bps
+            // At |AS|=0.5 bps: weight=0.25 (mostly linear). At |AS|=1 bps: weight=0.5.
+            let as_weight = (as_shift_bps.abs() / 2.0).clamp(0.0, 1.0);
+            let shift_bps = as_weight * as_shift_bps + (1.0 - as_weight) * linear_fallback_bps;
             // Safety clamp: prevents crossing even in extreme parameter regimes
             let max_skew_bps = self.config.max_lead_lag_skew_bps * 2.0;
             shift_bps.clamp(-max_skew_bps, max_skew_bps)

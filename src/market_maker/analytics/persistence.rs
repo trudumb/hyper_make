@@ -22,6 +22,7 @@ pub struct AnalyticsLogger {
     edge_writer: BufWriter<File>,
     equity_sharpe_writer: BufWriter<File>,
     gamma_calibration_writer: BufWriter<File>,
+    drift_calibration_writer: BufWriter<File>,
 }
 
 impl AnalyticsLogger {
@@ -46,6 +47,7 @@ impl AnalyticsLogger {
             edge_writer: open_append("edge_validation.jsonl")?,
             equity_sharpe_writer: open_append("equity_sharpe_metrics.jsonl")?,
             gamma_calibration_writer: open_append("gamma_calibration.jsonl")?,
+            drift_calibration_writer: open_append("drift_calibration.jsonl")?,
         })
     }
 
@@ -100,6 +102,15 @@ impl AnalyticsLogger {
         writeln!(self.gamma_calibration_writer, "{json}")
     }
 
+    /// Log a per-signal drift calibration record for offline variance tuning.
+    pub fn log_drift_calibration(
+        &mut self,
+        record: &DriftCalibrationRecord,
+    ) -> std::io::Result<()> {
+        let json = serde_json::to_string(record)?;
+        writeln!(self.drift_calibration_writer, "{json}")
+    }
+
     /// Flush all writers to disk.
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.sharpe_writer.flush()?;
@@ -108,6 +119,7 @@ impl AnalyticsLogger {
         self.edge_writer.flush()?;
         self.equity_sharpe_writer.flush()?;
         self.gamma_calibration_writer.flush()?;
+        self.drift_calibration_writer.flush()?;
         Ok(())
     }
 }
@@ -143,6 +155,61 @@ pub struct GammaCalibrationRecord {
     pub realized_as_bps: f64,
     /// Half-spread at fill time (bps).
     pub spread_bps: f64,
+
+    // === Extended risk features for offline gamma calibration (Phase 1A) ===
+    /// Excess volatility: realized_vol / predicted_vol - 1.0
+    #[serde(default)]
+    pub excess_volatility: f64,
+    /// Inventory fraction: |position| / max_position [0, 1]
+    #[serde(default)]
+    pub inventory_fraction: f64,
+    /// Excess intensity: realized kappa / predicted kappa - 1.0
+    #[serde(default)]
+    pub excess_intensity: f64,
+    /// Depth depletion: fraction of book depleted at best level [0, 1]
+    #[serde(default)]
+    pub depth_depletion: f64,
+    /// Model uncertainty: posterior variance / prior variance [0, 1]
+    #[serde(default)]
+    pub model_uncertainty: f64,
+    /// Position direction confidence from belief system [0, 1]
+    #[serde(default)]
+    pub position_direction_confidence: f64,
+    /// Drawdown fraction: current drawdown / max allowed [0, 1]
+    #[serde(default)]
+    pub drawdown_fraction: f64,
+    /// Regime risk score from CalibratedRiskModel [0, 1]
+    #[serde(default)]
+    pub regime_risk_score: f64,
+    /// Ghost depletion: hidden liquidity depletion estimate [0, 1]
+    #[serde(default)]
+    pub ghost_depletion: f64,
+    /// Continuation probability from position model [0, 1]
+    #[serde(default)]
+    pub continuation_probability: f64,
+}
+
+/// Per-signal record for offline drift variance calibration.
+///
+/// Each markout produces one record per active drift signal. After 2-3 sessions:
+/// 1. Compute per-signal MSE (predicted vs realized) -> replacement variance constants
+/// 2. Run Ljung-Box on innovation sequence -> detect miscalibrated process/observation noise
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DriftCalibrationRecord {
+    /// Timestamp in nanoseconds.
+    pub timestamp_ns: u64,
+    /// Signal name (e.g., "momentum", "trend", "lead_lag", "flow", "belief").
+    pub signal_name: String,
+    /// Predicted drift contribution from this signal (bps/sec).
+    pub predicted_bps: f64,
+    /// Realized drift from markout (bps/sec).
+    pub realized_bps: f64,
+    /// Variance used for this signal in Kalman filter.
+    pub variance_used: f64,
+    /// Innovation: predicted - observed (standard Kalman diagnostic).
+    pub innovation_bps: f64,
+    /// Timestamp of the markout observation (ms).
+    pub innovation_timestamp_ms: u64,
 }
 
 #[cfg(test)]
@@ -174,6 +241,7 @@ mod tests {
         assert!(dir.join("edge_validation.jsonl").exists());
         assert!(dir.join("equity_sharpe_metrics.jsonl").exists());
         assert!(dir.join("gamma_calibration.jsonl").exists());
+        assert!(dir.join("drift_calibration.jsonl").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -202,10 +202,18 @@ impl HJBInventoryController {
         let momentum_threshold = base_threshold * position_factor;
         let momentum_significant = momentum_bps.abs() > momentum_threshold;
 
-        // Accept 0.5 prior during warmup - better to react than ignore
-        let continuation_confident = p_continuation >= self.config.min_continuation_prob;
+        // Phase 3C: Soft continuation gate replaces binary cliff at p=0.5.
+        // beta_continuation=-0.5 already provides continuous scaling.
+        // Soft gate: ramp from 0 at p=0.2 to 1.0 at min_continuation_prob
+        let continuation_gate = if p_continuation >= self.config.min_continuation_prob {
+            1.0
+        } else if p_continuation > 0.2 {
+            (p_continuation - 0.2) / (self.config.min_continuation_prob - 0.2)
+        } else {
+            0.0
+        };
 
-        if !is_opposed || !momentum_significant || !continuation_confident {
+        if !is_opposed || !momentum_significant || continuation_gate < 0.01 {
             // No drift adjustment needed
             return DriftAdjustedSkew {
                 total_skew: base_skew,
@@ -247,7 +255,8 @@ impl HJBInventoryController {
         // Sign: urgency should amplify the base skew direction
         // If short (q < 0), base skew is negative (quotes shift up)
         // Urgency should make it MORE negative (more aggressive buying)
-        let drift_urgency = drift_urgency_magnitude * q.signum();
+        // Phase 3C: Scale by continuation_gate for smooth ramp-in
+        let drift_urgency = drift_urgency_magnitude * q.signum() * continuation_gate;
 
         // === Compute Variance Multiplier ===
         // Use EWMA-smoothed variance multiplier if warmed up for stability
