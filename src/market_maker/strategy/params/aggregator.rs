@@ -851,8 +851,8 @@ impl ParameterAggregator {
             // === Edge Accountability ===
             // Defaults set here; actual values computed in quote_engine.rs from
             // EdgeTracker::edge_uncertainty() and QuoteOutcomeTracker::calibration_error().
-            edge_uncertainty: 0.5,     // Maximum ignorance until wired
-            calibration_deficit: 0.0,  // Assume calibrated until measured
+            edge_uncertainty: 0.5,    // Maximum ignorance until wired
+            calibration_deficit: 0.0, // Assume calibrated until measured
         }
     }
 }

@@ -9,7 +9,7 @@ use crate::Message;
 
 use super::super::{
     adverse_selection::TradeObservation as MicroTradeObs,
-    belief::BeliefUpdate,
+    belief::{BeliefUpdate, EmergencyAction},
     environment::Observation,
     environment::TradingEnvironment,
     estimator::{HmmObservation, MarketEstimator},
@@ -133,6 +133,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         if result.is_some() {
+            // Update event-driven volatility posterior on every mid price change.
+            // This keeps the posterior fresh between fills for accurate sigma estimates.
+            self.event_posteriors.on_mid_update(self.latest_mid);
+
             // Update learning module with current mid for prediction scoring
             self.learning.update_mid(self.latest_mid);
 
@@ -1118,6 +1122,54 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         );
                     }
                 }
+            }
+
+            // === Event-Driven Posterior Update ===
+            // Update conjugate posteriors on EVERY fill, not just at cycle boundaries.
+            // Immediate proxy for adverse selection: spread_capture < 0 means the
+            // fill was on the wrong side of the current mid (adversely selected).
+            let spread_capture = if is_buy {
+                self.latest_mid - fill_price // buy below mid = good
+            } else {
+                fill_price - self.latest_mid // sell above mid = good
+            };
+            let is_adverse = spread_capture < 0.0;
+
+            let emergency_action = self.event_posteriors.on_fill(is_adverse, self.latest_mid);
+
+            // Act on emergency: cancel resting orders on the losing side.
+            // This is the ONLY action between cycles — a circuit breaker, not a quoting decision.
+            match emergency_action {
+                EmergencyAction::CancelResting {
+                    ref reason,
+                    severity,
+                    trigger: _,
+                } => {
+                    warn!(
+                        reason = %reason,
+                        severity = %format!("{:.2}", severity),
+                        position = %format!("{:.6}", self.position.position()),
+                        "EVENT-DRIVEN EMERGENCY: cancelling resting orders"
+                    );
+
+                    // Cancel orders on the side that's accumulating adversely.
+                    // If we're getting filled on bids (is_buy) and it's adverse,
+                    // cancel bids. Vice versa for asks.
+                    let cancel_side = if is_buy { Side::Buy } else { Side::Sell };
+                    let side_orders = self.orders.get_all_by_side(cancel_side);
+                    let oids: Vec<u64> = side_orders.iter().map(|o| o.oid).collect();
+                    if !oids.is_empty() {
+                        warn!(
+                            side = ?cancel_side,
+                            count = oids.len(),
+                            "Emergency posterior cancel: pulling resting orders"
+                        );
+                        self.environment
+                            .cancel_bulk_orders(&self.config.asset, oids)
+                            .await;
+                    }
+                }
+                EmergencyAction::None => {}
             }
         }
 

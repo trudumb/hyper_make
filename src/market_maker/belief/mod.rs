@@ -77,6 +77,7 @@
 pub mod bayesian_fair_value;
 mod central;
 mod messages;
+pub mod posterior;
 mod publisher;
 mod snapshot;
 
@@ -85,6 +86,10 @@ pub use bayesian_fair_value::{
 };
 pub use central::{CentralBeliefConfig, CentralBeliefState};
 pub use messages::{BeliefUpdate, PredictionLog, PredictionType};
+pub use posterior::{
+    EmergencyAction, EmergencyThresholds, EmergencyTrigger, EventPosteriorConfig,
+    EventPosteriorState, PosteriorSnapshot,
+};
 pub use publisher::{BeliefPublisher, PublishError, PublisherHandle};
 pub use snapshot::{
     BeliefSnapshot, BeliefStats, CalibrationMetrics, CalibrationState, ChangepointBeliefs,

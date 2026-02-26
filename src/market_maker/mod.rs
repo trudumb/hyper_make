@@ -443,6 +443,13 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
         crate::market_maker::orchestrator::event_accumulator::CycleStateChanges,
     pub cycle_timer: crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer,
 
+    // === Event-Driven Posterior Updates ===
+    /// Continuous-time Bayesian posteriors updated on every fill event.
+    /// The quote cycle reads `snapshot()` for beliefs; the emergency cancel
+    /// path acts between cycles as a circuit breaker.
+    /// O(1) per event, no allocations, no locks on the hot path.
+    pub(crate) event_posteriors: belief::EventPosteriorState,
+
     // === Cancel-Race AS Tracking (Sprint 6.3) ===
     /// Tracks adverse selection from cancel-race events (cancel sent, fill arrived first).
     /// Excess race AS feeds into spread floor to protect against latency disadvantage.
@@ -731,6 +738,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 crate::market_maker::orchestrator::event_accumulator::CycleStateChanges::default(),
             cycle_timer:
                 crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer::new(),
+            event_posteriors: belief::EventPosteriorState::with_defaults(),
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),
             // Bayesian sigma correction from markout feedback
             covariance_tracker: estimator::covariance_tracker::CovarianceTracker::new(),

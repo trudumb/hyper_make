@@ -433,6 +433,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This replaces scattered reads from beliefs_builder, regime_hmm, and changepoint.
         let belief_snapshot: BeliefSnapshot = self.central_beliefs.snapshot();
 
+        // === EVENT-DRIVEN POSTERIOR SNAPSHOT ===
+        // Read point-in-time snapshot of the continuous-time posteriors.
+        // These are updated on every fill event (not just at cycle boundaries).
+        let posterior_snapshot = self.event_posteriors.snapshot();
+
         // HIP-3: OI cap pre-flight check (fast path for unlimited)
         // This is on the hot path, so we use pre-computed values from runtime config
         let current_position_notional = self.position.position().abs() * self.latest_mid;
@@ -1122,6 +1127,29 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // === Event-Driven Posterior: AS Floor Boost ===
+        // When the continuous-time Beta posterior shows elevated adverse selection
+        // (P95 > 50%), apply a defense-first floor boost. The posterior P95 is
+        // more responsive than the EWMA-based AS estimator since it updates O(1)
+        // on every fill with conjugate Bayesian updates.
+        //
+        // Scaling: AS_P95 [0,1] × realized_sigma_bps gives expected adverse move
+        // in bps, which is the economic cost we need to cover in the spread.
+        if posterior_snapshot.fill_count >= 5 && posterior_snapshot.adverse_rate_p95 > 0.5 {
+            let sigma_bps = posterior_snapshot.sigma_per_s * 10_000.0;
+            let posterior_as_floor_bps = posterior_snapshot.adverse_rate_p95 * sigma_bps;
+            if posterior_as_floor_bps > market_params.as_floor_bps {
+                trace!(
+                    posterior_as_floor_bps = %format!("{:.2}", posterior_as_floor_bps),
+                    existing_as_floor = %format!("{:.2}", market_params.as_floor_bps),
+                    as_rate_p95 = %format!("{:.1}%", posterior_snapshot.adverse_rate_p95 * 100.0),
+                    sigma_bps = %format!("{:.2}", sigma_bps),
+                    "Event posterior AS floor binding"
+                );
+                market_params.as_floor_bps = posterior_as_floor_bps;
+            }
+        }
+
         // Q19: Profile spread floor from SpreadProfile (static safety bound)
         market_params.profile_spread_floor_bps =
             self.config.spread_profile.profile_min_half_spread_bps();
@@ -1321,6 +1349,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     "Belief system: confidence-weighted (bias × conf)"
                 );
             }
+        }
+
+        // === Event-Driven Posterior Diagnostics ===
+        // Log the continuous-time posteriors (updated on every fill, read here at cycle).
+        if posterior_snapshot.fill_count > 0
+            && (self.quote_cycle_count.is_multiple_of(20) || posterior_snapshot.emergency_active)
+        {
+            debug!(
+                fill_intensity = %format!("{:.2}/s", posterior_snapshot.fill_intensity_mean),
+                fill_intensity_p95 = %format!("{:.2}/s", posterior_snapshot.fill_intensity_p95),
+                adverse_rate = %format!("{:.1}%", posterior_snapshot.adverse_rate_mean * 100.0),
+                adverse_rate_p95 = %format!("{:.1}%", posterior_snapshot.adverse_rate_p95 * 100.0),
+                recent_as_rate = %format!("{:.1}%", posterior_snapshot.recent_adverse_rate * 100.0),
+                recent_fills = posterior_snapshot.recent_fill_count,
+                sigma_per_s = %format!("{:.6}", posterior_snapshot.sigma_per_s),
+                total_fills = posterior_snapshot.fill_count,
+                emergency = posterior_snapshot.emergency_active,
+                emergency_score = %format!("{:.3}", posterior_snapshot.emergency_score),
+                "Event-driven posteriors (continuous-time beliefs)"
+            );
         }
 
         // FIX: Wire p_momentum_continue from actual momentum model
