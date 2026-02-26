@@ -433,6 +433,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This replaces scattered reads from beliefs_builder, regime_hmm, and changepoint.
         let belief_snapshot: BeliefSnapshot = self.central_beliefs.snapshot();
 
+        // Posterior-driven reduce-only: wrong-way position vs strong directional belief
+        {
+            let posterior_threshold = self.inventory_governor.posterior_reduce_only_prob();
+            let pos = self.position.position();
+            if (belief_snapshot.drift_vol.prob_bearish > posterior_threshold && pos > 0.0)
+                || (belief_snapshot.drift_vol.prob_bullish > posterior_threshold && pos < 0.0)
+            {
+                risk_reduce_only = true;
+                info!(
+                    prob_bearish = %format!("{:.3}", belief_snapshot.drift_vol.prob_bearish),
+                    prob_bullish = %format!("{:.3}", belief_snapshot.drift_vol.prob_bullish),
+                    position = %format!("{:.4}", pos),
+                    threshold = %format!("{:.2}", posterior_threshold),
+                    "Posterior reduce-only: strong directional belief against position"
+                );
+            }
+        }
+
         // HIP-3: OI cap pre-flight check (fast path for unlimited)
         // This is on the hot path, so we use pre-computed values from runtime config
         let current_position_notional = self.position.position().abs() * self.latest_mid;

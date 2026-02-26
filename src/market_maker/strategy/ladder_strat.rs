@@ -832,8 +832,15 @@ impl LadderStrategy {
         // 2. Continuous inventory penalty (q * gamma * sigma^2 * T)
         // 3. Funding carry
 
-        // 1. Drift — uncapped signal, bounded only by ±95% GLFT half-spread clamp below
-        let drift_shift_bps = market_params.drift_signal_bps;
+        // 1. Drift — posterior primary, signal additive
+        // Primary: μ_posterior × horizon (Bayesian belief system)
+        // Units: (frac/sec) × sec × 10000 × [0,1] = bps
+        let posterior_drift_bps = market_params.belief_predictive_bias
+            * time_horizon
+            * 10_000.0
+            * market_params.belief_confidence;
+        // Secondary: lead-lag / CUSUM fast overlay (50-500ms microstructure)
+        let drift_shift_bps = posterior_drift_bps + market_params.drift_signal_bps;
 
         // 2. Inventory Penalty
         // gamma has regime & beta_inventory applied natively via effective_gamma
@@ -859,15 +866,19 @@ impl LadderStrategy {
 
         let reservation_mid = market_params.microprice * (1.0 + shift_fraction);
 
-        // SAFETY: Bound skewed mid within 95% of GLFT half-spread to prevent crossing.
+        // SAFETY: Bound skewed mid within 2× GLFT half-spread.
+        // At max shift (2×, bullish): touch_bid = mid + hs (aggressive), touch_ask = mid + 3×hs (conservative).
         let glft_half_spread_frac = self.depth_generator.glft_optimal_spread(gamma, kappa);
-        let half_spread_bound = glft_half_spread_frac * 0.95;
+        let half_spread_bound = glft_half_spread_frac * 2.0;
         let max_mid = market_params.market_mid * (1.0 + half_spread_bound);
         let min_mid = market_params.market_mid * (1.0 - half_spread_bound);
         let effective_mid = reservation_mid.clamp(min_mid, max_mid);
 
         if total_shift_bps.abs() > 0.5 {
             tracing::debug!(
+                posterior_drift_bps = %format!("{:.2}", posterior_drift_bps),
+                signal_drift_bps = %format!("{:.2}", market_params.drift_signal_bps),
+                belief_confidence = %format!("{:.3}", market_params.belief_confidence),
                 drift_bps = %format!("{:.2}", drift_shift_bps),
                 inv_penalty_bps = %format!("{:.2}", inv_penalty_bps),
                 funding_carry_bps = %format!("{:.2}", funding_carry_bps),
@@ -3901,7 +3912,7 @@ mod tests {
         };
         params.capital_policy.use_tick_grid = false; // Force non-tick-grid path for reservation mid testing
 
-        // Bullish drift (reservation mid reads drift_signal_bps)
+        // Bullish drift via signal (posterior is zero by default)
         params.drift_signal_bps = 5.0; // 5 bps upward drift
         let ladder = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         let bid_price_drift = ladder.bids.first().map(|l| l.price).unwrap_or(0.0);
@@ -4036,8 +4047,8 @@ mod tests {
     #[test]
     fn test_drift_above_old_skew_cap_shifts_reservation_mid() {
         // WS6: Drift > 5 bps (old max_lead_lag_skew_bps cap) should shift reservation mid.
-        // The ±95% GLFT half-spread clamp is the only bound.
-        // Use kappa=200 so GLFT half-spread ≈ 50 bps → clamp at ±47.5 bps allows both test values through.
+        // The ±2× GLFT half-spread clamp is the only bound.
+        // Use kappa=200 so GLFT half-spread ≈ 50 bps → clamp at ±100 bps allows both test values through.
         let strategy = LadderStrategy::new(0.1);
         let config = QuoteConfig {
             mid_price: 100.0,
@@ -4075,6 +4086,235 @@ mod tests {
         assert!(
             avg_bid_15 > avg_bid_5,
             "Drift > old 5 bps cap should shift reservation mid further. avg@5bps={avg_bid_5:.4}, avg@15bps={avg_bid_15:.4}",
+        );
+    }
+
+    // --- Posterior Drift Tests ---
+
+    #[test]
+    fn test_posterior_drift_shifts_reservation_mid() {
+        // Posterior drift with confidence should shift bid prices up (bullish).
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams {
+            microprice: 100.0,
+            market_mid: 100.0,
+            margin_available: 1000.0,
+            leverage: 1.0,
+            sigma: 0.005,
+            kappa: 2000.0,
+            arrival_intensity: 0.5,
+            cached_best_bid: 99.95,
+            cached_best_ask: 100.05,
+            ..Default::default()
+        };
+        params.capital_policy.use_tick_grid = false;
+
+        // Bullish posterior: bias > 0, confidence = 0.8, signal drift = 0
+        params.belief_predictive_bias = 0.01; // 1% per second upward
+        params.belief_confidence = 0.8;
+        params.drift_signal_bps = 0.0;
+        let ladder_posterior = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let bid_price_posterior = ladder_posterior
+            .bids
+            .first()
+            .map(|l| l.price)
+            .unwrap_or(0.0);
+
+        // No posterior
+        params.belief_predictive_bias = 0.0;
+        params.belief_confidence = 0.0;
+        let ladder_baseline = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let bid_price_baseline = ladder_baseline.bids.first().map(|l| l.price).unwrap_or(0.0);
+
+        assert!(
+            bid_price_posterior > bid_price_baseline,
+            "Posterior bullish drift should raise bid prices. posterior={bid_price_posterior}, baseline={bid_price_baseline}"
+        );
+    }
+
+    #[test]
+    fn test_posterior_drift_gated_by_confidence() {
+        // Zero confidence should gate the posterior — no shift even with large bias.
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams {
+            microprice: 100.0,
+            market_mid: 100.0,
+            margin_available: 1000.0,
+            leverage: 1.0,
+            sigma: 0.005,
+            kappa: 2000.0,
+            arrival_intensity: 0.5,
+            cached_best_bid: 99.95,
+            cached_best_ask: 100.05,
+            ..Default::default()
+        };
+        params.capital_policy.use_tick_grid = false;
+
+        // Large bias but zero confidence
+        params.belief_predictive_bias = 0.01;
+        params.belief_confidence = 0.0;
+        params.drift_signal_bps = 0.0;
+        let ladder_gated = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+
+        // No posterior at all
+        params.belief_predictive_bias = 0.0;
+        params.belief_confidence = 0.0;
+        let ladder_baseline = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+
+        let avg_bid_gated: f64 = ladder_gated.bids.iter().map(|l| l.price).sum::<f64>()
+            / ladder_gated.bids.len().max(1) as f64;
+        let avg_bid_baseline: f64 = ladder_baseline.bids.iter().map(|l| l.price).sum::<f64>()
+            / ladder_baseline.bids.len().max(1) as f64;
+
+        assert!(
+            (avg_bid_gated - avg_bid_baseline).abs() < 1e-8,
+            "Zero confidence should gate posterior — no shift. gated={avg_bid_gated:.6}, baseline={avg_bid_baseline:.6}"
+        );
+    }
+
+    #[test]
+    fn test_posterior_plus_signal_drift_additive() {
+        // Both posterior and signal positive — combined depth asymmetry should exceed either alone.
+        // With asymmetric-depths architecture, positive drift → tighter bids, wider asks.
+        // Measured via touch-level depth difference (ask_touch_depth - bid_touch_depth).
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams {
+            microprice: 100.0,
+            market_mid: 100.0,
+            margin_available: 1000.0,
+            leverage: 1.0,
+            sigma: 0.005,
+            kappa: 200.0,
+            arrival_intensity: 0.5,
+            cached_best_bid: 99.90,
+            cached_best_ask: 100.10,
+            ..Default::default()
+        };
+        params.capital_policy.use_tick_grid = false;
+
+        // Helper: measure touch-level asymmetry (ask_depth - bid_depth) in bps from mid.
+        let touch_asymmetry = |ladder: &crate::market_maker::quoting::ladder::Ladder| -> f64 {
+            let mid = 100.0;
+            let bid_depth = ladder
+                .bids
+                .first()
+                .map(|l| (mid - l.price) / mid * 10_000.0)
+                .unwrap_or(0.0);
+            let ask_depth = ladder
+                .asks
+                .first()
+                .map(|l| (l.price - mid) / mid * 10_000.0)
+                .unwrap_or(0.0);
+            ask_depth - bid_depth
+        };
+
+        // Use small drifts to avoid clamp interactions.
+        // posterior = signum(0.001) * 0.005 * 10000 * 0.05 = 2.5 bps
+        // signal = 2.0 bps, combined = 4.5 bps (GLFT δ* ≈ 50 bps, plenty of room)
+
+        // Baseline
+        params.belief_predictive_bias = 0.0;
+        params.belief_confidence = 0.0;
+        params.drift_signal_bps = 0.0;
+        let ladder_base = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let asym_base = touch_asymmetry(&ladder_base);
+
+        // Posterior only (2.5 bps shift)
+        params.belief_predictive_bias = 0.001;
+        params.belief_confidence = 0.05;
+        params.drift_signal_bps = 0.0;
+        let ladder_post = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let asym_post = touch_asymmetry(&ladder_post);
+
+        // Signal only (2.0 bps shift)
+        params.belief_predictive_bias = 0.0;
+        params.belief_confidence = 0.0;
+        params.drift_signal_bps = 2.0;
+        let ladder_sig = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let asym_sig = touch_asymmetry(&ladder_sig);
+
+        // Both (4.5 bps shift)
+        params.belief_predictive_bias = 0.001;
+        params.belief_confidence = 0.05;
+        params.drift_signal_bps = 2.0;
+        let ladder_both = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let asym_both = touch_asymmetry(&ladder_both);
+
+        // Positive drift → wider asks than bids
+        assert!(
+            asym_post > asym_base,
+            "Posterior drift should create asymmetry. post={asym_post:.4}, base={asym_base:.4}"
+        );
+        assert!(
+            asym_sig > asym_base,
+            "Signal drift should create asymmetry. sig={asym_sig:.4}, base={asym_base:.4}"
+        );
+        assert!(
+            asym_both > asym_post,
+            "Combined should exceed posterior alone. both={asym_both:.4}, post={asym_post:.4}"
+        );
+        assert!(
+            asym_both > asym_sig,
+            "Combined should exceed signal alone. both={asym_both:.4}, sig={asym_sig:.4}"
+        );
+    }
+
+    #[test]
+    fn test_posterior_drift_capped_at_2x_spread() {
+        // Extreme posterior bias should be clamped by the ±2× half-spread bound.
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams {
+            microprice: 100.0,
+            market_mid: 100.0,
+            margin_available: 1000.0,
+            leverage: 1.0,
+            sigma: 0.005,
+            kappa: 2000.0,
+            arrival_intensity: 0.5,
+            cached_best_bid: 99.95,
+            cached_best_ask: 100.05,
+            ..Default::default()
+        };
+        params.capital_policy.use_tick_grid = false;
+
+        // Extreme bullish posterior — would be hundreds of bps without clamping
+        params.belief_predictive_bias = 1.0; // 100%/sec — absurd, tests the clamp
+        params.belief_confidence = 1.0;
+        params.drift_signal_bps = 0.0;
+        let ladder = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+
+        let bid_price = ladder.bids.first().map(|l| l.price).unwrap_or(0.0);
+
+        // Even with extreme drift, the 2× half-spread clamp keeps bids sane.
+        // The effective_mid can be at most market_mid * (1 + 2 * glft_half_spread).
+        // Bid is effective_mid - half_spread, which should still be near market_mid.
+        assert!(
+            bid_price < 100.10,
+            "Extreme posterior drift must be clamped. bid_price={bid_price}"
         );
     }
 }

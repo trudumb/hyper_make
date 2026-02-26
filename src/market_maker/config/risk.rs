@@ -135,6 +135,14 @@ pub struct CascadeConfig {
     pub suppress_cooldown_secs: u64,
     /// Duration in seconds for sigma boost after burst detected.
     pub burst_sigma_boost_secs: u64,
+
+    // === Count-based burst detection ===
+    /// Number of same-side fills to trigger count-based burst cancel (default: 4).
+    pub burst_count_threshold: usize,
+    /// Time window in seconds for count-based burst detection (default: 2).
+    pub burst_count_window_secs: u64,
+    /// Cooldown in seconds after burst-cancel before next can fire (default: 5).
+    pub burst_cancel_cooldown_secs: u64,
 }
 
 impl Default for CascadeConfig {
@@ -152,6 +160,9 @@ impl Default for CascadeConfig {
             widen_cooldown_secs: 15,
             suppress_cooldown_secs: 30,
             burst_sigma_boost_secs: 30,
+            burst_count_threshold: 4,
+            burst_count_window_secs: 2,
+            burst_cancel_cooldown_secs: 5,
         }
     }
 }
@@ -267,6 +278,11 @@ pub struct GovernorConfig {
     /// Milder than Kill zone but still attracts reducing fills.
     #[serde(default = "default_red_reducing_addon")]
     pub red_reducing_addon_bps: f64,
+    /// Posterior probability threshold to trigger reduce-only mode.
+    /// When directional belief exceeds this against current position,
+    /// stop adding to the losing side before mechanical limits trigger.
+    #[serde(default = "default_posterior_reduce_only_prob")]
+    pub posterior_reduce_only_prob: f64,
 }
 
 fn default_kill_reducing_addon() -> f64 {
@@ -275,6 +291,10 @@ fn default_kill_reducing_addon() -> f64 {
 
 fn default_red_reducing_addon() -> f64 {
     15.0
+}
+
+fn default_posterior_reduce_only_prob() -> f64 {
+    0.85
 }
 
 impl Default for GovernorConfig {
@@ -287,6 +307,7 @@ impl Default for GovernorConfig {
             kill_addon_bps: 25.0,
             kill_reducing_addon_bps: 25.0,
             red_reducing_addon_bps: 15.0,
+            posterior_reduce_only_prob: 0.85,
         }
     }
 }

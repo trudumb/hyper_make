@@ -1630,6 +1630,13 @@ pub struct FillCascadeTracker {
     configured_sigma_boost: f64,
     last_level_buy: CascadeLevel,
     last_level_sell: CascadeLevel,
+    // Count-based burst detection (parallel to Hawkes intensity)
+    burst_ring_buy: std::collections::VecDeque<std::time::Instant>,
+    burst_ring_sell: std::collections::VecDeque<std::time::Instant>,
+    burst_count_threshold: usize,
+    burst_count_window: std::time::Duration,
+    burst_cancel_cooldown_until: Option<std::time::Instant>,
+    burst_cancel_cooldown: std::time::Duration,
 }
 
 impl FillCascadeTracker {
@@ -1662,6 +1669,12 @@ impl FillCascadeTracker {
             configured_sigma_boost: 1.5, // Default; override via set_sigma_boost()
             last_level_buy: CascadeLevel::None,
             last_level_sell: CascadeLevel::None,
+            burst_ring_buy: std::collections::VecDeque::new(),
+            burst_ring_sell: std::collections::VecDeque::new(),
+            burst_count_threshold: cfg.burst_count_threshold,
+            burst_count_window: std::time::Duration::from_secs(cfg.burst_count_window_secs),
+            burst_cancel_cooldown_until: None,
+            burst_cancel_cooldown: std::time::Duration::from_secs(cfg.burst_cancel_cooldown_secs),
         }
     }
 
@@ -1833,6 +1846,48 @@ impl FillCascadeTracker {
         false
     }
 
+    /// Count-based burst detection: N+ same-side fills within window → emergency cancel trigger.
+    /// Has its own cooldown to prevent repeated cancel storms.
+    /// Complements Hawkes intensity-based detection by catching sustained-level bursts.
+    pub fn check_count_burst(&mut self, side: Side) -> bool {
+        // Respect cooldown
+        if let Some(expiry) = self.burst_cancel_cooldown_until {
+            if std::time::Instant::now() < expiry {
+                return false;
+            }
+        }
+        let ring = match side {
+            Side::Buy => &mut self.burst_ring_buy,
+            Side::Sell => &mut self.burst_ring_sell,
+        };
+        let now = std::time::Instant::now();
+        ring.push_back(now);
+        // Evict expired entries
+        while ring
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > self.burst_count_window)
+        {
+            ring.pop_front();
+        }
+        if ring.len() >= self.burst_count_threshold {
+            self.burst_cancel_cooldown_until = Some(now + self.burst_cancel_cooldown);
+            ring.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Accessor for burst count threshold (for logging in handler).
+    pub fn burst_count_threshold(&self) -> usize {
+        self.burst_count_threshold
+    }
+
+    /// Accessor for burst count window in seconds (for logging in handler).
+    pub fn burst_count_window_secs(&self) -> u64 {
+        self.burst_count_window.as_secs()
+    }
+
     /// Phase 2C: Current max intensity ratio across both sides (snapshot, no mutation).
     /// Used to gate side-cancel: below cascade_cancel_threshold → gamma boost only.
     pub fn max_intensity_ratio(&self) -> f64 {
@@ -1902,6 +1957,9 @@ mod fill_cascade_tests {
             widen_cooldown_secs: 15,
             suppress_cooldown_secs: 30,
             burst_sigma_boost_secs: 30,
+            burst_count_threshold: 4,
+            burst_count_window_secs: 2,
+            burst_cancel_cooldown_secs: 5,
         }
     }
 
@@ -2087,5 +2145,109 @@ mod fill_cascade_tests {
             cfg3.validate().is_err(),
             "suppress <= widen ratio should fail"
         );
+    }
+
+    // === Count-based burst detection tests ===
+
+    fn count_burst_config() -> CascadeConfig {
+        let mut cfg = test_cascade_config();
+        cfg.burst_count_threshold = 4;
+        cfg.burst_count_window_secs = 2;
+        cfg.burst_cancel_cooldown_secs = 5;
+        cfg
+    }
+
+    #[test]
+    fn test_count_burst_below_threshold_no_trigger() {
+        // 3 fills in window (threshold is 4) → no trigger
+        let mut tracker = FillCascadeTracker::new_with_config(&count_burst_config());
+        assert!(!tracker.check_count_burst(Side::Buy));
+        assert!(!tracker.check_count_burst(Side::Buy));
+        assert!(!tracker.check_count_burst(Side::Buy));
+    }
+
+    #[test]
+    fn test_count_burst_at_threshold_triggers() {
+        // 4 fills in window → triggers
+        let mut tracker = FillCascadeTracker::new_with_config(&count_burst_config());
+        assert!(!tracker.check_count_burst(Side::Buy));
+        assert!(!tracker.check_count_burst(Side::Buy));
+        assert!(!tracker.check_count_burst(Side::Buy));
+        assert!(
+            tracker.check_count_burst(Side::Buy),
+            "4th fill should trigger count burst"
+        );
+    }
+
+    #[test]
+    fn test_count_burst_exceeds_window_no_trigger() {
+        // 4 fills but spread across > 2s window → no trigger
+        let mut cfg = count_burst_config();
+        cfg.burst_count_window_secs = 1; // tight 1s window
+        let mut tracker = FillCascadeTracker::new_with_config(&cfg);
+        assert!(!tracker.check_count_burst(Side::Sell));
+        assert!(!tracker.check_count_burst(Side::Sell));
+        // Sleep past window
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!tracker.check_count_burst(Side::Sell));
+        // Only 1 fill in window now (previous 2 expired), 4th is actually 2nd in window
+        assert!(
+            !tracker.check_count_burst(Side::Sell),
+            "fills outside window should not count"
+        );
+    }
+
+    #[test]
+    fn test_count_burst_cooldown_blocks_retrigger() {
+        // After trigger, 4 more fills within 5s cooldown → no trigger
+        let mut tracker = FillCascadeTracker::new_with_config(&count_burst_config());
+        // First burst
+        for _ in 0..3 {
+            assert!(!tracker.check_count_burst(Side::Buy));
+        }
+        assert!(
+            tracker.check_count_burst(Side::Buy),
+            "first burst should trigger"
+        );
+        // Second burst during cooldown
+        for _ in 0..4 {
+            assert!(
+                !tracker.check_count_burst(Side::Buy),
+                "should not trigger during cooldown"
+            );
+        }
+    }
+
+    #[test]
+    fn test_count_burst_cooldown_expires_allows_retrigger() {
+        // After cooldown expires, next burst triggers
+        let mut cfg = count_burst_config();
+        cfg.burst_cancel_cooldown_secs = 1; // short cooldown for test
+        let mut tracker = FillCascadeTracker::new_with_config(&cfg);
+        // First burst
+        for _ in 0..3 {
+            assert!(!tracker.check_count_burst(Side::Sell));
+        }
+        assert!(tracker.check_count_burst(Side::Sell), "first burst");
+        // Wait for cooldown to expire
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Second burst should trigger
+        for _ in 0..3 {
+            assert!(!tracker.check_count_burst(Side::Sell));
+        }
+        assert!(
+            tracker.check_count_burst(Side::Sell),
+            "should trigger after cooldown expires"
+        );
+    }
+
+    #[test]
+    fn test_count_burst_sides_independent() {
+        // 3 buy + 3 sell = no trigger on either side (threshold is 4)
+        let mut tracker = FillCascadeTracker::new_with_config(&count_burst_config());
+        for _ in 0..3 {
+            assert!(!tracker.check_count_burst(Side::Buy));
+            assert!(!tracker.check_count_burst(Side::Sell));
+        }
     }
 }

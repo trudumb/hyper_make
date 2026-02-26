@@ -1033,6 +1033,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.drift_estimator.boost_responsiveness(2.0);
             }
 
+            // Count-based burst detection: 4+ same-side fills in 2s → emergency cancel.
+            // Parallel to Hawkes-based cascade detection — catches sustained-level bursts
+            // where intensity stays elevated but doesn't newly escalate.
+            if self.fill_cascade_tracker.check_count_burst(fill_side) {
+                let side_orders = self.orders.get_all_by_side(fill_side);
+                let oids: Vec<u64> = side_orders.iter().map(|o| o.oid).collect();
+                if !oids.is_empty() {
+                    warn!(
+                        side = ?fill_side,
+                        count = oids.len(),
+                        burst_count = self.fill_cascade_tracker.burst_count_threshold(),
+                        window_secs = self.fill_cascade_tracker.burst_count_window_secs(),
+                        "BURST CANCEL: count-based burst — emergency side-cancel"
+                    );
+                    self.environment
+                        .cancel_bulk_orders(&self.config.asset, oids)
+                        .await;
+                }
+            }
+
             // WS4: Feed cascade events to BayesianHawkes for posterior updating.
             // Magnitude = 1.0 per fill; accumulating fills are cascade-relevant.
             let is_accumulating = (is_buy && current_pos > 0.0) || (!is_buy && current_pos < 0.0);

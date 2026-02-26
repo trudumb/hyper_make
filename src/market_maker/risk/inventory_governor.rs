@@ -213,6 +213,11 @@ impl InventoryGovernor {
         self.max_position
     }
 
+    /// Returns the posterior probability threshold for reduce-only mode.
+    pub fn posterior_reduce_only_prob(&self) -> f64 {
+        self.config.posterior_reduce_only_prob
+    }
+
     /// Classify current position into a zone and compute constraints.
     pub fn assess(&self, position: f64) -> PositionAssessment {
         let abs_pos = position.abs();
