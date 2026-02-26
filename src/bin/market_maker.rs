@@ -2919,6 +2919,76 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     // Paper balance uses CLI --paper-balance (default $1000) for consistent auto-derive.
     market_maker = market_maker.with_paper_balance(paper_balance);
 
+    // Wire WebSocket dashboard (same as live path)
+    let dashboard_ws_state = Arc::new(hyperliquid_rust_sdk::DashboardWsState::new(
+        hyperliquid_rust_sdk::DashboardWsConfig::default(),
+    ));
+    market_maker = market_maker.with_dashboard_ws(dashboard_ws_state.clone());
+
+    // Start HTTP metrics + WS dashboard server for paper mode
+    let metrics_port = cli.metrics_port.unwrap_or(config.monitoring.metrics_port);
+    if config.monitoring.enable_http_metrics && metrics_port > 0 {
+        let prometheus = market_maker.prometheus().clone();
+        let asset_for_metrics = asset.clone();
+        let ws_state_for_server = dashboard_ws_state.clone();
+
+        tokio::spawn(async move {
+            let prometheus_for_dashboard = prometheus.clone();
+
+            let cors = CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any);
+
+            let app = Router::new()
+                .route(
+                    "/metrics",
+                    get(move || {
+                        let prom = prometheus.clone();
+                        let asset = asset_for_metrics.clone();
+                        async move { prom.to_prometheus_text(&asset, "USDC") }
+                    }),
+                )
+                .route(
+                    "/api/dashboard",
+                    get(move || {
+                        let prom = prometheus_for_dashboard.clone();
+                        async move { Json(prom.to_dashboard_state()) }
+                    }),
+                )
+                .merge(
+                    Router::new()
+                        .route(
+                            "/ws/dashboard",
+                            axum::routing::get(hyperliquid_rust_sdk::ws_handler),
+                        )
+                        .with_state(ws_state_for_server),
+                )
+                .route("/healthz", get(|| async { axum::http::StatusCode::OK }))
+                .route("/readyz", get(|| async { axum::http::StatusCode::OK }))
+                .layer(cors);
+
+            let addr = format!("127.0.0.1:{metrics_port}");
+            info!(
+                port = metrics_port,
+                bind = "127.0.0.1",
+                mode = "paper",
+                "Starting dashboard + metrics server"
+            );
+
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        warn!(error = %e, "Metrics server error");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, port = metrics_port, "Failed to bind metrics port");
+                }
+            }
+        });
+    }
+
     // Run with optional duration
     if duration > 0 {
         info!(duration_s = duration, "Paper trading with time limit");
