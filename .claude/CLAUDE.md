@@ -22,6 +22,13 @@ cargo nextest run                       # 3. Run tests (isolated processes, OOM-
 
 **Resource constraint**: One cargo command at a time (hook-enforced mutex). Sequential only — concurrent builds crash the machine.
 
+**BANNED: Full-suite `cargo test` / `cargo nextest run`** — Do NOT run the full test suite unless the user explicitly asks for it. The full suite is slow and resource-intensive. Instead, run only the specific test(s) relevant to your change:
+```bash
+cargo nextest run -E 'test(specific_test_name)'   # Single test
+cargo nextest run -p specific_package              # Single crate
+cargo test --lib -p specific_package               # Lib tests only for one crate
+```
+
 IMPORTANT: After any code change, run `cargo fmt --all -- --check` then `cargo clippy --all-targets -- -D warnings` and fix all issues before considering the task done.
 
 ## Structure
