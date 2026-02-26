@@ -1383,6 +1383,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // PHASE 4: Now using centralized belief snapshot instead of scattered reads
                 let regime_probs = belief_snapshot.regime.probs;
 
+                // Compute trend-position alignment: does trend support or oppose position?
+                // Range [-1, 1]: positive = trend supports position, negative = opposes
+                let trend_position_alignment = if position.abs() > max_position * 0.005
+                    && trend_signal.is_warmed_up
+                    && trend_signal.timeframe_agreement > 0.1
+                {
+                    let trend_sign = if trend_signal.long_momentum_bps.abs() > 3.0 {
+                        trend_signal.long_momentum_bps.signum()
+                    } else if trend_signal.medium_momentum_bps.abs() > 2.0 {
+                        trend_signal.medium_momentum_bps.signum()
+                    } else {
+                        0.0
+                    };
+                    trend_signal.timeframe_agreement * position.signum() * trend_sign
+                } else {
+                    0.0
+                };
+
                 // Update continuation model with all signals
                 self.stochastic.position_decision.update_signals(
                     changepoint_prob,
@@ -1391,6 +1409,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     trend_signal.timeframe_agreement,
                     trend_signal.trend_confidence,
                     regime_probs,
+                    trend_position_alignment,
                 );
 
                 // Log signal fusion diagnostics when position is significant
@@ -3546,6 +3565,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     drawdown_frac: 0.0,
                     self_impact_bps: 0.0,
                     inventory_beta: 0.0,
+                    continuation_gamma_mult: 1.0,
                 };
                 if let Some(best_bid) = viable.bids.first() {
                     let half_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
@@ -3980,6 +4000,30 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Cache market params for signal diagnostics (fill handler uses this)
         self.cached_market_params = Some(market_params);
+
+        // === Push incremental update to WebSocket dashboard clients ===
+        if let Some(ref ws) = self.infra.dashboard_ws {
+            let quotes = super::super::infra::metrics::dashboard::LiveQuotes {
+                mid: self.latest_mid,
+                spread_bps: self.tier2.spread_tracker.current_spread_bps(),
+                inventory: self.position.position(),
+                regime: self.stochastic.regime_state.regime_label().to_string(),
+                kappa: self.estimator.kappa(),
+                gamma: self.config.risk_aversion,
+                fill_prob: 0.0,
+                adverse_prob: self.tier1.adverse_selection.realized_as_bps() / 10.0,
+            };
+            let _ = ws
+                .sender()
+                .send(super::super::infra::dashboard_ws::DashboardPush::Update {
+                    quotes: Some(quotes),
+                    pnl: None,
+                    regime: None,
+                    pipeline: None,
+                    risk: None,
+                    timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                });
+        }
 
         Ok(())
     }

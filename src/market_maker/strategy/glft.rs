@@ -175,6 +175,24 @@ impl DualTimescaleController {
     }
 }
 
+/// Compute continuation-based gamma multiplier for inventory penalty.
+///
+/// Piecewise linear: anchored at 1.0 when p=0.5 (neutral GLFT).
+/// - p < 0.5 → ramps to max_mult (REDUCE: amplify inventory penalty)
+/// - p > 0.5 → ramps to min_mult (HOLD: relax inventory penalty)
+pub fn continuation_gamma_multiplier(
+    p_continuation: f64,
+    max_mult: f64, // at p=0 (default 3.0)
+    min_mult: f64, // at p=1 (default 0.5)
+) -> f64 {
+    let p = p_continuation.clamp(0.0, 1.0);
+    if p <= 0.5 {
+        max_mult + (1.0 - max_mult) * (p / 0.5)
+    } else {
+        1.0 + (min_mult - 1.0) * ((p - 0.5) / 0.5)
+    }
+}
+
 /// Parameter struct for evaluating comprehensive Expected PnL
 #[derive(Debug, Clone)]
 pub struct EPnLParams {
@@ -195,6 +213,9 @@ pub struct EPnLParams {
     pub drawdown_frac: f64,
     pub self_impact_bps: f64,
     pub inventory_beta: f64,
+    /// Scales gamma for inventory penalty only (from continuation model).
+    /// 1.0 = neutral (standard GLFT), >1.0 = REDUCE pressure, <1.0 = HOLD.
+    pub continuation_gamma_mult: f64,
 }
 
 /// Enhanced per-level E[PnL] computation absorbing all former multiplicative overlays.
@@ -231,10 +252,13 @@ pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
     };
 
     let gamma_q = params.gamma * (1.0 + params.inventory_beta * q_ratio.powi(2));
+    // Apply continuation multiplier to inventory penalty only (not spread formula)
+    let gamma_q_inv = gamma_q * params.continuation_gamma_mult;
 
     let is_reducing =
         (params.is_bid && params.position < 0.0) || (!params.is_bid && params.position > 0.0);
-    let inv_penalty_bps = gamma_q * q_ratio * params.sigma.powi(2) * params.time_horizon * 10_000.0;
+    let inv_penalty_bps =
+        gamma_q_inv * q_ratio * params.sigma.powi(2) * params.time_horizon * 10_000.0;
 
     let inventory_adj = if is_reducing {
         -0.5 * inv_penalty_bps // Bonus for reducing
@@ -357,6 +381,7 @@ pub fn expected_pnl_bps(
         drawdown_frac: 0.0,
         self_impact_bps: 0.0,
         inventory_beta: 0.0,
+        continuation_gamma_mult: 1.0,
     };
     expected_pnl_bps_enhanced(&params)
 }
@@ -404,10 +429,13 @@ pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagn
     };
 
     let gamma_q = params.gamma * (1.0 + params.inventory_beta * q_ratio.powi(2));
+    // Apply continuation multiplier to inventory penalty only (not spread formula)
+    let gamma_q_inv = gamma_q * params.continuation_gamma_mult;
 
     let is_reducing =
         (params.is_bid && params.position < 0.0) || (!params.is_bid && params.position > 0.0);
-    let inv_penalty_bps = gamma_q * q_ratio * params.sigma.powi(2) * params.time_horizon * 10_000.0;
+    let inv_penalty_bps =
+        gamma_q_inv * q_ratio * params.sigma.powi(2) * params.time_horizon * 10_000.0;
 
     let inventory_adj = if is_reducing {
         -0.5 * inv_penalty_bps
@@ -2828,6 +2856,7 @@ mod tests {
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
+            continuation_gamma_mult: 1.0,
         };
         let pnl_clean = expected_pnl_bps_enhanced(&params);
 
@@ -2857,6 +2886,7 @@ mod tests {
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
+            continuation_gamma_mult: 1.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
 
@@ -2889,6 +2919,7 @@ mod tests {
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
+            continuation_gamma_mult: 1.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
 
@@ -2921,6 +2952,7 @@ mod tests {
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
+            continuation_gamma_mult: 1.0,
         };
         let pnl_no_impact = expected_pnl_bps_enhanced(&params);
 
@@ -2958,6 +2990,7 @@ mod tests {
             drawdown_frac: 0.0,
             self_impact_bps: 0.0,
             inventory_beta: 0.0,
+            continuation_gamma_mult: 1.0,
         };
         let enhanced = expected_pnl_bps_enhanced(&params);
 
@@ -2988,6 +3021,7 @@ mod tests {
             drawdown_frac: 0.0,
             self_impact_bps: 0.1,
             inventory_beta: 1.0,
+            continuation_gamma_mult: 1.0,
         };
 
         let scalar = expected_pnl_bps_enhanced(&params);
@@ -3350,6 +3384,86 @@ mod tests {
         assert!(
             shift_bps > 0.01,
             "PPIP should produce non-trivial skew at 15% utilization: got {shift_bps:.6} bps"
+        );
+    }
+
+    // === Continuation gamma multiplier tests ===
+
+    #[test]
+    fn test_continuation_gamma_multiplier_neutral() {
+        let mult = continuation_gamma_multiplier(0.5, 3.0, 0.5);
+        assert!(
+            (mult - 1.0).abs() < 1e-12,
+            "p=0.5 should give neutral mult=1.0, got {}",
+            mult
+        );
+    }
+
+    #[test]
+    fn test_continuation_gamma_multiplier_reduce() {
+        let mult = continuation_gamma_multiplier(0.0, 3.0, 0.5);
+        assert!(
+            (mult - 3.0).abs() < 1e-12,
+            "p=0.0 should give max_mult=3.0, got {}",
+            mult
+        );
+
+        let mult_mid = continuation_gamma_multiplier(0.25, 3.0, 0.5);
+        assert!(
+            (mult_mid - 2.0).abs() < 1e-12,
+            "p=0.25 should give mult=2.0, got {}",
+            mult_mid
+        );
+    }
+
+    #[test]
+    fn test_continuation_gamma_multiplier_hold() {
+        let mult = continuation_gamma_multiplier(1.0, 3.0, 0.5);
+        assert!(
+            (mult - 0.5).abs() < 1e-12,
+            "p=1.0 should give min_mult=0.5, got {}",
+            mult
+        );
+
+        let mult_mid = continuation_gamma_multiplier(0.75, 3.0, 0.5);
+        assert!(
+            (mult_mid - 0.75).abs() < 1e-12,
+            "p=0.75 should give mult=0.75, got {}",
+            mult_mid
+        );
+    }
+
+    #[test]
+    fn test_continuation_gamma_multiplier_monotonic() {
+        let mut prev = continuation_gamma_multiplier(0.0, 3.0, 0.5);
+        for i in 1..=10 {
+            let p = i as f64 / 10.0;
+            let curr = continuation_gamma_multiplier(p, 3.0, 0.5);
+            assert!(
+                curr <= prev + 1e-12,
+                "mult should decrease: p={}, curr={}, prev={}",
+                p,
+                curr,
+                prev
+            );
+            prev = curr;
+        }
+    }
+
+    #[test]
+    fn test_continuation_gamma_multiplier_clamps() {
+        let mult_neg = continuation_gamma_multiplier(-0.5, 3.0, 0.5);
+        let mult_zero = continuation_gamma_multiplier(0.0, 3.0, 0.5);
+        assert!(
+            (mult_neg - mult_zero).abs() < 1e-12,
+            "Negative p should clamp to p=0"
+        );
+
+        let mult_over = continuation_gamma_multiplier(1.5, 3.0, 0.5);
+        let mult_one = continuation_gamma_multiplier(1.0, 3.0, 0.5);
+        assert!(
+            (mult_over - mult_one).abs() < 1e-12,
+            "p>1 should clamp to p=1"
         );
     }
 }

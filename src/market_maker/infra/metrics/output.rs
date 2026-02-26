@@ -906,6 +906,51 @@ impl PrometheusMetrics {
             inventory_cost,
             fees,
         };
-        self.dashboard.snapshot(&params)
+        let mut state = self.dashboard.snapshot(&params);
+
+        // Populate BayesianPipelineState from available metrics
+        state.pipeline = super::dashboard::BayesianPipelineState {
+            data_age_ms: self.inner.data_staleness_secs.load() as u64 * 1000,
+            drift_bps_s: 0.0,
+            sigma_pct: sigma * 100.0,
+            toxicity: self.inner.toxicity_score.load(),
+            microprice: mid_price,
+            drift_bps: 0.0,
+            reservation_price: mid_price,
+            glft_spread_bps: spread_bps,
+            risk_premium_bps: 0.0,
+            total_spread_bps: spread_bps,
+            bid_depth_bps: spread_bps / 2.0,
+            ask_depth_bps: spread_bps / 2.0,
+            depth_skew_bps: 0.0,
+            kelly_fraction: self.inner.kelly_fraction.load(),
+            max_size: 0.0,
+            margin_utilization_pct: 0.0,
+            bid_levels: 0,
+            ask_levels: 0,
+        };
+
+        // Populate RiskSummary from available metrics
+        let ks_triggered = self
+            .inner
+            .kill_switch_triggered
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 1;
+        state.risk_summary = super::dashboard::RiskSummary {
+            position_pct: self.inner.inventory_utilization.load() * 100.0,
+            drawdown_pct: self.inner.drawdown_pct.load(),
+            kill_switch_headroom_pct: if ks_triggered {
+                0.0
+            } else {
+                100.0 - self.inner.drawdown_pct.load().abs()
+            },
+            cascade_severity,
+            data_age_ms: self.inner.data_staleness_secs.load() as u64 * 1000,
+            kill_switch_triggered: ks_triggered,
+            position_velocity_1m: 0.0,
+            price_velocity_1s: 0.0,
+        };
+
+        state
     }
 }

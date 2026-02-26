@@ -32,6 +32,7 @@ pub use market_maker::{
     // Phase 6: Structured Logging
     init_logging,
     targets as log_targets,
+    ws_handler,
     // Tier 1: Adverse Selection
     AdverseSelectionConfig,
     AdverseSelectionEstimator,
@@ -49,6 +50,9 @@ pub use market_maker::{
     // WebSocket Reconnection
     ConnectionHealthMonitor,
     ConnectionState,
+    // WebSocket Dashboard
+    DashboardWsConfig,
+    DashboardWsState,
     DataQualityConfig,
     DataQualityMonitor,
     // Dynamic Risk Configuration

@@ -849,8 +849,15 @@ impl LadderStrategy {
         } else {
             0.0
         };
-        // Penalty = q * gamma * sigma^2 * T in bps
-        let inv_penalty_bps = q * gamma * market_params.sigma.powi(2) * time_horizon * 10_000.0;
+        // Continuation-based gamma multiplier: amplify inventory penalty when opposed, relax when aligned
+        let cont_gamma_mult = super::glft::continuation_gamma_multiplier(
+            market_params.continuation_p,
+            3.0, // max_mult at p=0 (REDUCE: strong opposition)
+            0.5, // min_mult at p=1 (HOLD: strong alignment)
+        );
+        // Penalty = q * gamma * cont_mult * sigma^2 * T in bps
+        let inv_penalty_bps =
+            q * gamma * cont_gamma_mult * market_params.sigma.powi(2) * time_horizon * 10_000.0;
 
         // 3. Funding Carry (annualized rate converted to per-second, multiply by T)
         // 365.25 * 24 * 60 * 60 = 31,557,600
@@ -1213,6 +1220,7 @@ impl LadderStrategy {
                 drawdown_frac: 0.0,   // handled by capital coordinator
                 self_impact_bps: 0.0, // self impact handled by actuary later
                 inventory_beta: self.risk_model.beta_inventory,
+                continuation_gamma_mult: cont_gamma_mult,
             };
 
             let mut ask_params = bid_params.clone();

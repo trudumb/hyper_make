@@ -32,7 +32,8 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use super::metrics::dashboard::{
-    DashboardState, FillRecord, LiveQuotes, PnLAttribution, RegimeState,
+    BayesianPipelineState, DashboardState, FillRecord, LiveQuotes, PnLAttribution, RegimeState,
+    RiskSummary,
 };
 
 // ============================================================================
@@ -42,6 +43,7 @@ use super::metrics::dashboard::{
 /// Server-to-client push messages
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum DashboardPush {
     /// Full state snapshot (sent on connect + periodically)
     Snapshot { state: Box<DashboardState> },
@@ -54,6 +56,10 @@ pub enum DashboardPush {
         pnl: Option<PnLAttribution>,
         #[serde(skip_serializing_if = "Option::is_none")]
         regime: Option<RegimeState>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pipeline: Option<BayesianPipelineState>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        risk: Option<RiskSummary>,
         timestamp_ms: i64,
     },
 
@@ -189,6 +195,8 @@ impl DashboardWsState {
             quotes,
             pnl,
             regime,
+            pipeline: None,
+            risk: None,
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         });
     }
@@ -303,6 +311,8 @@ async fn handle_connection(socket: WebSocket, state: Arc<DashboardWsState>) {
                                         quotes: None,
                                         pnl: None,
                                         regime: None,
+                                        pipeline: None,
+                                        risk: None,
                                         timestamp_ms: chrono::Utc::now().timestamp_millis(),
                                     };
                                     if let Ok(json) = serde_json::to_string(&msg) {
@@ -398,6 +408,8 @@ mod tests {
             quotes: None,
             pnl: None,
             regime: None,
+            pipeline: None,
+            risk: None,
             timestamp_ms: 12345,
         };
         let json = serde_json::to_string(&push).unwrap();

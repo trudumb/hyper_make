@@ -695,6 +695,14 @@ pub struct DashboardState {
     // Feature health visualization
     /// Combined feature health state (decay, correlation, validation, lag, interactions).
     pub feature_health: FeatureHealthState,
+
+    // Bayesian pipeline and risk visualization
+    /// 7-stage pipeline state for pipeline tab.
+    #[serde(default)]
+    pub pipeline: BayesianPipelineState,
+    /// Risk summary for risk tab.
+    #[serde(default)]
+    pub risk_summary: RiskSummary,
 }
 
 impl Default for DashboardState {
@@ -720,6 +728,9 @@ impl Default for DashboardState {
             changepoint_diagnostics: ChangepointDiagnostics::default(),
             // Feature health
             feature_health: FeatureHealthState::default(),
+            // Pipeline and risk
+            pipeline: BayesianPipelineState::default(),
+            risk_summary: RiskSummary::default(),
         }
     }
 }
@@ -763,6 +774,70 @@ pub fn default_signals() -> Vec<SignalInfo> {
             rv: 0.6,
         },
     ]
+}
+
+/// Bayesian pipeline state for the 7-stage event→quote flow visualization.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(default)]
+pub struct BayesianPipelineState {
+    /// Data age in milliseconds.
+    pub data_age_ms: u64,
+    /// Drift rate in bps/second.
+    pub drift_bps_s: f64,
+    /// Sigma as percentage.
+    pub sigma_pct: f64,
+    /// Toxicity score [0,1].
+    pub toxicity: f64,
+    /// Microprice estimate.
+    pub microprice: f64,
+    /// Drift in bps.
+    pub drift_bps: f64,
+    /// Reservation price from GLFT.
+    pub reservation_price: f64,
+    /// GLFT optimal spread in bps.
+    pub glft_spread_bps: f64,
+    /// Risk premium in bps.
+    pub risk_premium_bps: f64,
+    /// Total spread in bps.
+    pub total_spread_bps: f64,
+    /// Bid depth in bps from mid.
+    pub bid_depth_bps: f64,
+    /// Ask depth in bps from mid.
+    pub ask_depth_bps: f64,
+    /// Depth skew in bps (bid - ask).
+    pub depth_skew_bps: f64,
+    /// Kelly fraction [0,1].
+    pub kelly_fraction: f64,
+    /// Maximum size in base units.
+    pub max_size: f64,
+    /// Margin utilization percentage.
+    pub margin_utilization_pct: f64,
+    /// Number of bid ladder levels.
+    pub bid_levels: usize,
+    /// Number of ask ladder levels.
+    pub ask_levels: usize,
+}
+
+/// Risk summary for dashboard risk visualization.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(default)]
+pub struct RiskSummary {
+    /// Position as percentage of max.
+    pub position_pct: f64,
+    /// Drawdown percentage.
+    pub drawdown_pct: f64,
+    /// Kill switch headroom percentage.
+    pub kill_switch_headroom_pct: f64,
+    /// Cascade severity [0,1].
+    pub cascade_severity: f64,
+    /// Data age in milliseconds.
+    pub data_age_ms: u64,
+    /// Whether kill switch is triggered.
+    pub kill_switch_triggered: bool,
+    /// Position velocity over 1 minute.
+    pub position_velocity_1m: f64,
+    /// Price velocity over 1 second.
+    pub price_velocity_1s: f64,
 }
 
 /// Classify regime from continuous signals.
@@ -1204,6 +1279,9 @@ impl DashboardAggregator {
             changepoint_diagnostics,
             // Feature health (populated separately via update_feature_health)
             feature_health: FeatureHealthState::default(),
+            // Pipeline and risk populated by output.rs after snapshot
+            pipeline: BayesianPipelineState::default(),
+            risk_summary: RiskSummary::default(),
         }
     }
 

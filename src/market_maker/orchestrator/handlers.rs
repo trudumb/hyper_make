@@ -1517,6 +1517,41 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.infra.last_margin_refresh = std::time::Instant::now();
         }
 
+        // === Push fill events to WebSocket dashboard clients ===
+        if let Some(ref ws) = self.infra.dashboard_ws {
+            let cum_pnl = self.tier2.pnl_tracker.summary(self.latest_mid).total_pnl;
+            for fill in &user_fills.data.fills {
+                if fill.coin != *self.config.asset {
+                    continue;
+                }
+                let is_buy = fill.side == "B" || fill.side.to_lowercase() == "buy";
+                let time_label = {
+                    let ts_secs = fill.time / 1000;
+                    let hrs = (ts_secs / 3600) % 24;
+                    let mins = (ts_secs / 60) % 60;
+                    format!("{:02}:{:02}", hrs, mins)
+                };
+                let record = super::super::infra::metrics::dashboard::FillRecord {
+                    time: time_label,
+                    timestamp_ms: fill.time as i64,
+                    pnl: 0.0, // Deferred to markout
+                    cum_pnl,
+                    side: if is_buy {
+                        "BID".to_string()
+                    } else {
+                        "ASK".to_string()
+                    },
+                    adverse_selection: format!(
+                        "{:.1}",
+                        self.tier1.adverse_selection.realized_as_bps()
+                    ),
+                };
+                let _ = ws
+                    .sender()
+                    .send(super::super::infra::dashboard_ws::DashboardPush::Fill { record });
+            }
+        }
+
         // === Phase 3: Event-Driven Quote Updates ===
         // Instead of calling update_quotes() on every fill, record fill events
         // to the accumulator. Fills are high-priority and typically trigger immediately.

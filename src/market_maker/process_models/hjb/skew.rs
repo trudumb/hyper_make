@@ -422,9 +422,20 @@ impl HJBInventoryController {
         };
 
         let momentum_significant = effective_momentum > momentum_threshold;
-        let continuation_confident = p_continuation >= self.config.min_continuation_prob;
+        // Inverted soft gate: urgency ramps UP as continuation drops.
+        // Low p_continuation means position is in trouble → max reduction pressure.
+        // High p_continuation means position is healthy → no extra reduction pressure.
+        let min_prob = self.config.min_continuation_prob;
+        let reduction_urgency_gate = if p_continuation >= min_prob {
+            0.0 // Position healthy, no extra reduction pressure
+        } else if p_continuation > 0.2 {
+            // Ramp from 0.0 (at min_prob) to 1.0 (at 0.2)
+            (min_prob - p_continuation) / (min_prob - 0.2)
+        } else {
+            1.0 // Position strongly opposed, max reduction pressure
+        };
 
-        if !is_opposed || !momentum_significant || !continuation_confident {
+        if !is_opposed || !momentum_significant || reduction_urgency_gate < 0.01 {
             return DriftAdjustedSkew {
                 total_skew: base_skew,
                 base_skew,
@@ -471,12 +482,9 @@ impl HJBInventoryController {
             (momentum_bps / 10000.0) / 0.5
         };
 
-        // Base urgency calculation
-        let raw_urgency = self.config.opposition_sensitivity
-            * drift_rate.abs()
-            * p_continuation
-            * q.abs()
-            * time_remaining;
+        // Base urgency calculation (gate handles p_continuation scaling)
+        let raw_urgency =
+            self.config.opposition_sensitivity * drift_rate.abs() * q.abs() * time_remaining;
 
         // Boost urgency when trend is confident (multi-timeframe agreement)
         // trend_confidence is 0.0-1.0, boost factor is 1.0-2.0
@@ -489,7 +497,7 @@ impl HJBInventoryController {
         let boosted_urgency = raw_urgency * trend_boost;
         let max_base_urgency = base_skew.abs() * self.config.max_drift_urgency;
         let drift_urgency_magnitude = boosted_urgency.min(max_base_urgency);
-        let drift_urgency = drift_urgency_magnitude * q.signum();
+        let drift_urgency = drift_urgency_magnitude * q.signum() * reduction_urgency_gate;
 
         // === Compute Variance Multiplier ===
         let variance_multiplier_capped = if self.is_drift_warmed_up() {
@@ -503,7 +511,7 @@ impl HJBInventoryController {
             let variance_multiplier = 1.0
                 + self.config.opposition_sensitivity
                     * momentum_vol_ratio
-                    * p_continuation
+                    * reduction_urgency_gate
                     * q.abs();
             variance_multiplier.min(self.config.max_drift_urgency)
         };
@@ -516,7 +524,7 @@ impl HJBInventoryController {
         };
 
         let urgency_score = (momentum_bps.abs() / 50.0).min(1.0)
-            + p_continuation
+            + reduction_urgency_gate
             + q.abs()
             + momentum_vol_ratio.min(1.0)
             + if self.is_terminal_zone() { 1.0 } else { 0.0 }
@@ -830,7 +838,7 @@ mod tests {
         // Long = -20 bps (strong), medium = -3 bps (weak), fully aligned
         let trend = make_trend(-20.0, -3.0, 1.0);
         // Position positive, momentum negative => opposed
-        let result = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend);
+        let result = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend);
 
         // With long_bps=-20: long_confidence = (20/10).min(1) = 1.0
         // With med_bps=-3: med_confidence = (3/5).min(1) * 1.0 = 0.6
@@ -849,11 +857,11 @@ mod tests {
         let ctrl = make_controller();
         // Long = -8 bps (moderate), medium = -10 bps (strong, fast), fully aligned
         let trend = make_trend(-8.0, -10.0, 1.0);
-        let result_blended = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend);
+        let result_blended = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend);
 
         // Now test with zero agreement => medium ignored
         let trend_disagree = make_trend(-8.0, -10.0, 0.0);
-        let result_long_only = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
+        let result_long_only = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend_disagree);
 
         // Blended urgency should be larger because medium pulls drift faster
         assert!(
@@ -868,11 +876,11 @@ mod tests {
         let ctrl = make_controller();
         // Long = -15 bps, medium = +8 bps (opposite direction), zero agreement
         let trend_disagree = make_trend(-15.0, 8.0, 0.0);
-        let result_disagree = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
+        let result_disagree = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend_disagree);
 
         // Same scenario but with full agreement — medium gets weight and dilutes long
         let trend_agree = make_trend(-15.0, 8.0, 1.0);
-        let _result_agree = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_agree);
+        let _result_agree = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend_agree);
 
         // When disagreeing (agreement=0), med_confidence=0, blend = pure long_drift
         // long_drift = (-15/10000)/300 = -5e-6
@@ -894,7 +902,7 @@ mod tests {
         // because position is positive and drift is negative => opposed => positive urgency)
         let long_only_trend = make_trend(-15.0, 0.0, 0.0);
         let result_long_only =
-            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &long_only_trend);
+            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &long_only_trend);
 
         // Disagreeing result should match long-only result (medium is zeroed)
         assert!(
@@ -902,6 +910,68 @@ mod tests {
             "disagreeing medium (urgency={}) should equal long-only (urgency={})",
             result_disagree.drift_urgency,
             result_long_only.drift_urgency,
+        );
+    }
+
+    // === Inverted soft gate tests ===
+
+    #[test]
+    fn test_inverted_gate_increases_urgency_as_continuation_drops() {
+        let ctrl = make_controller();
+        let trend = make_trend(-20.0, -10.0, 1.0);
+
+        // p=0.45: gate = (0.5-0.45)/(0.5-0.2) = 0.167
+        let result_moderate = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.45, &trend);
+        // p=0.3: gate = (0.5-0.3)/(0.5-0.2) = 0.667
+        let result_low = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend);
+
+        assert!(
+            result_low.drift_urgency.abs() > result_moderate.drift_urgency.abs(),
+            "lower continuation ({}) should produce more urgency than moderate ({})",
+            result_low.drift_urgency,
+            result_moderate.drift_urgency,
+        );
+    }
+
+    #[test]
+    fn test_inverted_gate_zero_urgency_when_position_healthy() {
+        let ctrl = make_controller();
+        let trend = make_trend(-20.0, -10.0, 1.0);
+
+        // p=0.6 >= min_prob=0.5 → gate = 0.0 → no urgency
+        let result = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.6, &trend);
+
+        assert!(
+            result.drift_urgency.abs() < 1e-12,
+            "healthy position (p=0.6) should have zero drift urgency, got {}",
+            result.drift_urgency,
+        );
+    }
+
+    #[test]
+    fn test_inverted_gate_max_urgency_at_extreme() {
+        let ctrl = make_controller();
+        let trend = make_trend(-20.0, -10.0, 1.0);
+
+        // p=0.15 < 0.2 → gate = 1.0 (max)
+        let result_extreme = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.15, &trend);
+        // p=0.35: gate = (0.5-0.35)/(0.5-0.2) = 0.5
+        let result_mid = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.35, &trend);
+
+        assert!(
+            result_extreme.drift_urgency.abs() > result_mid.drift_urgency.abs(),
+            "extreme opposition (p=0.15) should exceed mid (p=0.35): extreme={}, mid={}",
+            result_extreme.drift_urgency,
+            result_mid.drift_urgency,
+        );
+
+        // Gate at p=0.15 should be 1.0 and at p=0.1 should also be 1.0 (both below 0.2)
+        let result_very_extreme = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.1, &trend);
+        assert!(
+            (result_extreme.drift_urgency - result_very_extreme.drift_urgency).abs() < 1e-12,
+            "both below 0.2 should have same max urgency: p=0.15={}, p=0.1={}",
+            result_extreme.drift_urgency,
+            result_very_extreme.drift_urgency,
         );
     }
 }

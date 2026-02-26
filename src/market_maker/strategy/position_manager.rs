@@ -164,6 +164,8 @@ impl PositionDecisionEngine {
     /// * `trend_agreement` - From TrendSignal `timeframe_agreement`
     /// * `trend_confidence` - From TrendSignal `trend_confidence`
     /// * `regime_probs` - From HMM `regime_probabilities()` [quiet, normal, bursty, cascade]
+    /// * `trend_position_alignment` - [-1,1] trend alignment with position direction
+    #[allow(clippy::too_many_arguments)] // Signal passthrough; struct refactor deferred
     pub fn update_signals(
         &mut self,
         changepoint_prob: f64,
@@ -172,6 +174,7 @@ impl PositionDecisionEngine {
         trend_agreement: f64,
         trend_confidence: f64,
         regime_probs: [f64; 4],
+        trend_position_alignment: f64,
     ) {
         self.continuation.update_signals(
             changepoint_prob,
@@ -180,6 +183,7 @@ impl PositionDecisionEngine {
             trend_agreement,
             trend_confidence,
             regime_probs,
+            trend_position_alignment,
         );
     }
 
@@ -222,6 +226,7 @@ mod tests {
             0.5,                  // Some trend agreement
             0.5,                  // Some trend confidence
             [0.0, 0.0, 0.2, 0.8], // Cascade-dominant regime
+            0.0,                  // Neutral alignment
         );
 
         // Should have elevated continuation probability reflecting cascade regime
@@ -252,6 +257,7 @@ mod tests {
             0.0,                  // No trend
             0.0,                  // No trend confidence
             [0.2, 0.5, 0.2, 0.1], // Normal regime
+            0.0,                  // Neutral alignment
         );
 
         let p_after = engine.prob_continuation();

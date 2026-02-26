@@ -843,6 +843,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self
     }
 
+    /// Set WebSocket dashboard state for real-time push updates.
+    pub fn with_dashboard_ws(
+        mut self,
+        ws_state: std::sync::Arc<infra::dashboard_ws::DashboardWsState>,
+    ) -> Self {
+        self.infra.dashboard_ws = Some(ws_state);
+        info!("WebSocket dashboard enabled");
+        self
+    }
+
     /// Seed the margin sizer and exchange limits for paper trading.
     ///
     /// Without this, the MarketMaker sees `margin_available=0.00` and

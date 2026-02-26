@@ -801,6 +801,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         cascade_severity = %format!("{:.2}", summary.cascade_severity),
                         "Kill switch status"
                     );
+
+                    // === Push dashboard state to WebSocket clients ===
+                    if let Some(ref ws) = self.infra.dashboard_ws {
+                        let state = self.infra.prometheus.to_dashboard_state();
+                        ws.update_state(state);
+                        ws.push_snapshot();
+                    }
                 }
             }
         }
@@ -1108,6 +1115,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         cascade_severity = %format!("{:.2}", summary.cascade_severity),
                         "Kill switch status"
                     );
+
+                    // === Push dashboard state to WebSocket clients ===
+                    if let Some(ref ws) = self.infra.dashboard_ws {
+                        let state = self.infra.prometheus.to_dashboard_state();
+                        ws.update_state(state);
+                        ws.push_snapshot();
+                    }
                 }
             }
         }

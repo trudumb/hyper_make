@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HYPE-PERP Market Making Dashboard</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.2/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+  :root {
+    --green: #10b981; --red: #ef4444; --yellow: #f59e0b;
+    --blue: #3b82f6; --purple: #8b5cf6; --bg: #0f172a;
+    --card: #1e293b; --border: #334155; --text: #e2e8f0;
+    --text-muted: #94a3b8; --text-dim: #64748b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body, #root { height: 100%; background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  .flash { animation: flash-bg 0.6s ease-out; }
+  @keyframes flash-bg { 0% { background-color: rgba(59,130,246,0.3); } 100% { background-color: transparent; } }
+  @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem; }
+  .tab-active { border-bottom: 2px solid var(--blue); color: white; }
+  .tab-inactive { border-bottom: 2px solid transparent; color: var(--text-muted); }
+  .tab-inactive:hover { color: var(--text); }
+  .pipeline-arrow { position: relative; }
+  .pipeline-arrow::after {
+    content: '\2192'; position: absolute; right: -18px; top: 50%;
+    transform: translateY(-50%); color: var(--text-dim); font-size: 1.2rem;
+  }
+  .fill-row-enter { animation: slide-in 0.3s ease-out; }
+  @keyframes slide-in { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:translateY(0); } }
+  canvas { image-rendering: auto; }
+</style>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        card: '#1e293b', border: '#334155',
+      }
+    }
+  }
+}
+</script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+'use strict';
+
+// ─── Shorthand ───
+const h = React.createElement;
+const { useState, useEffect, useRef, useCallback, useMemo, useReducer } = React;
+
+// ─── Constants ───
+const COLORS = { green: '#10b981', red: '#ef4444', yellow: '#f59e0b', blue: '#3b82f6', purple: '#8b5cf6' };
+const REGIME_COLORS = { Quiet: COLORS.green, Trending: COLORS.purple, Volatile: COLORS.yellow, Cascade: COLORS.red };
+const MAX_FILLS = 100;
+const MAX_HISTORY = 500;
+
+// ─── Utilities ───
+function fmt(v, decimals) {
+  if (v == null || isNaN(v)) return '--';
+  return Number(v).toFixed(decimals != null ? decimals : 2);
+}
+function fmtUsd(v) {
+  if (v == null || isNaN(v)) return '--';
+  const n = Number(v);
+  return (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
+}
+function fmtPct(v) { return v != null ? fmt(v, 1) + '%' : '--'; }
+function fmtBps(v) { return v != null ? fmt(v, 1) + ' bps' : '--'; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function colorForValue(v, thresholds) {
+  if (v == null) return COLORS.blue;
+  if (v >= thresholds[1]) return COLORS.red;
+  if (v >= thresholds[0]) return COLORS.yellow;
+  return COLORS.green;
+}
+
+// ─── WebSocket Client ───
+class DashboardWS {
+  constructor(onMessage, onStatusChange) {
+    this.onMessage = onMessage;
+    this.onStatusChange = onStatusChange;
+    this.ws = null;
+    this.reconnectDelay = 1000;
+    this.maxDelay = 5000;
+    this.fallbackInterval = null;
+    this.connected = false;
+    this.mode = 'disconnected'; // 'ws' | 'http' | 'disconnected'
+    this.pingInterval = null;
+    this.msgId = 0;
+  }
+
+  connect() {
+    const host = window.location.hostname || 'localhost';
+    const url = 'ws://' + host + ':8080/ws/dashboard';
+    try {
+      this.ws = new WebSocket(url);
+      this.ws.onopen = () => {
+        this.connected = true;
+        this.mode = 'ws';
+        this.reconnectDelay = 1000;
+        this.onStatusChange('ws');
+        this.stopFallback();
+        this.startPing();
+      };
+      this.ws.onmessage = (evt) => {
+        try { this.onMessage(JSON.parse(evt.data)); } catch(e) { console.warn('Parse error:', e); }
+      };
+      this.ws.onclose = () => {
+        this.connected = false;
+        this.stopPing();
+        this.onStatusChange('disconnected');
+        this.startFallback();
+        const delay = this.reconnectDelay;
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxDelay);
+        setTimeout(() => this.connect(), delay);
+      };
+      this.ws.onerror = () => { this.ws.close(); };
+    } catch(e) {
+      this.startFallback();
+      const delay = this.reconnectDelay;
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxDelay);
+      setTimeout(() => this.connect(), delay);
+    }
+  }
+
+  send(msg) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+
+  requestSnapshot() {
+    this.send({ type: 'request_snapshot', id: ++this.msgId });
+  }
+
+  startPing() {
+    this.pingInterval = setInterval(() => {
+      this.send({ type: 'ping', id: ++this.msgId });
+    }, 15000);
+  }
+
+  stopPing() {
+    if (this.pingInterval) { clearInterval(this.pingInterval); this.pingInterval = null; }
+  }
+
+  startFallback() {
+    if (this.fallbackInterval) return;
+    const host = window.location.hostname || 'localhost';
+    const url = 'http://' + host + ':8080/api/dashboard';
+    this.fallbackInterval = setInterval(() => {
+      fetch(url).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }).then(data => {
+        if (this.mode !== 'ws') {
+          this.mode = 'http';
+          this.onStatusChange('http');
+        }
+        this.onMessage(data);
+      }).catch(() => {});
+    }, 1000);
+  }
+
+  stopFallback() {
+    if (this.fallbackInterval) { clearInterval(this.fallbackInterval); this.fallbackInterval = null; }
+  }
+
+  disconnect() {
+    this.stopPing();
+    this.stopFallback();
+    if (this.ws) this.ws.close();
+  }
+}
+
+// ─── State Reducer ───
+function dashReducer(state, action) {
+  switch (action.type) {
+    case 'snapshot': {
+      const s = action.state || {};
+      return {
+        ...state,
+        quotes: s.quotes || state.quotes,
+        pnl: s.pnl || state.pnl,
+        regime: s.regime || state.regime,
+        fills: (s.fills || []).slice(0, MAX_FILLS),
+        calibration: s.calibration || state.calibration,
+        signals: s.signals || state.signals,
+        pipeline: s.pipeline || state.pipeline,
+        risk_summary: s.risk_summary || state.risk_summary,
+        price_history: (s.price_history || []).slice(-MAX_HISTORY),
+        kappa_diagnostics: s.kappa_diagnostics || state.kappa_diagnostics,
+        signal_history: (s.signal_history || []).slice(-MAX_HISTORY),
+        decision_history: (s.decision_history || []).slice(-MAX_HISTORY),
+        timestamp_ms: s.timestamp_ms || Date.now(),
+      };
+    }
+    case 'update': {
+      const u = action.data;
+      return {
+        ...state,
+        quotes: u.quotes ? { ...state.quotes, ...u.quotes } : state.quotes,
+        pnl: u.pnl ? { ...state.pnl, ...u.pnl } : state.pnl,
+        regime: u.regime ? { ...state.regime, ...u.regime } : state.regime,
+        pipeline: u.pipeline ? { ...state.pipeline, ...u.pipeline } : state.pipeline,
+        risk_summary: u.risk ? { ...state.risk_summary, ...u.risk } : state.risk_summary,
+        timestamp_ms: u.timestamp_ms || Date.now(),
+      };
+    }
+    case 'fill': {
+      const newFills = [action.record, ...state.fills].slice(0, MAX_FILLS);
+      return { ...state, fills: newFills };
+    }
+    case 'status': {
+      return { ...state, wsStatus: action.status };
+    }
+    default: return state;
+  }
+}
+
+const INITIAL_STATE = {
+  quotes: {}, pnl: {}, regime: {}, fills: [], calibration: {},
+  signals: [], pipeline: {}, risk_summary: {}, price_history: [],
+  kappa_diagnostics: {}, signal_history: [], decision_history: [],
+  timestamp_ms: 0, wsStatus: 'disconnected',
+};
+
+// ─── Canvas Gauge Helpers ───
+function drawSemiGauge(canvas, value, min, max, label, unit, thresholds) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, ht = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+  ctx.clearRect(0, 0, cw, ch);
+
+  const cx = cw / 2, cy = ch * 0.72;
+  const radius = Math.min(cw, ch) * 0.38;
+  const lineW = radius * 0.18;
+
+  // Background arc
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, Math.PI, 2 * Math.PI, false);
+  ctx.lineWidth = lineW;
+  ctx.strokeStyle = '#334155';
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // Value arc
+  const pct = clamp((value - min) / (max - min), 0, 1);
+  const angle = Math.PI + pct * Math.PI;
+  const color = thresholds
+    ? colorForValue(Math.abs(pct * 100), thresholds)
+    : (pct < 0.5 ? COLORS.green : pct < 0.8 ? COLORS.yellow : COLORS.red);
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, Math.PI, angle, false);
+  ctx.lineWidth = lineW;
+  ctx.strokeStyle = color;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // Value text
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold ' + Math.round(radius * 0.45) + 'px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(fmt(value, 2) + (unit || ''), cx, cy - 2);
+
+  // Label
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = Math.round(radius * 0.28) + 'px "Inter", sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.fillText(label || '', cx, cy + 6);
+}
+
+function drawHorizontalBar(canvas, value, max, label, thresholds, showPct) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+  ctx.clearRect(0, 0, cw, ch);
+
+  const barH = ch * 0.35;
+  const barY = ch * 0.35;
+  const pad = 4;
+  const barW = cw - pad * 2;
+  const pct = max > 0 ? clamp(value / max, 0, 1) : 0;
+
+  // Label
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '11px "Inter", sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.fillText(label || '', pad, 2);
+
+  // Value text
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 11px "JetBrains Mono", monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(showPct ? fmtPct(value) : fmt(value, 1), cw - pad, 2);
+  ctx.textAlign = 'left';
+
+  // Background
+  ctx.fillStyle = '#334155';
+  ctx.beginPath();
+  ctx.roundRect(pad, barY, barW, barH, 3);
+  ctx.fill();
+
+  // Value fill
+  const color = thresholds
+    ? colorForValue(pct * 100, thresholds)
+    : COLORS.blue;
+  if (pct > 0) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(pad, barY, barW * pct, barH, 3);
+    ctx.fill();
+  }
+}
+
+function drawWaterfallChart(canvas, items) {
+  if (!canvas || !items || items.length === 0) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+  ctx.clearRect(0, 0, cw, ch);
+
+  const padTop = 20, padBottom = 50, padLeft = 50, padRight = 20;
+  const plotW = cw - padLeft - padRight;
+  const plotH = ch - padTop - padBottom;
+
+  const values = items.map(i => i.value || 0);
+  const allVals = [];
+  let run = 0;
+  for (const v of values) {
+    allVals.push(run);
+    allVals.push(run + v);
+    run += v;
+  }
+  allVals.push(0); allVals.push(run);
+  const minV = Math.min(...allVals);
+  const maxV = Math.max(...allVals);
+  const range = (maxV - minV) || 1;
+
+  function yOf(v) { return padTop + plotH * (1 - (v - minV) / range); }
+
+  // Zero line
+  const y0 = yOf(0);
+  ctx.strokeStyle = '#475569';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(padLeft, y0); ctx.lineTo(cw - padRight, y0); ctx.stroke();
+  ctx.setLineDash([]);
+
+  const barW = plotW / (items.length + 1) * 0.6;
+  const gap = plotW / (items.length + 1);
+  let cumulative = 0;
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const v = item.value || 0;
+    const x = padLeft + gap * (i + 0.5) - barW / 2;
+    const yStart = yOf(cumulative);
+    const yEnd = yOf(cumulative + v);
+    const barTop = Math.min(yStart, yEnd);
+    const barHeight = Math.abs(yEnd - yStart) || 1;
+
+    ctx.fillStyle = v >= 0 ? COLORS.green : COLORS.red;
+    ctx.fillRect(x, barTop, barW, barHeight);
+
+    // Connector line
+    if (i < items.length - 1) {
+      ctx.strokeStyle = '#475569';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath();
+      ctx.moveTo(x + barW, yEnd);
+      ctx.lineTo(x + gap - (gap - barW) * 0.2, yEnd);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Value label
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(fmtUsd(v), x + barW / 2, barTop - 4);
+
+    // Category label
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px "Inter", sans-serif';
+    ctx.save();
+    ctx.translate(x + barW / 2, ch - padBottom + 8);
+    ctx.rotate(-0.4);
+    ctx.textAlign = 'left';
+    ctx.fillText(item.label, 0, 0);
+    ctx.restore();
+
+    cumulative += v;
+  }
+
+  // Total bar
+  const tx = padLeft + gap * (items.length + 0.5) - barW / 2;
+  const tBarTop = Math.min(yOf(0), yOf(cumulative));
+  const tBarH = Math.abs(yOf(cumulative) - yOf(0)) || 1;
+  ctx.fillStyle = cumulative >= 0 ? COLORS.green : COLORS.red;
+  ctx.globalAlpha = 0.7;
+  ctx.fillRect(tx, tBarTop, barW, tBarH);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = cumulative >= 0 ? COLORS.green : COLORS.red;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(tx, tBarTop, barW, tBarH);
+
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 11px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(fmtUsd(cumulative), tx + barW / 2, tBarTop - 4);
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '10px "Inter", sans-serif';
+  ctx.fillText('TOTAL', tx + barW / 2, ch - padBottom + 12);
+}
+
+function drawStackedBars(canvas, probs) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+  ctx.clearRect(0, 0, cw, ch);
+
+  const entries = [
+    { key: 'quiet', label: 'Quiet', color: COLORS.green },
+    { key: 'trending', label: 'Trend', color: COLORS.purple },
+    { key: 'volatile', label: 'Vol', color: COLORS.yellow },
+    { key: 'cascade', label: 'Casc', color: COLORS.red },
+  ];
+
+  const pad = 8;
+  const barH = ch - pad * 2 - 16;
+  let y = pad + 16;
+
+  // Title
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '11px "Inter", sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Regime Probabilities', pad, 12);
+
+  let x = pad;
+  const totalW = cw - pad * 2;
+
+  for (const e of entries) {
+    const p = (probs && probs[e.key]) || 0;
+    const w = totalW * p;
+    if (w > 0) {
+      ctx.fillStyle = e.color;
+      ctx.fillRect(x, y, Math.max(w, 1), barH);
+
+      if (w > 30) {
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(Math.round(p * 100) + '%', x + w / 2, y + barH / 2);
+      }
+      x += w;
+    }
+  }
+
+  // Legend
+  ctx.textBaseline = 'top';
+  let lx = pad;
+  for (const e of entries) {
+    ctx.fillStyle = e.color;
+    ctx.fillRect(lx, y + barH + 4, 8, 8);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '9px "Inter", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(e.label, lx + 10, y + barH + 4);
+    lx += 50;
+  }
+}
+
+function drawCumulativePnl(canvas, fills) {
+  if (!canvas || !fills || fills.length === 0) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+  ctx.clearRect(0, 0, cw, ch);
+
+  const pad = { top: 20, bottom: 25, left: 50, right: 10 };
+  const plotW = cw - pad.left - pad.right;
+  const plotH = ch - pad.top - pad.bottom;
+
+  const data = [...fills].reverse();
+  const vals = data.map(f => f.cumPnl || 0);
+  const minV = Math.min(0, ...vals);
+  const maxV = Math.max(0, ...vals);
+  const range = (maxV - minV) || 1;
+  function yOf(v) { return pad.top + plotH * (1 - (v - minV) / range); }
+
+  // Zero line
+  ctx.strokeStyle = '#475569';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(pad.left, yOf(0)); ctx.lineTo(cw - pad.right, yOf(0)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Line
+  ctx.beginPath();
+  ctx.strokeStyle = COLORS.blue;
+  ctx.lineWidth = 2;
+  for (let i = 0; i < data.length; i++) {
+    const x = pad.left + (plotW / Math.max(data.length - 1, 1)) * i;
+    const y = yOf(vals[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Fill under
+  ctx.lineTo(pad.left + plotW, yOf(0));
+  ctx.lineTo(pad.left, yOf(0));
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, pad.top, 0, ch - pad.bottom);
+  const lastVal = vals[vals.length - 1] || 0;
+  const baseColor = lastVal >= 0 ? COLORS.green : COLORS.red;
+  grad.addColorStop(0, baseColor + '30');
+  grad.addColorStop(1, baseColor + '05');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Y-axis labels
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const v = minV + (range / 4) * i;
+    ctx.fillText('$' + fmt(v, 0), pad.left - 4, yOf(v));
+  }
+}
+
+function drawPositionTimeSeries(canvas, history, maxPos) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const cw = canvas.offsetWidth, ch = canvas.offsetHeight;
+  ctx.clearRect(0, 0, cw, ch);
+
+  const pad = { top: 10, bottom: 20, left: 40, right: 10 };
+  const plotW = cw - pad.left - pad.right;
+  const plotH = ch - pad.top - pad.bottom;
+  const limit = maxPos || 10;
+  const data = history || [];
+
+  function yOf(v) { return pad.top + plotH * (1 - (v + limit) / (2 * limit)); }
+
+  // Limit lines
+  ctx.strokeStyle = COLORS.red + '60';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(pad.left, yOf(limit)); ctx.lineTo(cw - pad.right, yOf(limit)); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(pad.left, yOf(-limit)); ctx.lineTo(cw - pad.right, yOf(-limit)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Zero line
+  ctx.strokeStyle = '#475569';
+  ctx.beginPath(); ctx.moveTo(pad.left, yOf(0)); ctx.lineTo(cw - pad.right, yOf(0)); ctx.stroke();
+
+  // Position line
+  if (data.length > 0) {
+    ctx.beginPath();
+    ctx.strokeStyle = COLORS.blue;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < data.length; i++) {
+      const x = pad.left + (plotW / Math.max(data.length - 1, 1)) * i;
+      const inv = data[i].input_inventory != null ? data[i].input_inventory : 0;
+      const y = yOf(inv);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // Labels
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('+' + fmt(limit, 0), pad.left - 4, yOf(limit));
+  ctx.fillText('0', pad.left - 4, yOf(0));
+  ctx.fillText('-' + fmt(limit, 0), pad.left - 4, yOf(-limit));
+}
+
+// ─── Components ───
+
+// Connection status dot
+function StatusDot({ status }) {
+  const colorMap = { ws: COLORS.green, http: COLORS.yellow, disconnected: COLORS.red };
+  const labelMap = { ws: 'WS Live', http: 'HTTP Poll', disconnected: 'Offline' };
+  return h('div', { className: 'flex items-center gap-1.5' },
+    h('div', {
+      className: 'w-2 h-2 rounded-full' + (status === 'ws' ? ' pulse-dot' : ''),
+      style: { backgroundColor: colorMap[status] || COLORS.red }
+    }),
+    h('span', { className: 'text-xs mono', style: { color: colorMap[status] } }, labelMap[status] || 'Offline')
+  );
+}
+
+// Regime badge
+function RegimeBadge({ regime }) {
+  const r = regime || 'Unknown';
+  const color = REGIME_COLORS[r] || COLORS.blue;
+  return h('span', {
+    className: 'px-2 py-0.5 rounded text-xs font-semibold mono',
+    style: { backgroundColor: color + '25', color: color, border: '1px solid ' + color + '40' }
+  }, r);
+}
+
+// Flash-on-change value display
+function LiveValue({ value, format, className, prevRef }) {
+  const elRef = useRef(null);
+  const prev = useRef(value);
+  useEffect(() => {
+    if (prev.current !== value && elRef.current) {
+      elRef.current.classList.remove('flash');
+      void elRef.current.offsetWidth; // reflow
+      elRef.current.classList.add('flash');
+    }
+    prev.current = value;
+  }, [value]);
+  const display = format ? format(value) : (value != null ? String(value) : '--');
+  return h('span', { ref: elRef, className: 'mono transition-colors ' + (className || '') }, display);
+}
+
+// ─── Header ───
+function Header({ state }) {
+  const q = state.quotes || {};
+  const p = state.pnl || {};
+  const r = state.risk_summary || {};
+  const inv = q.inventory || 0;
+  const dir = inv > 0.01 ? 'LONG' : inv < -0.01 ? 'SHORT' : 'FLAT';
+  const dirColor = inv > 0 ? COLORS.green : inv < 0 ? COLORS.red : COLORS.blue;
+  const killOk = !r.kill_switch_triggered;
+
+  return h('div', { className: 'flex items-center gap-4 px-4 py-2 bg-gray-950 border-b border-gray-800 text-sm flex-shrink-0 flex-wrap' },
+    h(StatusDot, { status: state.wsStatus }),
+    h('span', { className: 'font-bold text-blue-400' }, 'HYPE-PERP'),
+    h('div', { className: 'flex items-center gap-1' },
+      h('span', { className: 'text-gray-500' }, 'Mid:'),
+      h(LiveValue, { value: q.mid, format: v => '$' + fmt(v, 2), className: 'text-white font-semibold' })
+    ),
+    h('div', { className: 'flex items-center gap-1' },
+      h('span', { className: 'text-gray-500' }, 'Pos:'),
+      h('span', { className: 'mono font-semibold', style: { color: dirColor } },
+        (inv >= 0 ? '+' : '') + fmt(inv, 2) + ' ' + dir)
+    ),
+    h('div', { className: 'flex items-center gap-1' },
+      h('span', { className: 'text-gray-500' }, 'PnL:'),
+      h(LiveValue, {
+        value: p.total,
+        format: fmtUsd,
+        className: 'font-semibold ' + ((p.total || 0) >= 0 ? 'text-green-400' : 'text-red-400')
+      })
+    ),
+    h('div', { className: 'flex items-center gap-1' },
+      h('span', { className: 'text-gray-500' }, 'Regime:'),
+      h(RegimeBadge, { regime: (state.regime || {}).current || (q.regime) })
+    ),
+    h('div', { className: 'flex items-center gap-1' },
+      h('span', { className: 'text-gray-500' }, 'Kill:'),
+      h('span', {
+        className: 'mono font-semibold px-1.5 py-0.5 rounded text-xs',
+        style: {
+          color: killOk ? COLORS.green : COLORS.red,
+          backgroundColor: killOk ? COLORS.green + '20' : COLORS.red + '20',
+        }
+      }, killOk ? 'OK' : 'TRIGGERED')
+    ),
+    h('div', { className: 'flex items-center gap-1 ml-auto' },
+      h('span', { className: 'text-gray-600 text-xs' }, 'Spread:'),
+      h(LiveValue, { value: q.spread_bps, format: fmtBps, className: 'text-xs text-gray-400' })
+    )
+  );
+}
+
+// ─── Tab Bar ───
+function TabBar({ activeTab, onTabChange }) {
+  const tabs = ['COMMAND', 'PIPELINE', 'RISK', 'ANALYTICS'];
+  return h('div', { className: 'flex border-b border-gray-800 bg-gray-950 px-4 flex-shrink-0' },
+    tabs.map(t =>
+      h('button', {
+        key: t,
+        className: 'px-4 py-2 text-sm font-medium cursor-pointer transition-colors ' +
+          (activeTab === t ? 'tab-active' : 'tab-inactive'),
+        onClick: () => onTabChange(t)
+      }, t)
+    )
+  );
+}
+
+// ─── COMMAND TAB ───
+
+// Price Chart with lightweight-charts
+function PriceChart({ priceHistory, pipeline, fills }) {
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const lineSeriesRef = useRef(null);
+  const bidLineRef = useRef(null);
+  const askLineRef = useRef(null);
+  const microLineRef = useRef(null);
+  const markersRef = useRef([]);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const chart = LightweightCharts.createChart(containerRef.current, {
+      width: containerRef.current.offsetWidth,
+      height: containerRef.current.offsetHeight,
+      layout: { background: { type: 'solid', color: '#1e293b' }, textColor: '#94a3b8', fontSize: 10 },
+      grid: { vertLines: { color: '#334155' }, horzLines: { color: '#334155' } },
+      crosshair: { mode: 0 },
+      rightPriceScale: { borderColor: '#334155' },
+      timeScale: { borderColor: '#334155', timeVisible: true, secondsVisible: false },
+    });
+    const lineSeries = chart.addSeries(LightweightCharts.LineSeries, {
+      color: '#3b82f6', lineWidth: 2, priceLineVisible: false,
+      lastValueVisible: true,
+    });
+    chartRef.current = chart;
+    lineSeriesRef.current = lineSeries;
+
+    const ro = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      chart.resize(width, height);
+    });
+    ro.observe(containerRef.current);
+
+    return () => { ro.disconnect(); chart.remove(); };
+  }, []);
+
+  useEffect(() => {
+    if (!lineSeriesRef.current || !priceHistory) return;
+    const data = priceHistory.map(p => ({
+      time: Math.floor((p.timestamp_ms || 0) / 1000),
+      value: p.price || 0,
+    })).filter(d => d.time > 0 && d.value > 0);
+    if (data.length > 0) {
+      // Ensure sorted and deduplicated
+      data.sort((a, b) => a.time - b.time);
+      const deduped = [];
+      for (const d of data) {
+        if (deduped.length === 0 || deduped[deduped.length - 1].time < d.time) {
+          deduped.push(d);
+        }
+      }
+      lineSeriesRef.current.setData(deduped);
+    }
+  }, [priceHistory]);
+
+  // Update price lines for bid/ask/microprice
+  useEffect(() => {
+    if (!lineSeriesRef.current || !pipeline) return;
+    const series = lineSeriesRef.current;
+
+    // Remove old price lines
+    if (bidLineRef.current) { series.removePriceLine(bidLineRef.current); bidLineRef.current = null; }
+    if (askLineRef.current) { series.removePriceLine(askLineRef.current); askLineRef.current = null; }
+    if (microLineRef.current) { series.removePriceLine(microLineRef.current); microLineRef.current = null; }
+
+    const bidPrices = pipeline.bid_prices;
+    const askPrices = pipeline.ask_prices;
+    if (bidPrices && bidPrices.length > 0) {
+      bidLineRef.current = series.createPriceLine({
+        price: bidPrices[0], color: COLORS.green + 'a0', lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: false, title: 'BID',
+      });
+    }
+    if (askPrices && askPrices.length > 0) {
+      askLineRef.current = series.createPriceLine({
+        price: askPrices[0], color: COLORS.red + 'a0', lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: false, title: 'ASK',
+      });
+    }
+    if (pipeline.microprice) {
+      microLineRef.current = series.createPriceLine({
+        price: pipeline.microprice, color: COLORS.yellow + 'a0', lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: false, title: 'uPx',
+      });
+    }
+  }, [pipeline]);
+
+  // Fill markers
+  useEffect(() => {
+    if (!lineSeriesRef.current || !fills) return;
+    const markers = fills.slice(0, 20).map(f => ({
+      time: Math.floor((f.timestamp_ms || 0) / 1000),
+      position: f.side === 'BID' ? 'belowBar' : 'aboveBar',
+      color: f.side === 'BID' ? COLORS.green : COLORS.red,
+      shape: f.side === 'BID' ? 'arrowUp' : 'arrowDown',
+      text: (f.pnl >= 0 ? '+' : '') + fmt(f.pnl, 2),
+    })).filter(m => m.time > 0);
+    markers.sort((a, b) => a.time - b.time);
+    lineSeriesRef.current.setMarkers(markers);
+  }, [fills]);
+
+  return h('div', { ref: containerRef, className: 'w-full h-full' });
+}
+
+// Position & Risk Panel
+function PositionRiskPanel({ quotes, risk, pipeline }) {
+  const posGaugeRef = useRef(null);
+  const ddBarRef = useRef(null);
+  const ksBarRef = useRef(null);
+
+  const inv = (quotes || {}).inventory || 0;
+  const maxInv = 10;
+  const posPct = (risk || {}).position_pct || 0;
+  const ddPct = (risk || {}).drawdown_pct || 0;
+  const ksHeadroom = (risk || {}).kill_switch_headroom_pct || 100;
+  const cascSev = (risk || {}).cascade_severity || 0;
+
+  useEffect(() => {
+    drawSemiGauge(posGaugeRef.current, posPct, 0, 100, 'Position %', '%', [50, 80]);
+  }, [posPct]);
+
+  useEffect(() => {
+    drawHorizontalBar(ddBarRef.current, ddPct, 10, 'Drawdown', [50, 80], true);
+  }, [ddPct]);
+
+  useEffect(() => {
+    drawHorizontalBar(ksBarRef.current, 100 - ksHeadroom, 100, 'Kill Switch Headroom (' + fmt(ksHeadroom, 0) + '%)', [50, 80], true);
+  }, [ksHeadroom]);
+
+  const cascColor = cascSev < 0.1 ? COLORS.green : cascSev < 0.5 ? COLORS.yellow : COLORS.red;
+
+  return h('div', { className: 'flex flex-col gap-2 h-full p-3' },
+    h('canvas', { ref: posGaugeRef, className: 'w-full', style: { height: '120px' } }),
+    h('canvas', { ref: ddBarRef, className: 'w-full', style: { height: '36px' } }),
+    h('canvas', { ref: ksBarRef, className: 'w-full', style: { height: '36px' } }),
+    h('div', { className: 'flex items-center gap-2 text-xs' },
+      h('span', { className: 'text-gray-500' }, 'Cascade:'),
+      h('div', { className: 'w-3 h-3 rounded-full', style: { backgroundColor: cascColor } }),
+      h('span', { className: 'mono', style: { color: cascColor } }, fmt(cascSev, 3))
+    ),
+    h('div', { className: 'flex items-center gap-2 text-xs' },
+      h('span', { className: 'text-gray-500' }, 'Margin:'),
+      h('span', { className: 'mono text-gray-300' }, fmtPct((pipeline || {}).margin_utilization_pct))
+    )
+  );
+}
+
+// Live Parameters Grid
+function LiveParams({ quotes, pipeline, kappaDiag }) {
+  const q = quotes || {};
+  const p = pipeline || {};
+  const kd = kappaDiag || {};
+
+  const params = [
+    { label: '\u03BA kappa', value: fmt(q.kappa || kd.posterior_mean, 0), sub: kd.confidence != null ? 'conf: ' + fmt(kd.confidence, 2) : null },
+    { label: '\u03C3 sigma', value: fmtPct(p.sigma_pct != null ? p.sigma_pct * 100 : null) },
+    { label: '\u03B3 gamma', value: fmt(q.gamma, 3) },
+    { label: 'Spread', value: fmtBps(q.spread_bps || p.total_spread_bps) },
+    { label: 'Drift', value: fmtBps(p.drift_bps) },
+    { label: 'Regime', value: q.regime || p.regime || '--', isRegime: true },
+    { label: 'Toxicity', value: fmt(p.toxicity, 3) },
+    { label: 'Fill Prob', value: fmtPct(q.fill_prob) },
+    { label: 'AS Prob', value: fmtPct(q.adverse_prob) },
+    { label: 'GLFT Sprd', value: fmtBps(p.glft_spread_bps) },
+    { label: 'Risk Prem', value: fmtBps(p.risk_premium_bps) },
+    { label: 'Kelly', value: fmt(p.kelly_fraction, 3) },
+  ];
+
+  return h('div', { className: 'grid grid-cols-3 gap-1 p-2 text-xs h-full overflow-auto' },
+    params.map((p, i) =>
+      h('div', { key: i, className: 'bg-gray-800/50 rounded px-2 py-1.5 flex flex-col' },
+        h('span', { className: 'text-gray-500 text-[10px] leading-tight' }, p.label),
+        p.isRegime
+          ? h(RegimeBadge, { regime: p.value })
+          : h(LiveValue, { value: p.value, className: 'text-gray-200 font-medium text-sm leading-tight' }),
+        p.sub ? h('span', { className: 'text-gray-600 text-[9px]' }, p.sub) : null
+      )
+    )
+  );
+}
+
+// Fills Table
+function FillsTable({ fills }) {
+  const list = fills || [];
+  return h('div', { className: 'flex flex-col h-full' },
+    h('div', { className: 'flex items-center px-2 py-1 text-[10px] text-gray-500 border-b border-gray-700 font-semibold uppercase tracking-wider' },
+      h('span', { className: 'w-14' }, 'Time'),
+      h('span', { className: 'w-10' }, 'Side'),
+      h('span', { className: 'w-16 text-right' }, 'PnL'),
+      h('span', { className: 'w-16 text-right' }, 'Cum'),
+      h('span', { className: 'w-12 text-right' }, 'AS')
+    ),
+    h('div', { className: 'flex-1 overflow-y-auto' },
+      list.length === 0
+        ? h('div', { className: 'text-gray-600 text-xs text-center py-4' }, 'No fills yet')
+        : list.map((f, i) => {
+            const profitable = (f.pnl || 0) >= 0;
+            return h('div', {
+              key: i,
+              className: 'flex items-center px-2 py-1 text-xs mono fill-row-enter border-b border-gray-800/50 ' +
+                (profitable ? 'hover:bg-green-900/10' : 'hover:bg-red-900/10'),
+            },
+              h('span', { className: 'w-14 text-gray-400' }, f.time || '--'),
+              h('span', {
+                className: 'w-10 font-semibold',
+                style: { color: f.side === 'BID' ? COLORS.green : COLORS.red }
+              }, f.side || '--'),
+              h('span', {
+                className: 'w-16 text-right font-medium',
+                style: { color: profitable ? COLORS.green : COLORS.red }
+              }, fmtUsd(f.pnl)),
+              h('span', { className: 'w-16 text-right text-gray-300' }, fmtUsd(f.cumPnl)),
+              h('span', { className: 'w-12 text-right text-gray-400' }, f.as || '--')
+            );
+          })
+    ),
+    list.length > 0 ? h('div', { className: 'flex items-center px-2 py-1 text-xs mono border-t border-gray-700 bg-gray-800/30' },
+      h('span', { className: 'text-gray-500' }, list.length + ' fills'),
+      h('span', { className: 'ml-auto font-semibold', style: { color: (list[0]?.cumPnl || 0) >= 0 ? COLORS.green : COLORS.red } },
+        'Total: ' + fmtUsd(list[0]?.cumPnl))
+    ) : null
+  );
+}
+
+function CommandTab({ state }) {
+  return h('div', { className: 'grid grid-cols-2 grid-rows-2 gap-2 p-2 h-full min-h-0' },
+    // Top-Left: Price Chart
+    h('div', { className: 'card overflow-hidden flex flex-col min-h-0' },
+      h('div', { className: 'text-xs text-gray-500 px-3 py-1.5 border-b border-gray-700/50 font-semibold' }, 'PRICE + QUOTES'),
+      h('div', { className: 'flex-1 min-h-0' },
+        h(PriceChart, { priceHistory: state.price_history, pipeline: state.pipeline, fills: state.fills })
+      )
+    ),
+    // Top-Right: Position & Risk
+    h('div', { className: 'card overflow-hidden flex flex-col min-h-0' },
+      h('div', { className: 'text-xs text-gray-500 px-3 py-1.5 border-b border-gray-700/50 font-semibold' }, 'POSITION & RISK'),
+      h('div', { className: 'flex-1 min-h-0 overflow-auto' },
+        h(PositionRiskPanel, { quotes: state.quotes, risk: state.risk_summary, pipeline: state.pipeline })
+      )
+    ),
+    // Bottom-Left: Live Parameters
+    h('div', { className: 'card overflow-hidden flex flex-col min-h-0' },
+      h('div', { className: 'text-xs text-gray-500 px-3 py-1.5 border-b border-gray-700/50 font-semibold' }, 'LIVE PARAMETERS'),
+      h('div', { className: 'flex-1 min-h-0 overflow-auto' },
+        h(LiveParams, { quotes: state.quotes, pipeline: state.pipeline, kappaDiag: state.kappa_diagnostics })
+      )
+    ),
+    // Bottom-Right: Recent Fills
+    h('div', { className: 'card overflow-hidden flex flex-col min-h-0' },
+      h('div', { className: 'text-xs text-gray-500 px-3 py-1.5 border-b border-gray-700/50 font-semibold' }, 'RECENT FILLS'),
+      h('div', { className: 'flex-1 min-h-0' },
+        h(FillsTable, { fills: state.fills })
+      )
+    )
+  );
+}
+
+// ─── PIPELINE TAB ───
+
+function PipelineCard({ title, items, alertLevel }) {
+  const borderColor = alertLevel === 'red' ? COLORS.red
+    : alertLevel === 'yellow' ? COLORS.yellow
+    : 'transparent';
+  const bgColor = alertLevel === 'red' ? COLORS.red + '10'
+    : alertLevel === 'yellow' ? COLORS.yellow + '10'
+    : '';
+
+  return h('div', {
+    className: 'card p-3 flex flex-col gap-1 min-w-[140px] flex-1',
+    style: { borderColor: borderColor, backgroundColor: bgColor }
+  },
+    h('div', { className: 'text-xs font-bold text-blue-400 mb-1 tracking-wide' }, title),
+    items.map((item, i) =>
+      h('div', { key: i, className: 'flex justify-between items-center gap-2' },
+        h('span', { className: 'text-[10px] text-gray-500 whitespace-nowrap' }, item.label),
+        h(LiveValue, { value: item.value, className: 'text-xs text-gray-200 mono font-medium' })
+      )
+    )
+  );
+}
+
+function PipelineArrow() {
+  return h('div', { className: 'flex items-center justify-center text-gray-600 text-xl px-1 flex-shrink-0 self-center' },
+    h('svg', { width: 24, height: 24, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2 },
+      h('path', { d: 'M5 12h14m-4-4l4 4-4 4' })
+    )
+  );
+}
+
+function PipelineTab({ state }) {
+  const p = state.pipeline || {};
+  const q = state.quotes || {};
+  const r = state.risk_summary || {};
+
+  function alertFor(key, val, lo, hi) {
+    if (val == null) return null;
+    if (val >= hi) return 'red';
+    if (val >= lo) return 'yellow';
+    return null;
+  }
+
+  const stages = [
+    {
+      title: 'EVENTS',
+      items: [
+        { label: 'Data Age', value: (r.data_age_ms != null ? r.data_age_ms + 'ms' : '--') },
+        { label: 'Regime', value: p.regime || q.regime || '--' },
+        { label: 'Obs Count', value: fmt((state.kappa_diagnostics || {}).observation_count, 0) },
+      ],
+      alertLevel: alertFor('age', r.data_age_ms, 500, 2000),
+    },
+    {
+      title: 'POSTERIORS',
+      items: [
+        { label: '\u03BC drift', value: fmtBps(p.drift_bps_s) },
+        { label: '\u03C3', value: p.sigma_pct != null ? fmt(p.sigma_pct * 100, 3) + '%' : '--' },
+        { label: 'Toxicity', value: fmt(p.toxicity, 3) },
+        { label: 'Regime', value: p.regime || '--' },
+      ],
+      alertLevel: alertFor('tox', p.toxicity, 0.3, 0.6),
+    },
+    {
+      title: 'RESERVATION',
+      items: [
+        { label: 'Microprice', value: '$' + fmt(p.microprice, 2) },
+        { label: 'Drift bps', value: fmtBps(p.drift_bps) },
+        { label: 'Reserv Px', value: '$' + fmt(p.reservation_price, 2) },
+      ],
+    },
+    {
+      title: 'SPREAD',
+      items: [
+        { label: 'GLFT', value: fmtBps(p.glft_spread_bps) },
+        { label: 'Risk Prem', value: fmtBps(p.risk_premium_bps) },
+        { label: 'Total', value: fmtBps(p.total_spread_bps) },
+      ],
+      alertLevel: alertFor('spread', p.total_spread_bps, 20, 50),
+    },
+    {
+      title: 'DEPTHS',
+      items: [
+        { label: 'Bid Depth', value: fmt(p.bid_depth, 1) },
+        { label: 'Ask Depth', value: fmt(p.ask_depth, 1) },
+        { label: 'Skew bps', value: fmtBps(p.depth_skew_bps) },
+      ],
+    },
+    {
+      title: 'SIZING',
+      items: [
+        { label: 'Kelly', value: fmt(p.kelly_fraction, 3) },
+        { label: 'Max Size', value: fmt(p.max_size, 3) },
+        { label: 'Margin %', value: fmtPct(p.margin_utilization_pct) },
+      ],
+      alertLevel: alertFor('margin', p.margin_utilization_pct, 80, 95),
+    },
+    {
+      title: 'LADDER',
+      items: [
+        { label: 'Bid Lvls', value: fmt(p.bid_levels, 0) },
+        { label: 'Ask Lvls', value: fmt(p.ask_levels, 0) },
+        { label: 'Best Bid', value: p.bid_prices && p.bid_prices[0] ? '$' + fmt(p.bid_prices[0], 2) : '--' },
+        { label: 'Best Ask', value: p.ask_prices && p.ask_prices[0] ? '$' + fmt(p.ask_prices[0], 2) : '--' },
+      ],
+    },
+  ];
+
+  return h('div', { className: 'p-4 h-full overflow-auto' },
+    h('div', { className: 'text-sm text-gray-400 mb-3 font-medium' }, 'Bayesian Event \u2192 Quote Pipeline'),
+    h('div', { className: 'flex items-stretch gap-0 overflow-x-auto pb-2' },
+      stages.flatMap((s, i) => {
+        const els = [h(PipelineCard, { key: 'card-' + i, ...s })];
+        if (i < stages.length - 1) els.push(h(PipelineArrow, { key: 'arrow-' + i }));
+        return els;
+      })
+    ),
+    // Additional detail section
+    h('div', { className: 'grid grid-cols-3 gap-3 mt-4' },
+      // Kappa diagnostics
+      h('div', { className: 'card p-3' },
+        h('div', { className: 'text-xs font-bold text-blue-400 mb-2' }, '\u03BA DIAGNOSTICS'),
+        h('div', { className: 'space-y-1 text-xs' },
+          h('div', { className: 'flex justify-between' }, h('span', { className: 'text-gray-500' }, 'Posterior Mean'), h('span', { className: 'mono text-gray-200' }, fmt((state.kappa_diagnostics || {}).posterior_mean, 0))),
+          h('div', { className: 'flex justify-between' }, h('span', { className: 'text-gray-500' }, 'Posterior Std'), h('span', { className: 'mono text-gray-200' }, fmt((state.kappa_diagnostics || {}).posterior_std, 0))),
+          h('div', { className: 'flex justify-between' }, h('span', { className: 'text-gray-500' }, '95% CI'), h('span', { className: 'mono text-gray-200' },
+            '[' + fmt((state.kappa_diagnostics || {}).ci_95_lower, 0) + ', ' + fmt((state.kappa_diagnostics || {}).ci_95_upper, 0) + ']')),
+          h('div', { className: 'flex justify-between' }, h('span', { className: 'text-gray-500' }, 'CV'), h('span', { className: 'mono text-gray-200' }, fmt((state.kappa_diagnostics || {}).cv, 3))),
+          h('div', { className: 'flex justify-between' }, h('span', { className: 'text-gray-500' }, 'Heavy Tailed'), h('span', { className: 'mono', style: { color: (state.kappa_diagnostics || {}).is_heavy_tailed ? COLORS.yellow : COLORS.green } },
+            (state.kappa_diagnostics || {}).is_heavy_tailed ? 'Yes' : 'No')),
+          h('div', { className: 'flex justify-between' }, h('span', { className: 'text-gray-500' }, 'Mean Dist bps'), h('span', { className: 'mono text-gray-200' }, fmtBps((state.kappa_diagnostics || {}).mean_distance_bps)))
+        )
+      ),
+      // Bid ladder
+      h('div', { className: 'card p-3' },
+        h('div', { className: 'text-xs font-bold text-green-400 mb-2' }, 'BID LADDER'),
+        h('div', { className: 'space-y-0.5' },
+          (p.bid_prices || []).map((px, i) =>
+            h('div', { key: i, className: 'flex justify-between text-xs' },
+              h('span', { className: 'text-gray-500' }, 'L' + (i + 1)),
+              h('span', { className: 'mono text-green-400' }, '$' + fmt(px, 4))
+            )
+          ),
+          (p.bid_prices || []).length === 0 ? h('span', { className: 'text-gray-600 text-xs' }, 'No data') : null
+        )
+      ),
+      // Ask ladder
+      h('div', { className: 'card p-3' },
+        h('div', { className: 'text-xs font-bold text-red-400 mb-2' }, 'ASK LADDER'),
+        h('div', { className: 'space-y-0.5' },
+          (p.ask_prices || []).map((px, i) =>
+            h('div', { key: i, className: 'flex justify-between text-xs' },
+              h('span', { className: 'text-gray-500' }, 'L' + (i + 1)),
+              h('span', { className: 'mono text-red-400' }, '$' + fmt(px, 4))
+            )
+          ),
+          (p.ask_prices || []).length === 0 ? h('span', { className: 'text-gray-600 text-xs' }, 'No data') : null
+        )
+      )
+    )
+  );
+}
+
+// ─── RISK TAB ───
+
+function RiskTab({ state }) {
+  const r = state.risk_summary || {};
+  const regime = state.regime || {};
+  const posCanvasRef = useRef(null);
+  const regimeBarRef = useRef(null);
+  const cascadeGaugeRef = useRef(null);
+  const velGaugeRef = useRef(null);
+
+  useEffect(() => {
+    drawPositionTimeSeries(posCanvasRef.current, state.decision_history, 10);
+  }, [state.decision_history]);
+
+  useEffect(() => {
+    drawStackedBars(regimeBarRef.current, regime.probabilities);
+  }, [regime.probabilities]);
+
+  useEffect(() => {
+    drawSemiGauge(cascadeGaugeRef.current, (r.cascade_severity || 0) * 100, 0, 100, 'Cascade Severity', '%', [30, 60]);
+  }, [r.cascade_severity]);
+
+  useEffect(() => {
+    drawSemiGauge(velGaugeRef.current, Math.abs(r.position_velocity_1m || 0) * 100, 0, 50, 'Pos Velocity', '/m', [20, 35]);
+  }, [r.position_velocity_1m]);
+
+  const killOk = !r.kill_switch_triggered;
+
+  const killConditions = [
+    { label: 'Kill Switch', ok: killOk, value: killOk ? 'Armed' : 'TRIGGERED' },
+    { label: 'Headroom', ok: (r.kill_switch_headroom_pct || 100) > 20, value: fmtPct(r.kill_switch_headroom_pct) },
+    { label: 'Drawdown', ok: (r.drawdown_pct || 0) < 5, value: fmtPct(r.drawdown_pct) },
+    { label: 'Position %', ok: (r.position_pct || 0) < 80, value: fmtPct(r.position_pct) },
+    { label: 'Data Age', ok: (r.data_age_ms || 0) < 1000, value: (r.data_age_ms || '--') + 'ms' },
+    { label: 'Px Velocity', ok: Math.abs(r.price_velocity_1s || 0) < 0.01, value: fmt(r.price_velocity_1s, 4) },
+  ];
+
+  return h('div', { className: 'p-3 h-full overflow-auto grid grid-cols-3 grid-rows-3 gap-2' },
+    // Row 1
+    h('div', { className: 'card p-3 col-span-2 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-1' }, 'POSITION TIME SERIES'),
+      h('canvas', { ref: posCanvasRef, className: 'w-full flex-1', style: { minHeight: '80px' } })
+    ),
+    h('div', { className: 'card p-3 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-1' }, 'POSITION VELOCITY'),
+      h('canvas', { ref: velGaugeRef, className: 'w-full flex-1', style: { minHeight: '80px' } })
+    ),
+
+    // Row 2
+    h('div', { className: 'card p-3 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-1' }, 'CASCADE SEVERITY'),
+      h('canvas', { ref: cascadeGaugeRef, className: 'w-full flex-1', style: { minHeight: '80px' } })
+    ),
+    h('div', { className: 'card p-3 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-1' }, 'REGIME PROBABILITIES'),
+      h('canvas', { ref: regimeBarRef, className: 'w-full flex-1', style: { minHeight: '80px' } })
+    ),
+    h('div', { className: 'card p-3 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-1' }, 'PRICE VELOCITY'),
+      h('div', { className: 'flex flex-col gap-2 flex-1 justify-center' },
+        h('div', { className: 'text-center' },
+          h('span', { className: 'mono text-2xl font-bold', style: { color: Math.abs(r.price_velocity_1s || 0) > 0.005 ? COLORS.yellow : COLORS.green } },
+            fmt(r.price_velocity_1s, 5)),
+          h('div', { className: 'text-[10px] text-gray-500 mt-1' }, '/sec')
+        ),
+        h('div', { className: 'text-center' },
+          h('span', { className: 'text-gray-500 text-xs' }, 'Pos Vel 1m: '),
+          h('span', { className: 'mono text-sm text-gray-300' }, fmt(r.position_velocity_1m, 4))
+        )
+      )
+    ),
+
+    // Row 3
+    h('div', { className: 'card p-3 col-span-2' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-2' }, 'KILL SWITCH STATUS'),
+      h('div', { className: 'grid grid-cols-3 gap-2' },
+        killConditions.map((c, i) =>
+          h('div', {
+            key: i,
+            className: 'flex items-center gap-2 px-2 py-1.5 rounded bg-gray-800/50',
+          },
+            h('div', { className: 'w-2 h-2 rounded-full flex-shrink-0', style: { backgroundColor: c.ok ? COLORS.green : COLORS.red } }),
+            h('div', { className: 'flex flex-col' },
+              h('span', { className: 'text-[10px] text-gray-500' }, c.label),
+              h('span', { className: 'mono text-xs font-medium', style: { color: c.ok ? COLORS.green : COLORS.red } }, c.value)
+            )
+          )
+        )
+      )
+    ),
+    h('div', { className: 'card p-3 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-2' }, 'DATA FRESHNESS'),
+      h('div', { className: 'space-y-2 flex-1' },
+        h('div', { className: 'flex justify-between items-center text-xs' },
+          h('span', { className: 'text-gray-500' }, 'Data Age'),
+          h('span', {
+            className: 'mono font-medium',
+            style: { color: (r.data_age_ms || 0) < 500 ? COLORS.green : (r.data_age_ms || 0) < 2000 ? COLORS.yellow : COLORS.red }
+          }, (r.data_age_ms || '--') + ' ms')
+        ),
+        h('div', { className: 'flex justify-between items-center text-xs' },
+          h('span', { className: 'text-gray-500' }, 'WS Status'),
+          h(StatusDot, { status: state.wsStatus })
+        ),
+        h('div', { className: 'flex justify-between items-center text-xs' },
+          h('span', { className: 'text-gray-500' }, 'Last Update'),
+          h('span', { className: 'mono text-gray-400' },
+            state.timestamp_ms > 0 ? new Date(state.timestamp_ms).toLocaleTimeString() : '--')
+        )
+      )
+    )
+  );
+}
+
+// ─── ANALYTICS TAB ───
+
+function AnalyticsTab({ state }) {
+  const p = state.pnl || {};
+  const cal = state.calibration || {};
+  const sigs = state.signals || [];
+  const waterfallRef = useRef(null);
+  const cumPnlRef = useRef(null);
+
+  const waterfallItems = [
+    { label: 'Spread Capture', value: p.spread_capture || 0 },
+    { label: 'Adverse Sel.', value: p.adverse_selection || 0 },
+    { label: 'Inventory Cost', value: p.inventory_cost || 0 },
+    { label: 'Fees', value: p.fees || 0 },
+  ];
+
+  useEffect(() => {
+    drawWaterfallChart(waterfallRef.current, waterfallItems);
+  }, [p.spread_capture, p.adverse_selection, p.inventory_cost, p.fees]);
+
+  useEffect(() => {
+    drawCumulativePnl(cumPnlRef.current, state.fills);
+  }, [state.fills]);
+
+  return h('div', { className: 'p-3 h-full overflow-auto grid grid-cols-2 grid-rows-[1fr_1fr_auto] gap-2' },
+    // Waterfall
+    h('div', { className: 'card p-3 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-1' }, 'PnL ATTRIBUTION'),
+      h('canvas', { ref: waterfallRef, className: 'w-full flex-1', style: { minHeight: '160px' } })
+    ),
+    // Cum PnL
+    h('div', { className: 'card p-3 flex flex-col' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-1' }, 'CUMULATIVE PnL'),
+      h('canvas', { ref: cumPnlRef, className: 'w-full flex-1', style: { minHeight: '160px' } })
+    ),
+    // PnL Summary + Calibration
+    h('div', { className: 'card p-3' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-2' }, 'PnL SUMMARY'),
+      h('div', { className: 'grid grid-cols-2 gap-2 text-xs' },
+        h('div', { className: 'flex justify-between bg-gray-800/50 rounded px-2 py-1.5' },
+          h('span', { className: 'text-gray-500' }, 'Spread Capture'),
+          h('span', { className: 'mono font-medium', style: { color: (p.spread_capture || 0) >= 0 ? COLORS.green : COLORS.red } }, fmtUsd(p.spread_capture))
+        ),
+        h('div', { className: 'flex justify-between bg-gray-800/50 rounded px-2 py-1.5' },
+          h('span', { className: 'text-gray-500' }, 'Adverse Sel'),
+          h('span', { className: 'mono font-medium', style: { color: (p.adverse_selection || 0) >= 0 ? COLORS.green : COLORS.red } }, fmtUsd(p.adverse_selection))
+        ),
+        h('div', { className: 'flex justify-between bg-gray-800/50 rounded px-2 py-1.5' },
+          h('span', { className: 'text-gray-500' }, 'Inventory Cost'),
+          h('span', { className: 'mono font-medium', style: { color: (p.inventory_cost || 0) >= 0 ? COLORS.green : COLORS.red } }, fmtUsd(p.inventory_cost))
+        ),
+        h('div', { className: 'flex justify-between bg-gray-800/50 rounded px-2 py-1.5' },
+          h('span', { className: 'text-gray-500' }, 'Fees'),
+          h('span', { className: 'mono font-medium', style: { color: (p.fees || 0) >= 0 ? COLORS.green : COLORS.red } }, fmtUsd(p.fees))
+        ),
+        h('div', { className: 'col-span-2 flex justify-between bg-gray-800/80 rounded px-2 py-2 border border-gray-700' },
+          h('span', { className: 'text-gray-400 font-semibold' }, 'Total PnL'),
+          h('span', { className: 'mono font-bold text-sm', style: { color: (p.total || 0) >= 0 ? COLORS.green : COLORS.red } }, fmtUsd(p.total))
+        )
+      )
+    ),
+    // Calibration
+    h('div', { className: 'card p-3' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-2' }, 'CALIBRATION'),
+      h('div', { className: 'space-y-3' },
+        h('div', { className: 'flex flex-col gap-1' },
+          h('div', { className: 'flex justify-between text-xs' },
+            h('span', { className: 'text-gray-500' }, 'Fill Probability'),
+            h('span', { className: 'text-gray-400' }, (cal.fill || {}).samples ? (cal.fill.samples + ' samples') : '')
+          ),
+          h(BrierBar, { score: (cal.fill || {}).brier_score, label: 'Brier Score' })
+        ),
+        h('div', { className: 'flex flex-col gap-1' },
+          h('div', { className: 'flex justify-between text-xs' },
+            h('span', { className: 'text-gray-500' }, 'Adverse Selection'),
+            h('span', { className: 'text-gray-400' }, (cal.adverse_selection || {}).samples ? (cal.adverse_selection.samples + ' samples') : '')
+          ),
+          h(BrierBar, { score: (cal.adverse_selection || {}).brier_score, label: 'Brier Score' })
+        )
+      )
+    ),
+    // Signal Table
+    h('div', { className: 'card p-3 col-span-2' },
+      h('div', { className: 'text-xs font-bold text-blue-400 mb-2' }, 'SIGNAL ANALYSIS'),
+      h('div', { className: 'overflow-x-auto' },
+        h('table', { className: 'w-full text-xs' },
+          h('thead', null,
+            h('tr', { className: 'border-b border-gray-700' },
+              ['Signal', 'MI', 'Correlation', 'Lag (ms)', 'Regime Var'].map(col =>
+                h('th', { key: col, className: 'text-left py-1.5 px-2 text-gray-500 font-medium text-[10px] uppercase tracking-wider' }, col)
+              )
+            )
+          ),
+          h('tbody', null,
+            sigs.length === 0
+              ? h('tr', null, h('td', { colSpan: 5, className: 'text-center py-3 text-gray-600' }, 'No signals'))
+              : sigs.map((s, i) =>
+                  h('tr', { key: i, className: 'border-b border-gray-800/50 hover:bg-gray-800/30' },
+                    h('td', { className: 'py-1.5 px-2 mono text-gray-200 font-medium' }, s.signal || '--'),
+                    h('td', { className: 'py-1.5 px-2 mono' },
+                      h('span', { style: { color: (s.mi || 0) > 0.05 ? COLORS.green : COLORS.yellow } }, fmt(s.mi, 4))
+                    ),
+                    h('td', { className: 'py-1.5 px-2 mono text-gray-300' }, fmt(s.corr, 3)),
+                    h('td', { className: 'py-1.5 px-2 mono text-gray-300' }, fmt(s.lag, 0)),
+                    h('td', { className: 'py-1.5 px-2 mono text-gray-300' }, fmt(s.rv, 2))
+                  )
+                )
+          )
+        )
+      )
+    )
+  );
+}
+
+function BrierBar({ score, label }) {
+  // Brier score: 0 = perfect, 0.25 = no skill, >0.25 = worse than random
+  const s = score != null ? score : null;
+  const pct = s != null ? clamp(s / 0.35, 0, 1) : 0;
+  const color = s == null ? COLORS.blue
+    : s < 0.15 ? COLORS.green
+    : s < 0.25 ? COLORS.yellow
+    : COLORS.red;
+
+  return h('div', { className: 'flex items-center gap-2' },
+    h('div', { className: 'flex-1 h-3 bg-gray-800 rounded overflow-hidden' },
+      s != null ? h('div', {
+        className: 'h-full rounded transition-all',
+        style: { width: (pct * 100) + '%', backgroundColor: color }
+      }) : null
+    ),
+    h('span', { className: 'mono text-xs font-medium w-12 text-right', style: { color } },
+      s != null ? fmt(s, 3) : '--')
+  );
+}
+
+// ─── No Data Overlay ───
+function NoDataOverlay({ wsStatus }) {
+  if (wsStatus === 'ws') return null;
+  return h('div', { className: 'absolute inset-0 bg-gray-900/60 backdrop-blur-sm flex items-center justify-center z-10 pointer-events-none' },
+    h('div', { className: 'text-center' },
+      h('div', { className: 'text-gray-400 text-lg mb-2' },
+        wsStatus === 'http' ? 'HTTP Fallback Mode' : 'Connecting...'),
+      h('div', { className: 'text-gray-600 text-sm' },
+        wsStatus === 'http'
+          ? 'WebSocket unavailable. Data may be delayed.'
+          : 'Waiting for WebSocket connection at ws://localhost:8080/ws/dashboard')
+    )
+  );
+}
+
+// ─── App Root ───
+function App() {
+  const [state, dispatch] = useReducer(dashReducer, INITIAL_STATE);
+  const [activeTab, setActiveTab] = useState('COMMAND');
+  const wsRef = useRef(null);
+
+  useEffect(() => {
+    const ws = new DashboardWS(
+      (msg) => {
+        switch (msg.type) {
+          case 'snapshot':
+            dispatch({ type: 'snapshot', state: msg.state });
+            break;
+          case 'update':
+            dispatch({ type: 'update', data: msg });
+            break;
+          case 'fill':
+            dispatch({ type: 'fill', record: msg.record });
+            break;
+          case 'connected':
+            console.log('Dashboard connected, client_id:', msg.client_id);
+            break;
+        }
+      },
+      (status) => dispatch({ type: 'status', status })
+    );
+    ws.connect();
+    wsRef.current = ws;
+    return () => ws.disconnect();
+  }, []);
+
+  let tabContent;
+  switch (activeTab) {
+    case 'COMMAND': tabContent = h(CommandTab, { state }); break;
+    case 'PIPELINE': tabContent = h(PipelineTab, { state }); break;
+    case 'RISK': tabContent = h(RiskTab, { state }); break;
+    case 'ANALYTICS': tabContent = h(AnalyticsTab, { state }); break;
+    default: tabContent = null;
+  }
+
+  return h('div', { className: 'flex flex-col h-screen' },
+    h(Header, { state }),
+    h(TabBar, { activeTab, onTabChange: setActiveTab }),
+    h('div', { className: 'flex-1 min-h-0 relative' },
+      state.wsStatus !== 'ws' ? h(NoDataOverlay, { wsStatus: state.wsStatus }) : null,
+      tabContent
+    )
+  );
+}
+
+// ─── Mount ───
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(h(App));
+
+</script>
+</body>
+</html>

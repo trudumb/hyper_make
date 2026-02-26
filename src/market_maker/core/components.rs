@@ -2,6 +2,8 @@
 //!
 //! Groups related modules into logical bundles for cleaner organization.
 
+use std::sync::Arc;
+
 use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{
@@ -282,6 +284,8 @@ pub struct InfraComponents {
     /// Budget pacer for EV-aware API budget allocation (L5: Churn Reduction).
     /// Filters low-value operations when API budget is tight.
     pub budget_pacer: BudgetPacer,
+    /// WebSocket dashboard state for real-time push updates.
+    pub dashboard_ws: Option<Arc<crate::market_maker::infra::dashboard_ws::DashboardWsState>>,
 }
 
 /// Cached exchange rate limit with timestamp.
@@ -439,6 +443,7 @@ impl InfraComponents {
             order_lifecycle: OrderLifecycleTracker::new(1000),
             pending_fill_outcomes: std::collections::VecDeque::with_capacity(64),
             budget_pacer: BudgetPacer::default(),
+            dashboard_ws: None,
         }
     }
 }

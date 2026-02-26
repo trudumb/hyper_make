@@ -102,6 +102,9 @@ pub struct ContinuationPosterior {
     pub trend_agreement: f64,
     /// Trend confidence [0, 1] from TrendSignal
     pub trend_confidence: f64,
+    /// Trend-position alignment [-1, 1]: positive = trend supports position,
+    /// negative = trend opposes position. Zero = no position or no trend.
+    pub trend_position_alignment: f64,
     /// Regime probabilities [quiet, normal, bursty, cascade] from HMM
     pub regime_probs: [f64; 4],
 
@@ -122,6 +125,7 @@ impl Default for ContinuationPosterior {
             momentum_continuation: 0.5,
             trend_agreement: 0.0,
             trend_confidence: 0.0,
+            trend_position_alignment: 0.0,
             regime_probs: [0.2, 0.5, 0.2, 0.1], // Default: mostly normal
             fusion_config: ContinuationFusionConfig::default(),
         }
@@ -218,6 +222,7 @@ impl ContinuationPosterior {
     /// - `trend_agreement`: From TrendSignal `timeframe_agreement`
     /// - `trend_confidence`: From TrendSignal `trend_confidence`
     /// - `regime_probs`: From HMM `regime_probabilities()` [quiet, normal, bursty, cascade]
+    #[allow(clippy::too_many_arguments)]
     pub fn update_signals(
         &mut self,
         changepoint_prob: f64,
@@ -226,6 +231,7 @@ impl ContinuationPosterior {
         trend_agreement: f64,
         trend_confidence: f64,
         regime_probs: [f64; 4],
+        trend_position_alignment: f64,
     ) {
         self.changepoint_prob = changepoint_prob.clamp(0.0, 1.0);
         self.changepoint_entropy = changepoint_entropy.max(0.01);
@@ -233,6 +239,7 @@ impl ContinuationPosterior {
         self.trend_agreement = trend_agreement.clamp(0.0, 1.0);
         self.trend_confidence = trend_confidence.clamp(0.0, 1.0);
         self.regime_probs = regime_probs;
+        self.trend_position_alignment = trend_position_alignment.clamp(-1.0, 1.0);
     }
 
     /// Compute regime-based continuation prior from HMM probabilities.
@@ -290,9 +297,11 @@ impl ContinuationPosterior {
         let cp_discount = self.changepoint_discount();
         let p_fill_discounted = (1.0 - cp_discount) * p_fill + cp_discount * p_regime;
 
-        // 4. Convert trend agreement to continuation probability
-        // trend_agreement in [0, 1] → p_trend in [0.5, 1.0]
-        let p_trend = 0.5 + 0.5 * self.trend_agreement;
+        // 4. Convert trend-position alignment to continuation probability
+        // alignment in [-1, 1] → p_trend in [0, 1]
+        // Positive alignment (trend supports position) → p_trend > 0.5
+        // Negative alignment (trend opposes position) → p_trend < 0.5
+        let p_trend = 0.5 + 0.5 * self.trend_position_alignment;
 
         // 5. Confidence-weighted fusion
         // Each signal contributes: weight × confidence × probability
@@ -354,7 +363,7 @@ impl ContinuationPosterior {
                 + self.changepoint_discount() * self.regime_prior(),
             p_regime: self.regime_prior(),
             p_momentum: self.momentum_continuation,
-            p_trend: 0.5 + 0.5 * self.trend_agreement,
+            p_trend: 0.5 + 0.5 * self.trend_position_alignment,
             p_fused: self.prob_continuation_fused(),
             changepoint_discount: self.changepoint_discount(),
             fill_confidence: self.confidence(),
@@ -577,6 +586,7 @@ mod tests {
             0.5,                  // Some trend agreement
             0.5,                  // Some trend confidence
             [0.1, 0.4, 0.3, 0.2], // Trending regime (bursty + cascade)
+            0.0,                  // Neutral alignment
         );
 
         let p_before_cp = post.prob_continuation_fused();
@@ -594,6 +604,7 @@ mod tests {
             0.0,                  // No trend agreement
             0.0,                  // No trend confidence
             [0.2, 0.5, 0.2, 0.1], // Normal regime
+            0.0,                  // Neutral alignment
         );
 
         let p_after_cp = post.prob_continuation_fused();
@@ -622,6 +633,7 @@ mod tests {
             0.0,                  // No trend
             0.0,                  // No trend confidence
             [0.2, 0.5, 0.2, 0.1], // Normal regime
+            0.0,                  // Neutral alignment
         );
 
         let p_with_momentum = post.prob_continuation_fused();
@@ -638,7 +650,7 @@ mod tests {
     fn test_trend_agreement_boosts_continuation() {
         let mut post = ContinuationPosterior::default();
 
-        // Add strong trend agreement with confidence
+        // Add strong trend agreement with confidence and positive alignment
         post.update_signals(
             0.0,                  // No changepoint
             2.0,                  // Normal entropy
@@ -646,14 +658,15 @@ mod tests {
             0.9,                  // Strong trend agreement
             0.8,                  // High trend confidence
             [0.2, 0.5, 0.2, 0.1], // Normal regime
+            0.9,                  // Strong positive alignment (trend supports position)
         );
 
         let p_fused = post.prob_continuation_fused();
 
-        // Strong trend agreement should push toward higher continuation
+        // Strong trend aligned with position should push toward higher continuation
         assert!(
             p_fused > 0.55,
-            "Strong trend should boost continuation above neutral: {}",
+            "Strong aligned trend should boost continuation above neutral: {}",
             p_fused
         );
     }
@@ -670,6 +683,7 @@ mod tests {
             0.0,                  // No trend
             0.0,                  // No trend confidence
             [0.0, 0.0, 0.0, 1.0], // Pure cascade regime
+            0.0,                  // Neutral alignment
         );
 
         let p_fused = post.prob_continuation_fused();
@@ -706,6 +720,7 @@ mod tests {
             0.0,
             0.0,
             [0.2, 0.5, 0.2, 0.1],
+            0.0, // Neutral alignment
         );
 
         let conf_after = post.confidence_fused();
@@ -721,7 +736,7 @@ mod tests {
     #[test]
     fn test_signal_summary() {
         let mut post = ContinuationPosterior::default();
-        post.update_signals(0.3, 1.5, 0.7, 0.6, 0.5, [0.1, 0.4, 0.3, 0.2]);
+        post.update_signals(0.3, 1.5, 0.7, 0.6, 0.5, [0.1, 0.4, 0.3, 0.2], 0.0);
 
         let summary = post.signal_summary();
 
@@ -738,7 +753,59 @@ mod tests {
             "Fresh posterior should not have updates"
         );
 
-        post.update_signals(0.5, 2.0, 0.5, 0.0, 0.0, [0.2, 0.5, 0.2, 0.1]);
+        post.update_signals(0.5, 2.0, 0.5, 0.0, 0.0, [0.2, 0.5, 0.2, 0.1], 0.0);
         assert!(post.has_signal_updates(), "Should detect signal updates");
+    }
+
+    #[test]
+    fn test_trend_opposed_to_position_reduces_continuation() {
+        let mut post = ContinuationPosterior::default();
+
+        // Trend strongly opposes position (alignment = -1.0)
+        post.update_signals(
+            0.0,                  // No changepoint
+            2.0,                  // Normal entropy
+            0.5,                  // Neutral momentum
+            0.9,                  // Strong trend agreement
+            0.8,                  // High trend confidence
+            [0.2, 0.5, 0.2, 0.1], // Normal regime
+            -1.0,                 // Trend opposes position
+        );
+
+        let p_fused = post.prob_continuation_fused();
+
+        // With trend opposing position, p_trend = 0.5 + 0.5 * (-1.0) = 0.0
+        // This should pull fused probability below 0.5
+        assert!(
+            p_fused < 0.5,
+            "Trend opposing position should reduce continuation below neutral: {}",
+            p_fused
+        );
+    }
+
+    #[test]
+    fn test_trend_aligned_with_position_boosts_continuation() {
+        let mut post = ContinuationPosterior::default();
+
+        // Trend strongly aligned with position (alignment = +1.0)
+        post.update_signals(
+            0.0,                  // No changepoint
+            2.0,                  // Normal entropy
+            0.5,                  // Neutral momentum
+            0.9,                  // Strong trend agreement
+            0.8,                  // High trend confidence
+            [0.2, 0.5, 0.2, 0.1], // Normal regime
+            1.0,                  // Trend aligned with position
+        );
+
+        let p_fused = post.prob_continuation_fused();
+
+        // With trend supporting position, p_trend = 0.5 + 0.5 * 1.0 = 1.0
+        // This should push fused probability above 0.5
+        assert!(
+            p_fused > 0.5,
+            "Trend aligned with position should boost continuation above neutral: {}",
+            p_fused
+        );
     }
 }

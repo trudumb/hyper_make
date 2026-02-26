@@ -2224,12 +2224,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("Failed to sync open orders: {e}"))?;
 
+    // Create WebSocket dashboard state (shared between HTTP server and market maker)
+    let dashboard_ws_state = Arc::new(hyperliquid_rust_sdk::DashboardWsState::new(
+        hyperliquid_rust_sdk::DashboardWsConfig::default(),
+    ));
+    market_maker = market_maker.with_dashboard_ws(dashboard_ws_state.clone());
+
     // Start HTTP metrics endpoint if enabled
     let metrics_port = cli.metrics_port.unwrap_or(config.monitoring.metrics_port);
     if config.monitoring.enable_http_metrics && metrics_port > 0 {
         let prometheus = market_maker.prometheus().clone();
         let asset_for_metrics = asset.clone();
         let quote_for_metrics = collateral_symbol.clone();
+        let ws_state_for_server = dashboard_ws_state.clone();
 
         tokio::spawn(async move {
             // Clone prometheus for dashboard endpoint
@@ -2257,6 +2264,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let prom = prometheus_for_dashboard.clone();
                         async move { Json(prom.to_dashboard_state()) }
                     }),
+                )
+                // WebSocket dashboard endpoint for real-time push updates
+                .merge(
+                    Router::new()
+                        .route(
+                            "/ws/dashboard",
+                            axum::routing::get(hyperliquid_rust_sdk::ws_handler),
+                        )
+                        .with_state(ws_state_for_server),
                 )
                 // Health check endpoints for orchestration (k8s, load balancers)
                 .route("/healthz", get(|| async { axum::http::StatusCode::OK }))
