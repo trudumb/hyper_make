@@ -1,0 +1,1892 @@
+//! Bayesian Parameter Learning Infrastructure
+//!
+//! Provides online parameter learning with regularization to prevent overfitting.
+//! Every magic number is replaced with a `BayesianParam` that:
+//! 1. Uses the magic number as a prior mean (regularization)
+//! 2. Updates from observed data using conjugate Bayesian updates
+//! 3. Shrinks toward the prior when data is scarce
+//!
+//! # Design Principles
+//!
+//! 1. **Bayesian Regularization**: Prior prevents overfitting with small samples
+//! 2. **Online Learning**: Parameters update incrementally, no batch retraining
+//! 3. **Uncertainty Quantification**: All parameters have credible intervals
+//! 4. **Graceful Degradation**: Falls back to prior when data is unavailable
+//!
+//! # Prior Elicitation
+//!
+//! Each parameter's prior is chosen based on:
+//! - **Prior mean**: The previous "magic number" (domain knowledge baseline)
+//! - **Prior strength**: How many pseudo-observations (regularization strength)
+//! - **Distribution family**: Conjugate to the likelihood for efficient updates
+//!
+//! # Example: Alpha Touch Learning
+//!
+//! ```rust,ignore
+//! // Prior: Beta(2, 6) → E[α] = 0.25, prior_strength = 8 pseudo-observations
+//! let mut alpha_touch = BayesianParam::beta(0.25, 8.0);
+//!
+//! // After observing fills: 3 informed out of 10 total
+//! alpha_touch.observe_beta(3, 7); // 3 successes, 7 failures
+//!
+//! // Posterior: Beta(5, 13) → E[α] = 5/18 ≈ 0.28
+//! // Not 0.30 (raw MLE) because prior regularizes toward 0.25
+//! let estimate = alpha_touch.estimate(); // Shrinkage estimate
+//! ```
+
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
+/// Conjugate distribution family for the parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PriorFamily {
+    /// Beta(α, β) for probabilities [0, 1]
+    /// Conjugate to Binomial likelihood
+    Beta,
+    /// Gamma(shape, rate) for positive rates
+    /// Conjugate to Poisson/Exponential likelihood
+    Gamma,
+    /// Normal(μ, σ²) for unbounded parameters
+    /// Conjugate to Normal likelihood with known variance
+    Normal,
+    /// Inverse-Gamma(α, β) for variances
+    /// Conjugate to Normal likelihood for variance estimation
+    InverseGamma,
+    /// Log-Normal(μ, σ²) for positive multiplicative parameters
+    LogNormal,
+}
+
+/// Bayesian parameter with prior + posterior for regularized learning.
+///
+/// Implements shrinkage estimation: with few samples, estimate shrinks toward
+/// the prior mean. With many samples, estimate approaches MLE.
+///
+/// # Shrinkage Formula
+///
+/// ```text
+/// θ_posterior = w × θ_MLE + (1-w) × θ_prior
+/// where w = n / (n + prior_strength)
+/// ```
+///
+/// - N=0: θ = θ_prior (falls back to domain knowledge)
+/// - N=prior_strength: θ = 0.5×θ_MLE + 0.5×θ_prior (balanced)
+/// - N→∞: θ → θ_MLE (data dominates)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BayesianParam {
+    /// Name for logging and debugging
+    pub name: String,
+
+    /// Prior distribution family
+    pub family: PriorFamily,
+
+    /// Prior mean (the original "magic number" or domain knowledge)
+    pub prior_mean: f64,
+
+    /// Prior strength in pseudo-observations
+    /// Higher = more regularization, slower adaptation
+    pub prior_strength: f64,
+
+    /// First parameter of posterior distribution
+    /// - Beta: α (successes + prior_α)
+    /// - Gamma: shape (prior_shape + n)
+    /// - Normal: mean (weighted average)
+    /// - InverseGamma: α (prior_α + n/2)
+    /// - LogNormal: μ (log-space mean)
+    pub posterior_param1: f64,
+
+    /// Second parameter of posterior distribution
+    /// - Beta: β (failures + prior_β)
+    /// - Gamma: rate (prior_rate + sum_x)
+    /// - Normal: variance (posterior variance)
+    /// - InverseGamma: β (prior_β + sum_sq/2)
+    /// - LogNormal: σ² (log-space variance)
+    pub posterior_param2: f64,
+
+    /// Number of observations incorporated
+    pub n_observations: usize,
+
+    /// Sum of observations (for mean estimation)
+    sum_x: f64,
+
+    /// Sum of squared observations (for variance estimation)
+    sum_x2: f64,
+
+    /// Last update timestamp (skipped in serialization - not persisted)
+    #[serde(skip)]
+    pub last_updated: Option<Instant>,
+}
+
+impl BayesianParam {
+    // ==================== Constructors ====================
+
+    /// Create a Beta-distributed parameter for probabilities in [0, 1].
+    ///
+    /// # Arguments
+    /// * `prior_mean` - Expected probability (e.g., 0.25 for 25% informed)
+    /// * `prior_strength` - Pseudo-observations (e.g., 8 → moderate confidence)
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Prior: Beta(2, 6) → E[α] = 0.25, variance ≈ 0.02
+    /// let alpha = BayesianParam::beta("alpha_touch", 0.25, 8.0);
+    /// ```
+    pub fn beta(name: impl Into<String>, prior_mean: f64, prior_strength: f64) -> Self {
+        let prior_mean = prior_mean.clamp(0.001, 0.999);
+        let prior_alpha = prior_mean * prior_strength;
+        let prior_beta = (1.0 - prior_mean) * prior_strength;
+
+        Self {
+            name: name.into(),
+            family: PriorFamily::Beta,
+            prior_mean,
+            prior_strength,
+            posterior_param1: prior_alpha,
+            posterior_param2: prior_beta,
+            n_observations: 0,
+            sum_x: 0.0,
+            sum_x2: 0.0,
+            last_updated: None,
+        }
+    }
+
+    /// Create a Gamma-distributed parameter for positive rates.
+    ///
+    /// # Arguments
+    /// * `prior_mean` - Expected rate (e.g., 2000 for kappa)
+    /// * `prior_strength` - Pseudo-observations (e.g., 10 → weak confidence)
+    ///
+    /// # Gamma Parameterization
+    /// shape = prior_strength, rate = prior_strength / prior_mean
+    /// E[X] = shape/rate = prior_mean
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Prior: Gamma(10, 0.005) → E[κ] = 2000, CV ≈ 0.32
+    /// let kappa = BayesianParam::gamma("kappa", 2000.0, 10.0);
+    /// ```
+    pub fn gamma(name: impl Into<String>, prior_mean: f64, prior_strength: f64) -> Self {
+        let prior_mean = prior_mean.max(0.001);
+        let shape = prior_strength;
+        let rate = prior_strength / prior_mean;
+
+        Self {
+            name: name.into(),
+            family: PriorFamily::Gamma,
+            prior_mean,
+            prior_strength,
+            posterior_param1: shape,
+            posterior_param2: rate,
+            n_observations: 0,
+            sum_x: 0.0,
+            sum_x2: 0.0,
+            last_updated: None,
+        }
+    }
+
+    /// Create a Normal-distributed parameter for unbounded values.
+    ///
+    /// # Arguments
+    /// * `prior_mean` - Expected value
+    /// * `prior_var` - Prior variance (uncertainty in prior_mean)
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Prior: Normal(2.0, 0.5²) → E[β] = 2.0, 95% CI ≈ [1, 3]
+    /// let beta = BayesianParam::normal("flow_sensitivity", 2.0, 0.25);
+    /// ```
+    pub fn normal(name: impl Into<String>, prior_mean: f64, prior_var: f64) -> Self {
+        let prior_var = prior_var.max(1e-10);
+        let prior_strength = 1.0 / prior_var; // Precision as strength
+
+        Self {
+            name: name.into(),
+            family: PriorFamily::Normal,
+            prior_mean,
+            prior_strength,
+            posterior_param1: prior_mean,
+            posterior_param2: prior_var,
+            n_observations: 0,
+            sum_x: 0.0,
+            sum_x2: 0.0,
+            last_updated: None,
+        }
+    }
+
+    /// Create an Inverse-Gamma parameter for variances.
+    ///
+    /// # Arguments
+    /// * `prior_mean` - Expected variance
+    /// * `prior_strength` - Degrees of freedom (pseudo-observations)
+    ///
+    /// # InverseGamma Parameterization
+    /// α = prior_strength / 2, β = prior_mean × α
+    /// E[σ²] = β / (α - 1) ≈ prior_mean for large α
+    pub fn inverse_gamma(name: impl Into<String>, prior_mean: f64, prior_strength: f64) -> Self {
+        let prior_mean = prior_mean.max(1e-10);
+        let alpha = (prior_strength / 2.0).max(2.0); // α > 1 for finite mean
+        let beta = prior_mean * (alpha - 1.0);
+
+        Self {
+            name: name.into(),
+            family: PriorFamily::InverseGamma,
+            prior_mean,
+            prior_strength,
+            posterior_param1: alpha,
+            posterior_param2: beta,
+            n_observations: 0,
+            sum_x: 0.0,
+            sum_x2: 0.0,
+            last_updated: None,
+        }
+    }
+
+    /// Create a Log-Normal parameter for positive multiplicative values.
+    ///
+    /// # Arguments
+    /// * `prior_mean` - Expected value in natural space
+    /// * `prior_cv` - Prior coefficient of variation (CV = σ/μ)
+    pub fn log_normal(name: impl Into<String>, prior_mean: f64, prior_cv: f64) -> Self {
+        let prior_mean = prior_mean.max(1e-10);
+        let prior_cv = prior_cv.max(0.01);
+
+        // Convert to log-space parameters
+        // If E[X] = μ and CV = σ/μ, then in log-space:
+        // σ² = ln(1 + CV²), μ_log = ln(μ) - σ²/2
+        let log_var = (1.0 + prior_cv * prior_cv).ln();
+        let log_mean = prior_mean.ln() - log_var / 2.0;
+
+        Self {
+            name: name.into(),
+            family: PriorFamily::LogNormal,
+            prior_mean,
+            prior_strength: 1.0 / log_var.sqrt(), // Precision in log-space
+            posterior_param1: log_mean,
+            posterior_param2: log_var,
+            n_observations: 0,
+            sum_x: 0.0,
+            sum_x2: 0.0,
+            last_updated: None,
+        }
+    }
+
+    // ==================== Observation Methods ====================
+
+    /// Observe a binary outcome for Beta-distributed parameters.
+    ///
+    /// # Arguments
+    /// * `successes` - Number of successes (e.g., informed fills)
+    /// * `failures` - Number of failures (e.g., uninformed fills)
+    pub fn observe_beta(&mut self, successes: usize, failures: usize) {
+        if self.family != PriorFamily::Beta {
+            tracing::warn!("observe_beta called on non-Beta parameter {}", self.name);
+            return;
+        }
+
+        self.posterior_param1 += successes as f64;
+        self.posterior_param2 += failures as f64;
+        self.n_observations += successes + failures;
+        self.last_updated = Some(Instant::now());
+    }
+
+    /// Observe count data for Gamma-distributed parameters (Poisson likelihood).
+    ///
+    /// # Arguments
+    /// * `count` - Observed count (e.g., number of fills)
+    /// * `exposure` - Exposure time or space (e.g., seconds observed)
+    pub fn observe_gamma_poisson(&mut self, count: usize, exposure: f64) {
+        if self.family != PriorFamily::Gamma {
+            tracing::warn!(
+                "observe_gamma_poisson called on non-Gamma parameter {}",
+                self.name
+            );
+            return;
+        }
+
+        // Gamma-Poisson conjugate update:
+        // posterior_shape = prior_shape + count
+        // posterior_rate = prior_rate + exposure
+        self.posterior_param1 += count as f64;
+        self.posterior_param2 += exposure;
+        self.n_observations += 1;
+        self.sum_x += count as f64;
+        self.last_updated = Some(Instant::now());
+    }
+
+    /// Observe a continuous value for Gamma-distributed parameters (Exponential likelihood).
+    ///
+    /// # Arguments
+    /// * `value` - Observed positive value (e.g., inter-arrival time)
+    pub fn observe_gamma_exponential(&mut self, value: f64) {
+        if self.family != PriorFamily::Gamma || value <= 0.0 {
+            return;
+        }
+
+        // Gamma-Exponential conjugate update (for rate parameter):
+        // posterior_shape = prior_shape + 1
+        // posterior_rate = prior_rate + value
+        self.posterior_param1 += 1.0;
+        self.posterior_param2 += value;
+        self.n_observations += 1;
+        self.sum_x += value;
+        self.last_updated = Some(Instant::now());
+    }
+
+    /// Observe a continuous value for Normal-distributed parameters.
+    ///
+    /// Assumes known variance (observation_var) for conjugate update.
+    ///
+    /// # Arguments
+    /// * `value` - Observed value
+    /// * `observation_var` - Variance of the observation (known)
+    pub fn observe_normal(&mut self, value: f64, observation_var: f64) {
+        if self.family != PriorFamily::Normal {
+            return;
+        }
+
+        let observation_var = observation_var.max(1e-10);
+
+        // Normal-Normal conjugate update:
+        // posterior_precision = prior_precision + 1/obs_var
+        // posterior_mean = (prior_precision × prior_mean + value/obs_var) / posterior_precision
+        let prior_precision = 1.0 / self.posterior_param2;
+        let obs_precision = 1.0 / observation_var;
+        let posterior_precision = prior_precision + obs_precision;
+        let posterior_mean =
+            (prior_precision * self.posterior_param1 + obs_precision * value) / posterior_precision;
+
+        self.posterior_param1 = posterior_mean;
+        self.posterior_param2 = 1.0 / posterior_precision;
+        self.n_observations += 1;
+        self.sum_x += value;
+        self.sum_x2 += value * value;
+        self.last_updated = Some(Instant::now());
+    }
+
+    /// Observe a squared residual for variance estimation (Inverse-Gamma).
+    ///
+    /// # Arguments
+    /// * `squared_residual` - (x - μ)² for a single observation
+    pub fn observe_variance(&mut self, squared_residual: f64) {
+        if self.family != PriorFamily::InverseGamma {
+            return;
+        }
+
+        // InverseGamma-Normal (for variance) conjugate update:
+        // posterior_α = prior_α + 0.5
+        // posterior_β = prior_β + 0.5 × (x - μ)²
+        self.posterior_param1 += 0.5;
+        self.posterior_param2 += 0.5 * squared_residual;
+        self.n_observations += 1;
+        self.sum_x2 += squared_residual;
+        self.last_updated = Some(Instant::now());
+    }
+
+    /// Observe a positive value for Log-Normal parameters.
+    ///
+    /// # Arguments
+    /// * `value` - Observed positive value
+    pub fn observe_log_normal(&mut self, value: f64) {
+        if self.family != PriorFamily::LogNormal || value <= 0.0 {
+            return;
+        }
+
+        let log_value = value.ln();
+
+        // Track log-space statistics
+        self.n_observations += 1;
+        self.sum_x += log_value;
+        self.sum_x2 += log_value * log_value;
+
+        // Update log-space mean using running average
+        let n = self.n_observations as f64;
+        let sample_mean = self.sum_x / n;
+
+        // Bayesian update: blend prior and sample mean
+        let prior_precision = self.prior_strength;
+        let sample_precision = n; // Assuming unit variance observations
+        let posterior_precision = prior_precision + sample_precision;
+
+        let prior_log_mean = self.prior_mean.ln() - self.posterior_param2 / 2.0;
+        self.posterior_param1 = (prior_precision * prior_log_mean + sample_precision * sample_mean)
+            / posterior_precision;
+
+        self.last_updated = Some(Instant::now());
+    }
+
+    // ==================== Estimation Methods ====================
+
+    /// Get the shrinkage estimate (posterior mean).
+    ///
+    /// This is the Bayes-optimal point estimate under squared error loss.
+    /// With few observations, it shrinks toward the prior mean.
+    /// With many observations, it converges to the MLE.
+    pub fn estimate(&self) -> f64 {
+        match self.family {
+            PriorFamily::Beta => {
+                // Beta mean: α / (α + β)
+                self.posterior_param1 / (self.posterior_param1 + self.posterior_param2)
+            }
+            PriorFamily::Gamma => {
+                // Gamma mean: shape / rate
+                self.posterior_param1 / self.posterior_param2.max(1e-10)
+            }
+            PriorFamily::Normal => {
+                // Normal mean: directly stored
+                self.posterior_param1
+            }
+            PriorFamily::InverseGamma => {
+                // InverseGamma mean: β / (α - 1) for α > 1
+                if self.posterior_param1 > 1.0 {
+                    self.posterior_param2 / (self.posterior_param1 - 1.0)
+                } else {
+                    self.prior_mean
+                }
+            }
+            PriorFamily::LogNormal => {
+                // LogNormal mean: exp(μ + σ²/2)
+                (self.posterior_param1 + self.posterior_param2 / 2.0).exp()
+            }
+        }
+    }
+
+    /// Get the posterior variance (uncertainty in the estimate).
+    pub fn variance(&self) -> f64 {
+        match self.family {
+            PriorFamily::Beta => {
+                // Beta variance: αβ / ((α+β)²(α+β+1))
+                let sum = self.posterior_param1 + self.posterior_param2;
+                (self.posterior_param1 * self.posterior_param2) / (sum * sum * (sum + 1.0))
+            }
+            PriorFamily::Gamma => {
+                // Gamma variance: shape / rate²
+                let rate_sq = self.posterior_param2.powi(2).max(1e-10);
+                self.posterior_param1 / rate_sq
+            }
+            PriorFamily::Normal => {
+                // Normal variance: directly stored
+                self.posterior_param2
+            }
+            PriorFamily::InverseGamma => {
+                // InverseGamma variance: β² / ((α-1)²(α-2)) for α > 2
+                if self.posterior_param1 > 2.0 {
+                    let denom =
+                        (self.posterior_param1 - 1.0).powi(2) * (self.posterior_param1 - 2.0);
+                    self.posterior_param2.powi(2) / denom
+                } else {
+                    self.prior_mean.powi(2) // Fall back to prior-based variance
+                }
+            }
+            PriorFamily::LogNormal => {
+                // LogNormal variance: (exp(σ²) - 1) × exp(2μ + σ²)
+                let exp_var = self.posterior_param2.exp();
+                (exp_var - 1.0) * (2.0 * self.posterior_param1 + self.posterior_param2).exp()
+            }
+        }
+    }
+
+    /// Get the posterior standard deviation.
+    pub fn std_dev(&self) -> f64 {
+        self.variance().sqrt()
+    }
+
+    /// Get the coefficient of variation (std / mean).
+    pub fn cv(&self) -> f64 {
+        let mean = self.estimate();
+        if mean.abs() < 1e-10 {
+            f64::INFINITY
+        } else {
+            self.std_dev() / mean.abs()
+        }
+    }
+
+    /// Get the 95% credible interval.
+    ///
+    /// Returns (lower, upper) bounds containing 95% of the posterior mass.
+    /// Uses normal approximation for simplicity.
+    pub fn credible_interval_95(&self) -> (f64, f64) {
+        let mean = self.estimate();
+        let std = self.std_dev();
+        let z = 1.96; // 97.5th percentile of standard normal
+
+        match self.family {
+            PriorFamily::Beta => {
+                // Beta is bounded [0, 1]
+                ((mean - z * std).max(0.0), (mean + z * std).min(1.0))
+            }
+            PriorFamily::Gamma | PriorFamily::InverseGamma | PriorFamily::LogNormal => {
+                // These are positive
+                ((mean - z * std).max(0.0), mean + z * std)
+            }
+            PriorFamily::Normal => (mean - z * std, mean + z * std),
+        }
+    }
+
+    /// Get the effective sample size.
+    ///
+    /// For Bayesian updates, ESS accounts for prior strength:
+    /// ESS = n_observations + prior_strength
+    pub fn effective_sample_size(&self) -> f64 {
+        self.n_observations as f64 + self.prior_strength
+    }
+
+    /// Check if the parameter has enough data to be considered calibrated.
+    ///
+    /// # Arguments
+    /// * `min_observations` - Minimum real observations required
+    /// * `max_cv` - Maximum coefficient of variation allowed
+    pub fn is_calibrated(&self, min_observations: usize, max_cv: f64) -> bool {
+        self.n_observations >= min_observations && self.cv() < max_cv
+    }
+
+    /// Get the shrinkage weight toward the prior.
+    ///
+    /// Returns a value in [0, 1]:
+    /// - 1.0 = fully data-driven (MLE)
+    /// - 0.0 = fully prior-driven
+    pub fn data_weight(&self) -> f64 {
+        let n = self.n_observations as f64;
+        n / (n + self.prior_strength)
+    }
+
+    /// Reset to prior (for regime changes or re-initialization).
+    pub fn reset_to_prior(&mut self) {
+        match self.family {
+            PriorFamily::Beta => {
+                let prior_alpha = self.prior_mean * self.prior_strength;
+                let prior_beta = (1.0 - self.prior_mean) * self.prior_strength;
+                self.posterior_param1 = prior_alpha;
+                self.posterior_param2 = prior_beta;
+            }
+            PriorFamily::Gamma => {
+                self.posterior_param1 = self.prior_strength;
+                self.posterior_param2 = self.prior_strength / self.prior_mean;
+            }
+            PriorFamily::Normal => {
+                self.posterior_param1 = self.prior_mean;
+                self.posterior_param2 = 1.0 / self.prior_strength;
+            }
+            PriorFamily::InverseGamma => {
+                let alpha = (self.prior_strength / 2.0).max(2.0);
+                self.posterior_param1 = alpha;
+                self.posterior_param2 = self.prior_mean * (alpha - 1.0);
+            }
+            PriorFamily::LogNormal => {
+                let log_var = self.posterior_param2; // Preserve original variance
+                self.posterior_param1 = self.prior_mean.ln() - log_var / 2.0;
+            }
+        }
+        self.n_observations = 0;
+        self.sum_x = 0.0;
+        self.sum_x2 = 0.0;
+        self.last_updated = None;
+    }
+}
+
+/// Parameters learned from data with Bayesian regularization.
+///
+/// Replaces magic numbers with statistically grounded estimates.
+/// Each parameter has:
+/// 1. A prior based on domain knowledge (the old magic number)
+/// 2. Online learning from observed data
+/// 3. Uncertainty quantification
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let mut params = LearnedParameters::default();
+///
+/// // Record fills and update alpha_touch
+/// params.alpha_touch.observe_beta(informed_count, uninformed_count);
+///
+/// // Use the regularized estimate
+/// let alpha = params.alpha_touch.estimate();
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedParameters {
+    // ==================== Tier 1: P&L Critical ====================
+    /// Informed trader probability at touch.
+    /// Prior: Beta(2, 6) → E[α] = 0.25, based on historical analysis
+    pub alpha_touch: BayesianParam,
+
+    /// Base risk aversion parameter γ.
+    /// Prior: Gamma(3, 20) → E[γ] = 0.15, from GLFT derivation
+    pub gamma_base: BayesianParam,
+
+    /// Minimum spread floor in bps.
+    /// Prior: Normal(5, 2²) → E[δ] = 5 bps, covers fees + slippage
+    pub spread_floor_bps: BayesianParam,
+
+    /// Proactive skew sensitivity (momentum → skew).
+    /// Prior: Normal(2.0, 0.5²) → E[β] = 2.0 bps per unit momentum
+    pub proactive_skew_sensitivity: BayesianParam,
+
+    /// Toxic hour gamma multiplier.
+    /// Prior: LogNormal(2.0, 0.3) → E[mult] = 2.0, CV = 0.3
+    pub toxic_hour_gamma_mult: BayesianParam,
+
+    /// Predictive bias sensitivity.
+    /// Prior: Normal(2.0, 1.0²) → E = 2σ move on changepoint
+    pub predictive_bias_sensitivity: BayesianParam,
+
+    // ==================== Tier 2: Risk Management ====================
+    /// Maximum daily loss as fraction of account.
+    /// Prior: Beta(1, 49) → E = 0.02 (2% Kelly-scaled)
+    pub max_daily_loss_fraction: BayesianParam,
+
+    /// Maximum drawdown threshold.
+    /// Prior: Beta(1, 19) → E = 0.05 (5% VaR-based)
+    pub max_drawdown: BayesianParam,
+
+    /// Cascade detection threshold (OI drop).
+    /// Prior: Beta(2, 98) → E = 0.02 (2% OI drop)
+    pub cascade_oi_threshold: BayesianParam,
+
+    /// BOCPD hazard rate (1 / expected regime duration).
+    /// Prior: Gamma(1, 250) → E = 0.004 (1/250 samples)
+    pub bocpd_hazard_rate: BayesianParam,
+
+    /// BOCPD changepoint threshold.
+    /// Prior: Beta(7, 3) → E = 0.7
+    pub bocpd_threshold: BayesianParam,
+
+    /// Quote latch threshold in bps.
+    /// Prior: Normal(2.5, 1.0²) → E = 2.5 bps
+    pub quote_latch_threshold_bps: BayesianParam,
+
+    // ==================== Tier 3: Calibration ====================
+    /// Fill intensity κ (fills per unit spread).
+    /// Prior: Gamma(4, 0.002) → E = 2000
+    pub kappa: BayesianParam,
+
+    /// Hawkes process baseline intensity μ.
+    /// Prior: Gamma(5, 10) → E = 0.5
+    pub hawkes_mu: BayesianParam,
+
+    /// Hawkes process excitation α (α < β for stability).
+    /// Prior: Beta(3, 7) → E = 0.3
+    pub hawkes_alpha: BayesianParam,
+
+    /// Hawkes process decay β.
+    /// Prior: Gamma(1, 10) → E = 0.1
+    pub hawkes_beta: BayesianParam,
+
+    /// EWMA decay factor for kappa smoothing.
+    /// Prior: Beta(90, 10) → E = 0.9 (from autocorrelation analysis)
+    pub kappa_ewma_alpha: BayesianParam,
+
+    /// Kelly tracker decay factor.
+    /// Prior: Beta(99, 1) → E = 0.99 (100-trade half-life)
+    pub kelly_tracker_decay: BayesianParam,
+
+    /// Regime transition stickiness (diagonal of transition matrix).
+    /// Prior: Beta(95, 5) → E = 0.95
+    pub regime_sticky_diagonal: BayesianParam,
+
+    // ==================== Tier 4: Microstructure ====================
+    /// Kalman filter process noise Q.
+    /// Prior: InverseGamma(10, 9e-8) → E = 1e-8
+    pub kalman_q: BayesianParam,
+
+    /// Kalman filter observation noise R.
+    /// Prior: InverseGamma(10, 2.25e-8) → E = 2.5e-9
+    pub kalman_r: BayesianParam,
+
+    /// Momentum normalizer in bps.
+    /// Prior: Gamma(4, 0.2) → E = 20 bps
+    pub momentum_normalizer_bps: BayesianParam,
+
+    /// Depth spacing ratio for ladder levels.
+    /// Prior: LogNormal(1.5, 0.2) → E = 1.5, CV = 0.2
+    pub depth_spacing_ratio: BayesianParam,
+
+    /// Fill probability width in bps.
+    /// Prior: Normal(2.0, 0.5²) → E = 2 bps
+    pub fill_probability_width_bps: BayesianParam,
+
+    /// Microprice decay factor.
+    /// Prior: Beta(999, 1) → E = 0.999
+    pub microprice_decay: BayesianParam,
+
+    // ==================== Metadata ====================
+    /// Last full calibration timestamp (skipped in serialization - not persisted)
+    #[serde(skip)]
+    pub last_calibration: Option<Instant>,
+
+    /// Total fills observed across all parameters
+    pub total_fills_observed: usize,
+}
+
+impl Default for LearnedParameters {
+    fn default() -> Self {
+        Self {
+            // Tier 1: P&L Critical
+            alpha_touch: BayesianParam::beta("alpha_touch", 0.25, 8.0),
+            gamma_base: BayesianParam::gamma("gamma_base", 0.15, 3.0),
+            spread_floor_bps: BayesianParam::normal("spread_floor_bps", 5.0, 4.0),
+            proactive_skew_sensitivity: BayesianParam::normal(
+                "proactive_skew_sensitivity",
+                2.0,
+                0.25,
+            ),
+            toxic_hour_gamma_mult: BayesianParam::log_normal("toxic_hour_gamma_mult", 2.0, 0.3),
+            predictive_bias_sensitivity: BayesianParam::normal(
+                "predictive_bias_sensitivity",
+                2.0,
+                1.0,
+            ),
+
+            // Tier 2: Risk Management
+            max_daily_loss_fraction: BayesianParam::beta("max_daily_loss_fraction", 0.02, 50.0),
+            max_drawdown: BayesianParam::beta("max_drawdown", 0.05, 20.0),
+            cascade_oi_threshold: BayesianParam::beta("cascade_oi_threshold", 0.02, 100.0),
+            bocpd_hazard_rate: BayesianParam::gamma("bocpd_hazard_rate", 0.004, 1.0),
+            bocpd_threshold: BayesianParam::beta("bocpd_threshold", 0.7, 10.0),
+            quote_latch_threshold_bps: BayesianParam::normal("quote_latch_threshold_bps", 2.5, 1.0),
+
+            // Tier 3: Calibration
+            kappa: BayesianParam::gamma("kappa", 2000.0, 4.0),
+            hawkes_mu: BayesianParam::gamma("hawkes_mu", 0.5, 5.0),
+            hawkes_alpha: BayesianParam::beta("hawkes_alpha", 0.3, 10.0),
+            hawkes_beta: BayesianParam::gamma("hawkes_beta", 0.1, 1.0),
+            kappa_ewma_alpha: BayesianParam::beta("kappa_ewma_alpha", 0.9, 100.0),
+            kelly_tracker_decay: BayesianParam::beta("kelly_tracker_decay", 0.99, 100.0),
+            regime_sticky_diagonal: BayesianParam::beta("regime_sticky_diagonal", 0.95, 100.0),
+
+            // Tier 4: Microstructure
+            kalman_q: BayesianParam::inverse_gamma("kalman_q", 1e-8, 20.0),
+            kalman_r: BayesianParam::inverse_gamma("kalman_r", 2.5e-9, 20.0),
+            momentum_normalizer_bps: BayesianParam::gamma("momentum_normalizer_bps", 20.0, 4.0),
+            depth_spacing_ratio: BayesianParam::log_normal("depth_spacing_ratio", 1.5, 0.2),
+            fill_probability_width_bps: BayesianParam::normal(
+                "fill_probability_width_bps",
+                2.0,
+                0.25,
+            ),
+            microprice_decay: BayesianParam::beta("microprice_decay", 0.999, 1000.0),
+
+            // Metadata
+            last_calibration: None,
+            total_fills_observed: 0,
+        }
+    }
+}
+
+impl LearnedParameters {
+    /// Create parameters optimized for liquid markets (BTC mainnet).
+    pub fn for_liquid_market() -> Self {
+        Self {
+            // Liquid markets have lower adverse selection
+            alpha_touch: BayesianParam::beta("alpha_touch", 0.20, 10.0),
+            // Higher kappa (more fills per unit spread)
+            kappa: BayesianParam::gamma("kappa", 3000.0, 5.0),
+            // Tighter spread floor
+            spread_floor_bps: BayesianParam::normal("spread_floor_bps", 4.0, 1.0),
+            ..Self::default()
+        }
+    }
+
+    /// Create parameters optimized for thin DEX markets (HIP-3).
+    pub fn for_thin_dex() -> Self {
+        Self {
+            // Thin markets have higher adverse selection
+            alpha_touch: BayesianParam::beta("alpha_touch", 0.30, 6.0),
+            // Lower kappa (fewer fills)
+            kappa: BayesianParam::gamma("kappa", 1000.0, 3.0),
+            // Wider spread floor
+            spread_floor_bps: BayesianParam::normal("spread_floor_bps", 8.0, 4.0),
+            // Higher regime stickiness (regimes change slowly)
+            regime_sticky_diagonal: BayesianParam::beta("regime_sticky_diagonal", 0.98, 100.0),
+            ..Self::default()
+        }
+    }
+
+    /// Reset all parameters to their priors.
+    pub fn reset_all(&mut self) {
+        self.alpha_touch.reset_to_prior();
+        self.gamma_base.reset_to_prior();
+        self.spread_floor_bps.reset_to_prior();
+        self.proactive_skew_sensitivity.reset_to_prior();
+        self.toxic_hour_gamma_mult.reset_to_prior();
+        self.predictive_bias_sensitivity.reset_to_prior();
+        self.max_daily_loss_fraction.reset_to_prior();
+        self.max_drawdown.reset_to_prior();
+        self.cascade_oi_threshold.reset_to_prior();
+        self.bocpd_hazard_rate.reset_to_prior();
+        self.bocpd_threshold.reset_to_prior();
+        self.quote_latch_threshold_bps.reset_to_prior();
+        self.kappa.reset_to_prior();
+        self.hawkes_mu.reset_to_prior();
+        self.hawkes_alpha.reset_to_prior();
+        self.hawkes_beta.reset_to_prior();
+        self.kappa_ewma_alpha.reset_to_prior();
+        self.kelly_tracker_decay.reset_to_prior();
+        self.regime_sticky_diagonal.reset_to_prior();
+        self.kalman_q.reset_to_prior();
+        self.kalman_r.reset_to_prior();
+        self.momentum_normalizer_bps.reset_to_prior();
+        self.depth_spacing_ratio.reset_to_prior();
+        self.fill_probability_width_bps.reset_to_prior();
+        self.microprice_decay.reset_to_prior();
+        self.last_calibration = None;
+        self.total_fills_observed = 0;
+    }
+
+    /// Get a summary of all parameter estimates for logging.
+    pub fn summary(&self) -> Vec<(&str, f64, f64, usize)> {
+        vec![
+            (
+                "alpha_touch",
+                self.alpha_touch.estimate(),
+                self.alpha_touch.cv(),
+                self.alpha_touch.n_observations,
+            ),
+            (
+                "gamma_base",
+                self.gamma_base.estimate(),
+                self.gamma_base.cv(),
+                self.gamma_base.n_observations,
+            ),
+            (
+                "spread_floor_bps",
+                self.spread_floor_bps.estimate(),
+                self.spread_floor_bps.cv(),
+                self.spread_floor_bps.n_observations,
+            ),
+            (
+                "kappa",
+                self.kappa.estimate(),
+                self.kappa.cv(),
+                self.kappa.n_observations,
+            ),
+            (
+                "hawkes_mu",
+                self.hawkes_mu.estimate(),
+                self.hawkes_mu.cv(),
+                self.hawkes_mu.n_observations,
+            ),
+            (
+                "hawkes_alpha",
+                self.hawkes_alpha.estimate(),
+                self.hawkes_alpha.cv(),
+                self.hawkes_alpha.n_observations,
+            ),
+        ]
+    }
+
+    /// Check overall calibration status.
+    pub fn calibration_status(&self) -> CalibrationStatus {
+        let tier1_calibrated = self.alpha_touch.is_calibrated(50, 0.5)
+            && self.gamma_base.is_calibrated(20, 1.0)
+            && self.kappa.is_calibrated(100, 0.5);
+
+        let tier2_calibrated = self.cascade_oi_threshold.is_calibrated(10, 1.0)
+            && self.bocpd_threshold.is_calibrated(10, 0.5);
+
+        CalibrationStatus {
+            tier1_ready: tier1_calibrated,
+            tier2_ready: tier2_calibrated,
+            total_observations: self.total_fills_observed,
+            warmup_complete: self.total_fills_observed >= 100,
+        }
+    }
+
+    // ==================== Persistence ====================
+
+    /// Save learned parameters to a JSON file.
+    ///
+    /// The file can be loaded later with `load_from_file` to resume calibration
+    /// from where it left off, avoiding cold start on restart.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Load learned parameters from a JSON file.
+    ///
+    /// Returns the loaded parameters or an error if the file doesn't exist or is invalid.
+    /// Use `load_or_default` for graceful fallback to defaults.
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Load learned parameters from file or return default if file doesn't exist.
+    ///
+    /// This provides graceful cold start behavior:
+    /// - If calibration file exists, load and continue from previous state
+    /// - If no file exists, start fresh with default priors
+    pub fn load_or_default(path: &std::path::Path) -> Self {
+        match Self::load_from_file(path) {
+            Ok(params) => {
+                tracing::info!(
+                    path = %path.display(),
+                    total_fills = params.total_fills_observed,
+                    "Loaded learned parameters from file"
+                );
+                params
+            }
+            Err(e) => {
+                tracing::info!(
+                    path = %path.display(),
+                    error = %e,
+                    "No existing calibration file, starting with defaults"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Get the recommended file path for persisting learned parameters.
+    ///
+    /// Uses the format: `calibration/{asset}_learned_params.json`
+    pub fn default_path(asset: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from("calibration")
+            .join(format!("{}_learned_params.json", asset.to_lowercase()))
+    }
+}
+
+/// Data from a resolved fill used to update all relevant Bayesian parameters.
+///
+/// Constructed by the fill handler and passed to `LearnedParameters::observe_fill()`.
+/// Each field feeds one or more conjugate prior updates.
+#[derive(Debug, Clone)]
+pub struct FillOutcome {
+    /// Whether the fill was informed (price moved against us beyond AS threshold).
+    pub was_informed: bool,
+    /// Realized adverse selection in bps (positive = price moved against us).
+    pub realized_as_bps: f64,
+    /// Fill distance from mid in bps (how far our quote was from fair value).
+    pub fill_distance_bps: f64,
+    /// PnL of this fill in base units (positive = profit).
+    pub realized_pnl: f64,
+    /// Time since last fill in seconds (for Hawkes intensity).
+    pub inter_arrival_s: Option<f64>,
+    /// Number of fills in the observation window (for kappa estimation).
+    pub fills_in_window: Option<usize>,
+    /// Duration of the observation window in spread-seconds (for kappa estimation).
+    pub window_exposure: Option<f64>,
+    /// Predicted AS in bps at time of fill (for bias tracking).
+    pub predicted_as_bps: Option<f64>,
+}
+
+impl LearnedParameters {
+    /// Update all relevant Bayesian parameters from a single fill outcome.
+    ///
+    /// This is the main entry point that handlers.rs should call after each
+    /// fill is resolved with its markout. Routes the fill data to all applicable
+    /// conjugate prior updates.
+    ///
+    /// # Parameters updated per fill
+    /// - `alpha_touch`: Beta update (informed vs uninformed classification)
+    /// - `spread_floor_bps`: Normal update from realized AS
+    /// - `gamma_base`: Gamma-exponential update from abs(PnL)
+    /// - `kappa`: Gamma-Poisson update from fill count/exposure (if provided)
+    /// - `fill_probability_width_bps`: Normal update from fill distance
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let outcome = FillOutcome {
+    ///     was_informed: true,
+    ///     realized_as_bps: 4.5,
+    ///     fill_distance_bps: 2.1,
+    ///     realized_pnl: -0.003,
+    ///     inter_arrival_s: Some(12.5),
+    ///     fills_in_window: None,
+    ///     window_exposure: None,
+    ///     predicted_as_bps: Some(9.1),
+    /// };
+    /// learned_params.observe_fill(&outcome);
+    /// ```
+    pub fn observe_fill(&mut self, outcome: &FillOutcome) {
+        self.total_fills_observed += 1;
+        self.last_calibration = Some(Instant::now());
+
+        // --- Tier 1: P&L Critical ---
+
+        // alpha_touch: fraction of fills that are informed
+        if outcome.was_informed {
+            self.alpha_touch.observe_beta(1, 0);
+        } else {
+            self.alpha_touch.observe_beta(0, 1);
+        }
+
+        // spread_floor_bps: learn minimum viable spread from realized AS
+        // Observation variance ~4 bps^2 (typical AS volatility)
+        self.spread_floor_bps
+            .observe_normal(outcome.realized_as_bps, 4.0);
+
+        // gamma_base: learn risk aversion from PnL magnitude
+        // Higher |PnL| per fill → need higher gamma to control risk
+        let pnl_magnitude = outcome.realized_pnl.abs();
+        if pnl_magnitude > 1e-10 {
+            self.gamma_base.observe_gamma_exponential(pnl_magnitude);
+        }
+
+        // fill_probability_width_bps: learn fill distance distribution
+        if outcome.fill_distance_bps > 0.0 {
+            self.fill_probability_width_bps
+                .observe_normal(outcome.fill_distance_bps, 1.0);
+        }
+
+        // --- Tier 3: Calibration ---
+
+        // kappa: fill intensity (fills per unit spread-time)
+        if let (Some(count), Some(exposure)) = (outcome.fills_in_window, outcome.window_exposure) {
+            if exposure > 0.0 {
+                self.kappa.observe_gamma_poisson(count, exposure);
+            }
+        }
+
+        // Hawkes inter-arrival: feeds mu (baseline) and beta (decay)
+        if let Some(dt_s) = outcome.inter_arrival_s {
+            if dt_s > 0.0 {
+                self.hawkes_mu.observe_gamma_exponential(dt_s);
+            }
+        }
+
+        if self.total_fills_observed.is_multiple_of(100) {
+            tracing::info!(
+                total_fills = self.total_fills_observed,
+                alpha_touch_n = self.alpha_touch.n_observations,
+                alpha_touch_est = format!("{:.4}", self.alpha_touch.estimate()),
+                spread_floor_n = self.spread_floor_bps.n_observations,
+                spread_floor_est = format!("{:.2}", self.spread_floor_bps.estimate()),
+                kappa_n = self.kappa.n_observations,
+                kappa_est = format!("{:.0}", self.kappa.estimate()),
+                "parameter_learner: milestone update"
+            );
+        }
+    }
+
+    /// Update regime-related parameters from an observed regime transition.
+    ///
+    /// Call this when the HMM detects a regime change (or confirms a stay).
+    ///
+    /// # Arguments
+    /// * `stayed_in_regime` - True if regime did not change, false if it transitioned
+    pub fn observe_regime_transition(&mut self, stayed_in_regime: bool) {
+        if stayed_in_regime {
+            self.regime_sticky_diagonal.observe_beta(1, 0);
+        } else {
+            self.regime_sticky_diagonal.observe_beta(0, 1);
+        }
+    }
+
+    /// Update BOCPD-related parameters from a changepoint detection event.
+    ///
+    /// # Arguments
+    /// * `samples_since_last_cp` - Number of samples observed since the last changepoint
+    /// * `was_changepoint` - Whether a changepoint was detected
+    pub fn observe_changepoint(&mut self, samples_since_last_cp: usize, was_changepoint: bool) {
+        if was_changepoint && samples_since_last_cp > 0 {
+            // Hazard rate = 1 / expected_run_length
+            let observed_rate = 1.0 / samples_since_last_cp as f64;
+            self.bocpd_hazard_rate
+                .observe_gamma_exponential(1.0 / observed_rate);
+        }
+
+        // Update changepoint detection threshold calibration
+        if was_changepoint {
+            self.bocpd_threshold.observe_beta(1, 0);
+        } else {
+            self.bocpd_threshold.observe_beta(0, 1);
+        }
+    }
+
+    /// Get the number of parameters that have at least one observation.
+    pub fn params_with_observations(&self) -> usize {
+        let params = [
+            &self.alpha_touch,
+            &self.gamma_base,
+            &self.spread_floor_bps,
+            &self.proactive_skew_sensitivity,
+            &self.toxic_hour_gamma_mult,
+            &self.predictive_bias_sensitivity,
+            &self.max_daily_loss_fraction,
+            &self.max_drawdown,
+            &self.cascade_oi_threshold,
+            &self.bocpd_hazard_rate,
+            &self.bocpd_threshold,
+            &self.quote_latch_threshold_bps,
+            &self.kappa,
+            &self.hawkes_mu,
+            &self.hawkes_alpha,
+            &self.hawkes_beta,
+            &self.kappa_ewma_alpha,
+            &self.kelly_tracker_decay,
+            &self.regime_sticky_diagonal,
+            &self.kalman_q,
+            &self.kalman_r,
+            &self.momentum_normalizer_bps,
+            &self.depth_spacing_ratio,
+            &self.fill_probability_width_bps,
+            &self.microprice_decay,
+        ];
+        params.iter().filter(|p| p.n_observations > 0).count()
+    }
+}
+
+/// Calibration status summary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CalibrationStatus {
+    /// Tier 1 (P&L critical) parameters are calibrated
+    pub tier1_ready: bool,
+    /// Tier 2 (risk) parameters are calibrated
+    pub tier2_ready: bool,
+    /// Total observations across all parameters
+    pub total_observations: usize,
+    /// Warmup phase complete
+    pub warmup_complete: bool,
+}
+
+// ==================== Adversarial Markout Calibrator (WS5) ====================
+
+/// Minimum predicted AS in bps to accept an observation.
+/// Guards against division by near-zero predicted values.
+const MIN_AS_PREDICTED_BPS: f64 = 0.01;
+
+/// Default ridge regularization strength.
+/// Shrinks betas toward zero (no correction) when data is scarce.
+const DEFAULT_RIDGE_LAMBDA: f64 = 1.0;
+
+/// Default exponential forgetting factor per observation.
+/// 0.999 gives a half-life of ~693 observations.
+const DEFAULT_DECAY: f64 = 0.999;
+
+/// Minimum observations before attempting to solve for betas.
+/// Need at least 2*d observations for reasonable d-dimensional regression.
+const MIN_OBS_MULTIPLIER: usize = 2;
+
+/// Clamp bounds for the multiplicative correction factor.
+/// exp(beta'x) is clamped to [0.2, 5.0] to prevent extreme corrections.
+const CORRECTION_CLAMP_MIN: f64 = 0.2;
+const CORRECTION_CLAMP_MAX: f64 = 5.0;
+
+/// EWMA smoothing for residual tracking.
+const RESIDUAL_EWMA_ALPHA: f64 = 0.01;
+
+/// Online ridge regression calibrator for adversarial markout data.
+///
+/// Regresses `y = ln(as_realized / as_predicted)` on feature vectors from `RiskFeatures`.
+/// Detects systematic bias in the risk model's adverse selection predictions and
+/// produces a multiplicative correction factor `exp(beta'x)`.
+///
+/// # Ridge Regression
+///
+/// beta = (X'X + lambda*I)^{-1} X'y
+///
+/// Where X'X and X'y are accumulated as sufficient statistics with exponential
+/// forgetting. Ridge lambda regularizes toward zero betas (no correction),
+/// which is the safe default.
+///
+/// # Forgetting
+///
+/// Each observation decays the accumulated statistics by `decay` before adding
+/// the new data point. This allows the calibrator to adapt to non-stationary
+/// bias patterns (e.g., regime-dependent AS misprediction).
+///
+/// # Checkpoint Compatibility
+///
+/// All fields use `#[serde(default)]` for backward compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdversarialCalibrator {
+    /// d x d sufficient statistic: sum of decay^(n-i) * x_i * x_i'
+    #[serde(default)]
+    xtx: Vec<Vec<f64>>,
+
+    /// d x 1 sufficient statistic: sum of decay^(n-i) * x_i * y_i
+    #[serde(default)]
+    xty: Vec<f64>,
+
+    /// Number of features (dimensionality of the regression)
+    #[serde(default)]
+    n_features: usize,
+
+    /// Ridge regularization parameter (shrinks toward zero betas)
+    #[serde(default = "default_ridge_lambda")]
+    ridge_lambda: f64,
+
+    /// Exponential forgetting factor per observation
+    #[serde(default = "default_decay")]
+    decay: f64,
+
+    /// Total observations incorporated
+    #[serde(default)]
+    n_obs: usize,
+
+    /// EWMA of squared residuals for monitoring
+    #[serde(default)]
+    residual_ewma: f64,
+}
+
+fn default_ridge_lambda() -> f64 {
+    DEFAULT_RIDGE_LAMBDA
+}
+fn default_decay() -> f64 {
+    DEFAULT_DECAY
+}
+
+impl AdversarialCalibrator {
+    /// Create a new calibrator for `n_features`-dimensional feature vectors.
+    ///
+    /// Initializes with zero sufficient statistics (no correction = safe default).
+    pub fn new(n_features: usize) -> Self {
+        Self {
+            xtx: vec![vec![0.0; n_features]; n_features],
+            xty: vec![0.0; n_features],
+            n_features,
+            ridge_lambda: DEFAULT_RIDGE_LAMBDA,
+            decay: DEFAULT_DECAY,
+            n_obs: 0,
+            residual_ewma: 0.0,
+        }
+    }
+
+    /// Create a calibrator with custom ridge lambda and decay.
+    pub fn with_params(n_features: usize, ridge_lambda: f64, decay: f64) -> Self {
+        Self {
+            xtx: vec![vec![0.0; n_features]; n_features],
+            xty: vec![0.0; n_features],
+            n_features,
+            ridge_lambda: ridge_lambda.max(0.0),
+            decay: decay.clamp(0.9, 1.0),
+            n_obs: 0,
+            residual_ewma: 0.0,
+        }
+    }
+
+    /// Observe a markout outcome and update sufficient statistics.
+    ///
+    /// The regression target is `y = ln(as_realized / as_predicted)`.
+    /// - y > 0 means the model under-predicted AS (realized was worse)
+    /// - y < 0 means the model over-predicted AS (realized was better)
+    /// - y = 0 means perfect calibration
+    ///
+    /// # Guards
+    /// - Skips if `as_predicted_bps < MIN_AS_PREDICTED_BPS` (near-zero denominator)
+    /// - Skips if `as_realized_bps <= 0.0` (log undefined)
+    /// - Skips if `features.len() != n_features` (dimension mismatch)
+    pub fn observe(&mut self, features: &[f64], as_predicted_bps: f64, as_realized_bps: f64) {
+        // Guard: dimension mismatch
+        if features.len() != self.n_features {
+            return;
+        }
+        // Guard: near-zero predicted AS
+        if as_predicted_bps.abs() < MIN_AS_PREDICTED_BPS {
+            return;
+        }
+        // Guard: non-positive realized AS (log undefined)
+        if as_realized_bps <= 0.0 {
+            return;
+        }
+
+        let y = (as_realized_bps / as_predicted_bps).ln();
+
+        // Apply exponential forgetting to existing statistics
+        for row in self.xtx.iter_mut() {
+            for val in row.iter_mut() {
+                *val *= self.decay;
+            }
+        }
+        for val in self.xty.iter_mut() {
+            *val *= self.decay;
+        }
+
+        // Rank-1 update: XTX += x * x', XTY += x * y
+        for i in 0..self.n_features {
+            for j in 0..self.n_features {
+                self.xtx[i][j] += features[i] * features[j];
+            }
+            self.xty[i] += features[i] * y;
+        }
+
+        self.n_obs += 1;
+
+        // Update residual EWMA
+        let betas = self.calibrated_betas();
+        let prediction: f64 = betas.iter().zip(features.iter()).map(|(b, x)| b * x).sum();
+        let residual_sq = (y - prediction).powi(2);
+        self.residual_ewma =
+            (1.0 - RESIDUAL_EWMA_ALPHA) * self.residual_ewma + RESIDUAL_EWMA_ALPHA * residual_sq;
+    }
+
+    /// Solve ridge regression and return calibrated betas.
+    ///
+    /// beta = (X'X + lambda*I)^{-1} X'y
+    ///
+    /// Uses Cholesky decomposition since X'X + lambda*I is symmetric positive definite.
+    /// Returns a zero vector if:
+    /// - Insufficient observations (< 2 * n_features)
+    /// - Cholesky decomposition fails (near-singular matrix)
+    pub fn calibrated_betas(&self) -> Vec<f64> {
+        let d = self.n_features;
+
+        // Need enough observations for meaningful regression
+        if self.n_obs < MIN_OBS_MULTIPLIER * d {
+            return vec![0.0; d];
+        }
+
+        // Copy XTX and add ridge penalty to diagonal
+        let mut a = self.xtx.clone();
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] += self.ridge_lambda;
+        }
+
+        // Cholesky decomposition: A = L * L'
+        // L is lower triangular
+        let mut l = vec![vec![0.0; d]; d];
+
+        for j in 0..d {
+            // Diagonal element
+            let mut sum = a[j][j];
+            for lj_k in l[j].iter().take(j) {
+                sum -= lj_k * lj_k;
+            }
+            if sum <= 0.0 {
+                // Matrix is not positive definite — return zeros (safe default)
+                return vec![0.0; d];
+            }
+            l[j][j] = sum.sqrt();
+
+            // Below-diagonal elements
+            for i in (j + 1)..d {
+                let mut sum = a[i][j];
+                for (li_k, lj_k) in l[i].iter().take(j).zip(l[j].iter().take(j)) {
+                    sum -= li_k * lj_k;
+                }
+                l[i][j] = sum / l[j][j];
+            }
+        }
+
+        // Forward substitution: L * z = xty
+        let mut z = vec![0.0; d];
+        for i in 0..d {
+            let mut sum = self.xty[i];
+            for j in 0..i {
+                sum -= l[i][j] * z[j];
+            }
+            z[i] = sum / l[i][i];
+        }
+
+        // Back substitution: L' * beta = z
+        let mut beta = vec![0.0; d];
+        for i in (0..d).rev() {
+            let mut sum = z[i];
+            for j in (i + 1)..d {
+                sum -= l[j][i] * beta[j];
+            }
+            beta[i] = sum / l[i][i];
+        }
+
+        beta
+    }
+
+    /// Compute the multiplicative correction factor for a given feature vector.
+    ///
+    /// Returns `exp(beta' * x)` clamped to [0.2, 5.0].
+    /// - correction > 1.0 means the model under-predicts AS (widen gamma)
+    /// - correction < 1.0 means the model over-predicts AS (tighten gamma)
+    /// - correction = 1.0 means no correction needed (well-calibrated)
+    ///
+    /// With zero betas (insufficient data), returns 1.0 (no correction).
+    pub fn correction_factor(&self, features: &[f64]) -> f64 {
+        let betas = self.calibrated_betas();
+
+        let log_correction: f64 = betas.iter().zip(features.iter()).map(|(b, x)| b * x).sum();
+
+        log_correction
+            .exp()
+            .clamp(CORRECTION_CLAMP_MIN, CORRECTION_CLAMP_MAX)
+    }
+
+    /// Get the EWMA of squared residuals as a monitoring metric.
+    ///
+    /// Lower values indicate better calibration.
+    /// Starts at 0.0 and converges as observations are added.
+    pub fn residual_mse(&self) -> f64 {
+        self.residual_ewma
+    }
+
+    /// Total number of observations incorporated.
+    pub fn n_observations(&self) -> usize {
+        self.n_obs
+    }
+
+    /// Whether the calibrator has enough data to produce meaningful corrections.
+    pub fn is_warm(&self) -> bool {
+        self.n_obs >= MIN_OBS_MULTIPLIER * self.n_features
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_beta_prior() {
+        let param = BayesianParam::beta("test", 0.25, 8.0);
+        assert!((param.estimate() - 0.25).abs() < 0.01);
+        assert!(param.n_observations == 0);
+    }
+
+    #[test]
+    fn test_beta_update() {
+        let mut param = BayesianParam::beta("test", 0.25, 8.0);
+        param.observe_beta(3, 7); // 30% success rate in data
+
+        // Posterior should be between prior (0.25) and data (0.30)
+        let estimate = param.estimate();
+        assert!(estimate > 0.25 && estimate < 0.30);
+        assert_eq!(param.n_observations, 10);
+    }
+
+    #[test]
+    fn test_gamma_prior() {
+        let param = BayesianParam::gamma("kappa", 2000.0, 10.0);
+        assert!((param.estimate() - 2000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_gamma_poisson_update() {
+        let mut param = BayesianParam::gamma("kappa", 2000.0, 10.0);
+
+        // Observe 50 fills over 0.02 time units → rate of 2500
+        param.observe_gamma_poisson(50, 0.02);
+
+        // Posterior should be between prior (2000) and data (2500)
+        let estimate = param.estimate();
+        assert!(estimate > 2000.0 && estimate < 2500.0);
+    }
+
+    #[test]
+    fn test_normal_prior() {
+        let param = BayesianParam::normal("test", 2.0, 0.25);
+        assert!((param.estimate() - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_shrinkage() {
+        let mut param = BayesianParam::beta("test", 0.5, 10.0); // Strong prior at 0.5
+
+        // Observe extreme data: 9/10 successes
+        param.observe_beta(9, 1);
+
+        // With strong prior, estimate should shrink toward 0.5
+        let estimate = param.estimate();
+        assert!(estimate < 0.9); // Not as extreme as raw data
+        assert!(estimate > 0.5); // But higher than prior
+
+        // Data weight should be 10/(10+10) = 0.5
+        assert!((param.data_weight() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_credible_interval() {
+        let param = BayesianParam::beta("test", 0.5, 100.0);
+        let (lower, upper) = param.credible_interval_95();
+
+        assert!(lower >= 0.0);
+        assert!(upper <= 1.0);
+        assert!(lower < 0.5 && upper > 0.5);
+    }
+
+    #[test]
+    fn test_reset_to_prior() {
+        let mut param = BayesianParam::beta("test", 0.25, 8.0);
+        param.observe_beta(50, 50);
+        assert!(param.n_observations > 0);
+
+        param.reset_to_prior();
+        assert_eq!(param.n_observations, 0);
+        assert!((param.estimate() - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_learned_parameters_default() {
+        let params = LearnedParameters::default();
+
+        // Check Tier 1 defaults
+        assert!((params.alpha_touch.estimate() - 0.25).abs() < 0.01);
+        assert!((params.gamma_base.estimate() - 0.15).abs() < 0.01);
+        assert!((params.kappa.estimate() - 2000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_calibration_status() {
+        let params = LearnedParameters::default();
+        let status = params.calibration_status();
+
+        // Should not be calibrated without observations
+        assert!(!status.tier1_ready);
+        assert!(!status.warmup_complete);
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        use std::fs;
+
+        // Create params and add some observations
+        let mut params = LearnedParameters::default();
+        params.alpha_touch.observe_beta(30, 70); // 30% informed
+        params.kappa.observe_gamma_poisson(100, 0.05); // 2000 fills/sec/spread
+        params.total_fills_observed = 100;
+
+        // Save to temp file
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join("test_learned_params.json");
+
+        params.save_to_file(&temp_path).expect("Failed to save");
+
+        // Load and verify
+        let loaded = LearnedParameters::load_from_file(&temp_path).expect("Failed to load");
+
+        // Verify key values persisted
+        assert_eq!(
+            loaded.alpha_touch.n_observations,
+            params.alpha_touch.n_observations
+        );
+        assert!((loaded.alpha_touch.estimate() - params.alpha_touch.estimate()).abs() < 0.001);
+        assert_eq!(loaded.kappa.n_observations, params.kappa.n_observations);
+        assert!((loaded.kappa.estimate() - params.kappa.estimate()).abs() < 1.0);
+        assert_eq!(loaded.total_fills_observed, 100);
+
+        // Clean up
+        fs::remove_file(&temp_path).ok();
+    }
+
+    #[test]
+    fn test_load_or_default_missing_file() {
+        let nonexistent_path = std::path::PathBuf::from("/nonexistent/path/params.json");
+        let params = LearnedParameters::load_or_default(&nonexistent_path);
+
+        // Should return defaults
+        assert!((params.alpha_touch.estimate() - 0.25).abs() < 0.01);
+        assert_eq!(params.total_fills_observed, 0);
+    }
+
+    #[test]
+    fn test_default_path() {
+        let path = LearnedParameters::default_path("HYPE");
+        assert!(path.to_str().unwrap().contains("hype_learned_params.json"));
+    }
+
+    #[test]
+    fn test_observe_fill_updates_parameters() {
+        let mut params = LearnedParameters::default();
+        assert_eq!(params.total_fills_observed, 0);
+        assert_eq!(params.params_with_observations(), 0);
+
+        let outcome = FillOutcome {
+            was_informed: true,
+            realized_as_bps: 4.5,
+            fill_distance_bps: 2.1,
+            realized_pnl: -0.003,
+            inter_arrival_s: Some(12.5),
+            fills_in_window: Some(5),
+            window_exposure: Some(0.01),
+            predicted_as_bps: Some(9.1),
+        };
+
+        params.observe_fill(&outcome);
+
+        assert_eq!(params.total_fills_observed, 1);
+        // alpha_touch, spread_floor_bps, gamma_base, fill_probability_width_bps,
+        // kappa, hawkes_mu should all have observations
+        assert!(params.alpha_touch.n_observations > 0);
+        assert!(params.spread_floor_bps.n_observations > 0);
+        assert!(params.gamma_base.n_observations > 0);
+        assert!(params.fill_probability_width_bps.n_observations > 0);
+        assert!(params.kappa.n_observations > 0);
+        assert!(params.hawkes_mu.n_observations > 0);
+        assert!(params.params_with_observations() >= 6);
+    }
+
+    #[test]
+    fn test_observe_fill_informed_vs_uninformed() {
+        let mut params = LearnedParameters::default();
+        let prior_alpha = params.alpha_touch.estimate();
+
+        // Feed 10 uninformed fills
+        for _ in 0..10 {
+            params.observe_fill(&FillOutcome {
+                was_informed: false,
+                realized_as_bps: 1.0,
+                fill_distance_bps: 1.5,
+                realized_pnl: 0.001,
+                inter_arrival_s: None,
+                fills_in_window: None,
+                window_exposure: None,
+                predicted_as_bps: None,
+            });
+        }
+
+        // alpha_touch should have moved below prior (fewer informed than expected)
+        assert!(params.alpha_touch.estimate() < prior_alpha);
+        assert_eq!(params.alpha_touch.n_observations, 10);
+    }
+
+    #[test]
+    fn test_observe_regime_transition() {
+        let mut params = LearnedParameters::default();
+        let prior_sticky = params.regime_sticky_diagonal.estimate();
+
+        // Feed 5 stays and 5 transitions
+        for _ in 0..5 {
+            params.observe_regime_transition(true);
+        }
+        for _ in 0..5 {
+            params.observe_regime_transition(false);
+        }
+
+        assert_eq!(params.regime_sticky_diagonal.n_observations, 10);
+        // 50% stay rate vs 95% prior → estimate should drop
+        assert!(params.regime_sticky_diagonal.estimate() < prior_sticky);
+    }
+
+    #[test]
+    fn test_observe_changepoint() {
+        let mut params = LearnedParameters::default();
+
+        params.observe_changepoint(100, true);
+        assert!(params.bocpd_hazard_rate.n_observations > 0);
+        assert!(params.bocpd_threshold.n_observations > 0);
+
+        params.observe_changepoint(0, false);
+        // Non-changepoint should still update threshold
+        assert_eq!(params.bocpd_threshold.n_observations, 2);
+    }
+
+    // ==================== WS5: AdversarialCalibrator Tests ====================
+
+    #[test]
+    fn test_ws5_adversarial_no_data_returns_zeros() {
+        let cal = AdversarialCalibrator::new(12);
+        let betas = cal.calibrated_betas();
+
+        assert_eq!(betas.len(), 12);
+        for b in &betas {
+            assert_eq!(*b, 0.0, "Betas should be zero with no data");
+        }
+        assert_eq!(cal.n_observations(), 0);
+        assert!(!cal.is_warm());
+    }
+
+    #[test]
+    fn test_ws5_adversarial_correction_neutral_default() {
+        let cal = AdversarialCalibrator::new(12);
+
+        // With zero betas, correction_factor should be exp(0) = 1.0
+        let features = vec![1.0; 12];
+        let correction = cal.correction_factor(&features);
+
+        assert!(
+            (correction - 1.0).abs() < 1e-10,
+            "Correction should be 1.0 with no data, got {}",
+            correction,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_detects_systematic_bias() {
+        // Test with a simple 2-feature model for tractability
+        let mut cal = AdversarialCalibrator::with_params(2, 0.01, 1.0); // Very small ridge, no decay
+
+        // Generate 100 observations where:
+        // - feature[0] = 1.0 (intercept-like)
+        // - feature[1] = 0.0
+        // - realized/predicted = 2.0, so y = ln(2) ~ 0.693
+        for _ in 0..100 {
+            let features = vec![1.0, 0.0];
+            cal.observe(&features, 5.0, 10.0); // 10/5 = 2.0
+        }
+
+        assert_eq!(cal.n_observations(), 100);
+        assert!(cal.is_warm());
+
+        let betas = cal.calibrated_betas();
+        assert_eq!(betas.len(), 2);
+
+        // beta[0] should be close to ln(2) ~ 0.693
+        let expected_ln2 = (2.0_f64).ln();
+        assert!(
+            (betas[0] - expected_ln2).abs() < 0.05,
+            "beta[0] should be close to ln(2)={:.4}, got {:.4}",
+            expected_ln2,
+            betas[0],
+        );
+
+        // beta[1] should be close to 0 (no signal in that feature)
+        assert!(
+            betas[1].abs() < 0.05,
+            "beta[1] should be near zero, got {:.4}",
+            betas[1],
+        );
+
+        // Correction factor at features=[1, 0] should be close to 2.0
+        let correction = cal.correction_factor(&[1.0, 0.0]);
+        assert!(
+            (correction - 2.0).abs() < 0.2,
+            "Correction should be ~2.0, got {:.4}",
+            correction,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_forgetting_decays_old() {
+        let mut cal = AdversarialCalibrator::with_params(1, 0.01, 0.95); // Aggressive decay
+
+        // Phase 1: 50 observations with realized/predicted = 3.0 (y = ln(3))
+        for _ in 0..50 {
+            cal.observe(&[1.0], 5.0, 15.0);
+        }
+
+        let betas_after_phase1 = cal.calibrated_betas();
+        let beta1 = betas_after_phase1[0];
+
+        // Phase 2: 50 observations with realized/predicted = 1.0 (y = 0.0, perfectly calibrated)
+        for _ in 0..50 {
+            cal.observe(&[1.0], 5.0, 5.0);
+        }
+
+        let betas_after_phase2 = cal.calibrated_betas();
+        let beta2 = betas_after_phase2[0];
+
+        // After phase 2 with aggressive decay, beta should have moved significantly
+        // toward 0 because the old phase-1 data (y=ln(3)) has decayed and
+        // phase-2 data (y=0) now dominates.
+        assert!(
+            beta2.abs() < beta1.abs(),
+            "Beta should have decayed: phase1={:.4}, phase2={:.4}",
+            beta1,
+            beta2,
+        );
+
+        // With 0.95 decay over 50 observations, old data is 0.95^50 ~ 0.077 weight
+        // So beta should be much closer to 0 than to ln(3)
+        let ln3 = (3.0_f64).ln();
+        assert!(
+            beta2.abs() < ln3 / 2.0,
+            "Beta should be well below ln(3)/2={:.4}, got {:.4}",
+            ln3 / 2.0,
+            beta2,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_ridge_prevents_explosion() {
+        // Test with perfectly collinear features: feature[1] = 2 * feature[0]
+        let mut cal = AdversarialCalibrator::with_params(2, 1.0, 1.0); // Strong ridge
+
+        for i in 0..100 {
+            let x = (i as f64) * 0.1;
+            let features = vec![x, 2.0 * x]; // Perfectly collinear
+            cal.observe(&features, 5.0, 10.0);
+        }
+
+        let betas = cal.calibrated_betas();
+
+        // Both betas should be finite and bounded (ridge prevents explosion)
+        for (i, b) in betas.iter().enumerate() {
+            assert!(b.is_finite(), "beta[{}] should be finite, got {}", i, b,);
+            assert!(b.abs() < 10.0, "beta[{}] should be bounded, got {}", i, b,);
+        }
+    }
+
+    #[test]
+    fn test_ws5_adversarial_guards_invalid_input() {
+        let mut cal = AdversarialCalibrator::new(3);
+
+        // Guard: wrong feature dimension
+        cal.observe(&[1.0, 2.0], 5.0, 10.0); // 2 features, expects 3
+        assert_eq!(cal.n_observations(), 0, "Should skip wrong dimension");
+
+        // Guard: near-zero predicted AS
+        cal.observe(&[1.0, 2.0, 3.0], 0.001, 10.0);
+        assert_eq!(cal.n_observations(), 0, "Should skip near-zero predicted");
+
+        // Guard: non-positive realized AS
+        cal.observe(&[1.0, 2.0, 3.0], 5.0, 0.0);
+        assert_eq!(cal.n_observations(), 0, "Should skip zero realized");
+
+        cal.observe(&[1.0, 2.0, 3.0], 5.0, -1.0);
+        assert_eq!(cal.n_observations(), 0, "Should skip negative realized");
+
+        // Valid observation should be accepted
+        cal.observe(&[1.0, 2.0, 3.0], 5.0, 10.0);
+        assert_eq!(cal.n_observations(), 1, "Should accept valid observation");
+    }
+
+    #[test]
+    fn test_ws5_adversarial_correction_clamped() {
+        let mut cal = AdversarialCalibrator::with_params(1, 0.01, 1.0);
+
+        // Feed extreme bias: realized/predicted = 100 (y = ln(100) ~ 4.6)
+        for _ in 0..100 {
+            cal.observe(&[1.0], 1.0, 100.0);
+        }
+
+        let correction = cal.correction_factor(&[1.0]);
+        assert!(
+            correction <= CORRECTION_CLAMP_MAX,
+            "Correction should be clamped to {}, got {}",
+            CORRECTION_CLAMP_MAX,
+            correction,
+        );
+
+        // Feed opposite extreme bias: realized/predicted = 0.01 (y = ln(0.01) ~ -4.6)
+        let mut cal2 = AdversarialCalibrator::with_params(1, 0.01, 1.0);
+        for _ in 0..100 {
+            cal2.observe(&[1.0], 100.0, 1.0);
+        }
+
+        let correction2 = cal2.correction_factor(&[1.0]);
+        assert!(
+            correction2 >= CORRECTION_CLAMP_MIN,
+            "Correction should be clamped to {}, got {}",
+            CORRECTION_CLAMP_MIN,
+            correction2,
+        );
+    }
+
+    #[test]
+    fn test_ws5_adversarial_residual_mse() {
+        let mut cal = AdversarialCalibrator::new(2);
+
+        // Before any observations, residual should be 0
+        assert_eq!(cal.residual_mse(), 0.0);
+
+        // Feed some observations
+        for _ in 0..50 {
+            cal.observe(&[1.0, 0.5], 5.0, 10.0);
+        }
+
+        // Residual MSE should be finite and non-negative
+        let mse = cal.residual_mse();
+        assert!(mse.is_finite(), "MSE should be finite, got {}", mse);
+        assert!(mse >= 0.0, "MSE should be non-negative, got {}", mse);
+    }
+
+    #[test]
+    fn test_ws5_adversarial_serde_roundtrip() {
+        let mut cal = AdversarialCalibrator::new(3);
+        for _ in 0..20 {
+            cal.observe(&[1.0, 0.5, 0.2], 5.0, 8.0);
+        }
+
+        let json = serde_json::to_string(&cal).expect("serialize");
+        let loaded: AdversarialCalibrator = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(loaded.n_observations(), cal.n_observations());
+        assert_eq!(loaded.n_features, cal.n_features);
+        assert!((loaded.residual_mse() - cal.residual_mse()).abs() < 1e-10);
+
+        // Betas should be identical after roundtrip
+        let betas_orig = cal.calibrated_betas();
+        let betas_loaded = loaded.calibrated_betas();
+        for (a, b) in betas_orig.iter().zip(betas_loaded.iter()) {
+            assert!((a - b).abs() < 1e-10, "Betas should match after roundtrip",);
+        }
+    }
+}

@@ -1,0 +1,48 @@
+# E[PnL] Activation & Enhancement Workstreams
+
+This document outlines the implementation plan for transitioning `hyper_make` from discrete overlays to a continuous, principled E[PnL] architecture by activating and enhancing the existing mathematical infrastructure.
+
+## Proposed Changes
+
+### Workstream 1: Dead Code Removal
+- Restore `src/market_maker/mod.rs` from git history.
+- Delete 11 orphaned files (EventDrivenOrchestrator, etc) left over from previous architecture drafts.
+- Remove any stale `pub mod` references and ensure `cargo clippy` passes cleanly.
+
+### Workstream 2: Enhanced E[PnL] Function
+- Update the `EPnLParams` struct in `strategy/glft.rs` with new fields: `toxicity_score`, `circuit_breaker_active`, `drawdown_frac`, `self_impact_bps`, `cascade_addon_bps`.
+- Enhance `expected_pnl_bps()` to absorb all overlay costs directly into the continuous equation.
+- Retain the old function signature as a thin wrapper for backward compatibility.
+- Implement comprehensive unit tests proving the mathematical properties of the enhanced function.
+
+### Workstream 3: Unified Reservation Price
+- Update the `reservation_mid` logic in `strategy/ladder_strat.rs`.
+- Replace the multi-step mid-price adjustment with a single, unified equation incorporating drift, continuous inventory penalty (`q * gamma * sigma^2 * T`), and funding carry.
+- Apply a dynamic clamp at ±95% of the GLFT half-spread to prevent crossing the market.
+- Add unit tests verifying the reservation price logic under various conditions.
+
+### Workstream 4: Activate E[PnL] Gate & Remove Overlays
+- Enable `use_epnl_filter: true` by default in `market_params.rs` and `aggregator.rs`.
+- Populate the `EPnLParams` struct from the unified market state in `ladder_strat.rs`.
+- Remove legacy discrete multiplicative overlays: `spread_widening_mult` (tail risk, cross venue, risk overlay cascades), `TOXICITY_CANCEL` binary gate, and `risk_size_reduction` multiplier.
+
+### Workstream 5: Remove Discrete Position Zones
+- Simplify the `select_mode()` function in `execution/state_machine.rs` to remove hardcoded Yellow/Red zone branching.
+- Rely on the continuous `gamma(q)` penalty curve to organically widen spreads and skew inventory as position size increases.
+- Update risk tests to ensure smooth degradation rather than cliff-edge behavior.
+
+### Workstream 6: Drift De-capping and Signal Routing
+- Add a dedicated `non_drift_skew_bps()` method to `SignalIntegrator`.
+- Re-route `market_params.lead_lag_signal_bps` to accurately reflect the true, unbounded lead-lag signal.
+- Remove the artificial 5 bps cap on `anticipated_mid` shifts, allowing the system to fully internalize strong directional momentum.
+
+### Workstream 7: E[PnL] Diagnostics
+- Implement an `EPnLDiagnostics` struct to be logged every quote cycle.
+- Record the theoretical `epnl_at_fill_time` and reconcile it against true 5-second markouts.
+- Wire this telemetry into the `QuoteOutcomeTracker` for systemic performance evaluation.
+
+## Verification Plan
+
+1.  **Unit Tests:** Implement and execute targeted unit tests for each new equation and structural change. Verify mathematical correctness and edge-case handling devoid of exchange state.
+2.  **Paper Trading (Shadow Mode):** Run the system against live websocket feeds without executing trades to ensure the unified E[PnL] surface behaves reasonably under live market microstructures (WS7 diagnostics will be crucial here).
+3.  **Live Evaluation:** Gradually introduce capital while monitoring the `EPnLDiagnostics` to confirm the continuous filters correctly identify and prevent adverse selection scenarios like the Feb 19th incident.

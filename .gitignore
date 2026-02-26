@@ -1,1 +1,12 @@
 /target
+.idea/
+Cargo.lock
+.env
+market_maker.toml
+*.log
+logs/
+data/checkpoints/
+
+# Dashboard capture tool
+tools/dashboard-capture/screenshots/
+tools/dashboard-capture/node_modules/

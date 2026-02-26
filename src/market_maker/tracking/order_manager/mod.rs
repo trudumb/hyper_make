@@ -1,0 +1,488 @@
+//! Order state management for tracking resting orders.
+//!
+//! This module implements a robust order lifecycle state machine that handles
+//! the race condition between cancel requests and fill notifications. The key
+//! insight is that fills can arrive via WebSocket *after* a cancel has been
+//! confirmed by the exchange, so we must maintain a "fill window" after cancel
+//! confirmation before removing orders from tracking.
+//!
+//! # Module Structure
+//!
+//! - `types`: Core types (`Side`, `OrderState`, `TrackedOrder`, `PendingOrder`)
+//! - `manager`: `OrderManager` implementation
+//! - `reconcile`: Ladder reconciliation logic
+//! - `impulse_filter`: Statistical impulse control for API churn reduction
+
+mod impulse_filter;
+mod manager;
+pub mod outcome_tracker;
+mod reconcile;
+pub mod scorer;
+mod types;
+
+pub use impulse_filter::{ImpulseDecision, ImpulseFilter, ImpulseFilterConfig, ImpulseFilterStats};
+pub use manager::OrderManager;
+pub use outcome_tracker::{
+    OutcomeStats, ReconcileActionType, ReconcileDecision, ReconcileOutcomeTracker,
+};
+pub use reconcile::{
+    priority_based_matching, reconcile_side_smart, reconcile_side_smart_with_impulse,
+    DynamicReconcileConfig, ReconcileConfig, ReconcileStats,
+};
+pub use scorer::{score_all as score_reconcile_actions, ActionType, ScoredUpdate};
+pub use types::{LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_maker::quoting::{Ladder, LadderLevel};
+    use smallvec::smallvec;
+    use std::time::Duration;
+
+    #[test]
+    fn test_add_and_get_order() {
+        let mut mgr = OrderManager::new();
+        let order = TrackedOrder::new(123, Side::Buy, 100.0, 1.0, 0.0);
+        mgr.add_order(order);
+
+        let retrieved = mgr.get_order(123).unwrap();
+        assert_eq!(retrieved.oid, 123);
+        assert_eq!(retrieved.side, Side::Buy);
+    }
+
+    #[test]
+    fn test_get_by_side() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 0.5, 0.0));
+
+        let buy = mgr.get_by_side(Side::Buy).unwrap();
+        assert_eq!(buy.oid, 1);
+
+        let sell = mgr.get_by_side(Side::Sell).unwrap();
+        assert_eq!(sell.oid, 2);
+    }
+
+    #[test]
+    fn test_process_fill() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0));
+
+        // First fill - should work and transition to PartialFilled
+        let (found, is_new, complete) = mgr.process_fill(1, 101, 0.5);
+        assert!(found && is_new && !complete);
+
+        let order = mgr.get_order(1).unwrap();
+        assert!((order.filled - 0.5).abs() < f64::EPSILON);
+        assert!((order.remaining() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(order.state, OrderState::PartialFilled);
+    }
+
+    #[test]
+    fn test_is_filled() {
+        let mut order = TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0);
+        assert!(!order.is_filled());
+
+        order.filled = 1.0;
+        assert!(order.is_filled());
+    }
+
+    #[test]
+    fn test_cancel_then_fill_race() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0));
+
+        // Initiate cancel
+        assert!(mgr.initiate_cancel(1));
+        assert_eq!(mgr.get_order(1).unwrap().state, OrderState::CancelPending);
+
+        // Fill arrives during cancel
+        let (found, is_new, complete) = mgr.process_fill(1, 101, 1.0);
+        assert!(found && is_new && complete);
+        assert_eq!(
+            mgr.get_order(1).unwrap().state,
+            OrderState::FilledDuringCancel
+        );
+
+        // Cleanup should remove it
+        let removed = mgr.cleanup();
+        assert_eq!(removed, vec![1]);
+        assert!(mgr.get_order(1).is_none());
+    }
+
+    #[test]
+    fn test_cancel_confirmed_fill_window() {
+        let config = OrderManagerConfig {
+            fill_window_duration: Duration::from_millis(50),
+            cancel_timeout: Duration::from_secs(30),
+        };
+        let mut mgr = OrderManager::with_config(config);
+
+        // Place and initiate cancel
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0));
+        mgr.initiate_cancel(1);
+        mgr.on_cancel_confirmed(1);
+
+        // Immediately after confirm - should NOT be cleaned up
+        let removed = mgr.cleanup();
+        assert!(removed.is_empty());
+        assert!(mgr.get_order(1).is_some());
+
+        // Wait for fill window to expire
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Now should be cleaned up
+        let removed = mgr.cleanup();
+        assert_eq!(removed, vec![1]);
+        assert!(mgr.get_order(1).is_none());
+    }
+
+    #[test]
+    fn test_late_fill_after_cancel_confirmed() {
+        let config = OrderManagerConfig {
+            fill_window_duration: Duration::from_millis(100),
+            cancel_timeout: Duration::from_secs(30),
+        };
+        let mut mgr = OrderManager::with_config(config);
+
+        // Place, initiate cancel, confirm
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0));
+        mgr.initiate_cancel(1);
+        mgr.on_cancel_confirmed(1);
+
+        // Fill arrives within window
+        let (found, is_new, _) = mgr.process_fill(1, 101, 0.5);
+        assert!(found && is_new);
+        assert_eq!(
+            mgr.get_order(1).unwrap().state,
+            OrderState::FilledDuringCancel
+        );
+
+        // Should be cleaned up immediately (no need to wait)
+        let removed = mgr.cleanup();
+        assert_eq!(removed, vec![1]);
+    }
+
+    #[test]
+    fn test_duplicate_fill_rejected() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 2.0, 0.0));
+
+        // First fill
+        let (_, is_new1, _) = mgr.process_fill(1, 101, 1.0);
+        assert!(is_new1);
+        assert!((mgr.get_order(1).unwrap().filled - 1.0).abs() < f64::EPSILON);
+
+        // Duplicate fill (same tid)
+        let (_, is_new2, _) = mgr.process_fill(1, 101, 1.0);
+        assert!(!is_new2);
+        // Filled amount unchanged
+        assert!((mgr.get_order(1).unwrap().filled - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_get_active_excludes_cancelling() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Buy, 99.0, 1.0, 0.0));
+
+        // Cancel one
+        mgr.initiate_cancel(1);
+
+        // get_all_by_side should only return order 2 (active orders)
+        let active = mgr.get_all_by_side(Side::Buy);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].oid, 2);
+
+        // get_all_by_side_including_pending should return both
+        let all = mgr.get_all_by_side_including_pending(Side::Buy);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_cancel_failure_reverts_state() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0));
+
+        // Initiate cancel
+        mgr.initiate_cancel(1);
+        assert_eq!(mgr.get_order(1).unwrap().state, OrderState::CancelPending);
+
+        // Cancel failed - should revert to Resting
+        mgr.on_cancel_failed(1);
+        assert_eq!(mgr.get_order(1).unwrap().state, OrderState::Resting);
+
+        // Order should be visible to get_by_side again
+        assert!(mgr.get_by_side(Side::Buy).is_some());
+    }
+
+    #[test]
+    fn test_reconcile_ladder_empty_to_ladder() {
+        let mgr = OrderManager::new();
+        let ladder = Ladder {
+            bids: smallvec![
+                LadderLevel {
+                    price: 99.0,
+                    size: 1.0,
+                    depth_bps: 10.0,
+                },
+                LadderLevel {
+                    price: 98.0,
+                    size: 0.5,
+                    depth_bps: 20.0,
+                },
+            ],
+            asks: smallvec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5);
+
+        // Should place 3 orders (2 bids, 1 ask)
+        assert_eq!(actions.len(), 3);
+        let place_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Place { .. }))
+            .count();
+        assert_eq!(place_count, 3);
+    }
+
+    #[test]
+    fn test_reconcile_ladder_orders_match() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0, 0.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 1.0, 0.0));
+
+        let ladder = Ladder {
+            bids: smallvec![LadderLevel {
+                price: 99.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+            asks: smallvec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5);
+
+        // Orders match target levels - no actions needed
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_ladder_cancel_stale() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 95.0, 1.0, 0.0)); // Too far from target
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 105.0, 1.0, 0.0)); // Too far from target
+
+        let ladder = Ladder {
+            bids: smallvec![LadderLevel {
+                price: 99.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+            asks: smallvec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5); // 5 bps tolerance
+
+        // Should cancel 2 stale orders and place 2 new ones
+        assert_eq!(actions.len(), 4);
+        let cancel_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Cancel { .. }))
+            .count();
+        let place_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Place { .. }))
+            .count();
+        assert_eq!(cancel_count, 2);
+        assert_eq!(place_count, 2);
+    }
+
+    #[test]
+    fn test_reconcile_ladder_partial_match() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0, 0.0)); // Matches first level
+                                                                        // No ask order
+
+        let ladder = Ladder {
+            bids: smallvec![
+                LadderLevel {
+                    price: 99.0,
+                    size: 1.0,
+                    depth_bps: 10.0,
+                },
+                LadderLevel {
+                    price: 98.0,
+                    size: 0.5,
+                    depth_bps: 20.0,
+                },
+            ],
+            asks: smallvec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5);
+
+        // Should place 1 bid (98.0) and 1 ask (101.0)
+        assert_eq!(actions.len(), 2);
+        let place_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Place { .. }))
+            .count();
+        assert_eq!(place_count, 2);
+    }
+
+    // === Pending Exposure Tests ===
+
+    #[test]
+    fn test_pending_exposure_empty() {
+        let mgr = OrderManager::new();
+        let (bids, asks) = mgr.pending_exposure();
+        assert!((bids - 0.0).abs() < f64::EPSILON);
+        assert!((asks - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pending_exposure_with_orders() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0, 0.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Buy, 98.0, 0.5, 0.0));
+        mgr.add_order(TrackedOrder::new(3, Side::Sell, 101.0, 0.8, 0.0));
+
+        let (bids, asks) = mgr.pending_exposure();
+        assert!((bids - 1.5).abs() < f64::EPSILON); // 1.0 + 0.5
+        assert!((asks - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pending_exposure_excludes_partial_fills() {
+        let mut mgr = OrderManager::new();
+        let mut order = TrackedOrder::new(1, Side::Buy, 99.0, 1.0, 0.0);
+        order.record_fill(100, 0.3); // Partial fill
+        mgr.add_order(order);
+
+        let (bids, _) = mgr.pending_exposure();
+        assert!((bids - 0.7).abs() < f64::EPSILON); // Only remaining
+    }
+
+    #[test]
+    fn test_net_pending_change() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0, 0.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 0.3, 0.0));
+
+        let net = mgr.net_pending_change();
+        assert!((net - 0.7).abs() < f64::EPSILON); // 1.0 - 0.3 = 0.7 (net long)
+    }
+
+    #[test]
+    fn test_worst_case_positions() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0, 0.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 0.5, 0.0));
+
+        let current_position = 0.2;
+        let (min, max) = mgr.worst_case_positions(current_position);
+
+        // max = 0.2 + 1.0 = 1.2 (all buys fill, no sells)
+        assert!((max - 1.2).abs() < f64::EPSILON);
+        // min = 0.2 - 0.5 = -0.3 (all sells fill, no buys)
+        assert!((min - (-0.3)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_resting_notional() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0)); // $100 notional
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 200.0, 0.5, 0.0)); // $100 notional
+
+        let (bid_notional, ask_notional) = mgr.resting_notional();
+        assert!((bid_notional - 100.0).abs() < f64::EPSILON);
+        assert!((ask_notional - 100.0).abs() < f64::EPSILON);
+    }
+
+    // === TrackedOrder Enhancement Tests ===
+
+    #[test]
+    fn test_tracked_order_with_cloid() {
+        let order =
+            TrackedOrder::with_cloid(1, "my-client-id".to_string(), Side::Buy, 100.0, 1.0, 0.0);
+        assert_eq!(order.cloid, Some("my-client-id".to_string()));
+        assert_eq!(order.oid, 1);
+    }
+
+    #[test]
+    fn test_tracked_order_average_fill_price() {
+        let mut order = TrackedOrder::new(1, Side::Buy, 100.0, 2.0, 0.0);
+
+        // No fills yet - should return placement price
+        assert!((order.average_fill_price() - 100.0).abs() < f64::EPSILON);
+
+        // First fill at 99.0
+        order.record_fill_with_price(101, 1.0, 99.0);
+        assert!((order.average_fill_price() - 99.0).abs() < f64::EPSILON);
+
+        // Second fill at 98.0 - average should be (99 + 98) / 2 = 98.5
+        order.record_fill_with_price(102, 1.0, 98.0);
+        // fill_value = 99 * 1 + 98 * 1 = 197, filled = 2
+        // average = 197 / 2 = 98.5
+        assert!((order.average_fill_price() - 98.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_tracked_order_last_fill_at() {
+        let mut order = TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0);
+
+        // No fills yet
+        assert!(order.last_fill_at.is_none());
+        assert!(order.time_since_last_fill().is_none());
+
+        // Record a fill
+        order.record_fill(101, 0.5);
+        assert!(order.last_fill_at.is_some());
+        assert!(order.time_since_last_fill().is_some());
+
+        // Time since fill should be very small (just happened)
+        let elapsed = order.time_since_last_fill().unwrap();
+        assert!(elapsed.as_millis() < 100);
+    }
+
+    #[test]
+    fn test_tracked_order_fill_count() {
+        let mut order = TrackedOrder::new(1, Side::Buy, 100.0, 2.0, 0.0);
+        assert_eq!(order.fill_count(), 0);
+
+        order.record_fill(101, 0.5);
+        assert_eq!(order.fill_count(), 1);
+
+        order.record_fill(102, 0.5);
+        assert_eq!(order.fill_count(), 2);
+
+        // Duplicate should not increase count
+        order.record_fill(101, 0.5);
+        assert_eq!(order.fill_count(), 2);
+    }
+
+    #[test]
+    fn test_tracked_order_age() {
+        let order = TrackedOrder::new(1, Side::Buy, 100.0, 1.0, 0.0);
+        let age = order.age();
+        // Should be very small (just created)
+        assert!(age.as_millis() < 100);
+    }
+}
