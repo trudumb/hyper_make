@@ -64,6 +64,14 @@ pub struct CentralBeliefConfig {
     pub dir_lambda_as: f64,
     /// Weight for flow-direction evidence (order_flow_direction).
     pub dir_lambda_flow: f64,
+    /// Weight for burst/cascade directional evidence.
+    /// Bursts are high-information: a 6-fill sweep is strong directional evidence.
+    /// Default 2.0 (strong — bursts are rare and informative).
+    pub dir_lambda_burst: f64,
+    /// Scale for AS magnitude normalization in directional evidence.
+    /// AS_bps / scale = normalized magnitude (clamped [0, 2]).
+    /// Default 15.0 (typical HL AS is 10-25 bps).
+    pub dir_as_scale_bps: f64,
 
     // === Kappa Priors ===
     /// Prior kappa value (fill intensity)
@@ -114,6 +122,8 @@ impl Default for CentralBeliefConfig {
             dir_lambda_fill: 0.3,
             dir_lambda_as: 0.5,
             dir_lambda_flow: 0.8,
+            dir_lambda_burst: 2.0,
+            dir_as_scale_bps: 15.0,
             kappa_prior: 2000.0,
             kappa_prior_strength: 10.0,
             min_price_obs: 50,
@@ -627,6 +637,25 @@ impl CentralBeliefState {
                 }
             }
 
+            BeliefUpdate::BurstEvent {
+                is_buy_side,
+                intensity_ratio,
+                fill_count,
+                timestamp_ms,
+            } => {
+                self.apply_dir_time_decay(state, timestamp_ms);
+                // is_buy_side=true → sell aggressor hit our bid → bearish → L↑
+                let direction = if is_buy_side { 1.0 } else { -1.0 };
+                // Magnitude: ln(intensity_ratio) + 1 scaled by sqrt(fill_count)
+                let magnitude = (intensity_ratio.max(1.0).ln() + 1.0) * (fill_count as f64).sqrt();
+                let lr_burst = direction * magnitude.clamp(0.5, 5.0);
+                state.dir_log_odds += self.config.dir_lambda_burst * lr_burst;
+                state.dir_log_odds = state
+                    .dir_log_odds
+                    .clamp(-self.config.dir_max_log_odds, self.config.dir_max_log_odds);
+                state.last_update_ms = timestamp_ms;
+            }
+
             BeliefUpdate::RegimeUpdate { probs, features: _ } => {
                 state.regime_probs = probs;
             }
@@ -859,7 +888,7 @@ impl CentralBeliefState {
         state.dir_lr_sum_fill += lr_fill;
 
         // AS direction: large AS + is_buy → confirmed downward move → bearish
-        let as_scale_bps = 5.0;
+        let as_scale_bps = self.config.dir_as_scale_bps;
         let as_mag = (fill.realized_as_bps.abs() / as_scale_bps).clamp(0.0, 2.0);
         let lr_as = if fill.is_buy { as_mag } else { -as_mag };
         state.dir_log_odds += self.config.dir_lambda_as * lr_as;
@@ -1128,8 +1157,13 @@ impl CentralBeliefState {
         let total_n =
             (state.dir_n_price + state.dir_n_fill + state.dir_n_as + state.dir_n_flow) as f64;
         let dir_conf = 1.0 - 2.0 * prob_bearish.min(prob_bullish);
-        let evidence_conf = (total_n / 50.0).min(1.0);
-        let confidence = (dir_conf * evidence_conf).clamp(0.0, 1.0);
+        // Softer evidence ramp with meaningful floor for cold-start defense.
+        // Floor ensures 30% passthrough even with few observations.
+        // sqrt() makes ramp concave (faster initial rise).
+        let evidence_floor = 0.3;
+        let evidence_weight =
+            evidence_floor + (1.0 - evidence_floor) * (total_n / 50.0).min(1.0).sqrt();
+        let confidence = (dir_conf * evidence_weight).clamp(0.0, 1.0);
 
         // Sigma from running variance
         let expected_sigma = if state.sigma_n > 5.0 {
@@ -1182,6 +1216,11 @@ impl CentralBeliefState {
             sigma_skewness,
             sigma_kurtosis,
             drift_skewness,
+            // Diagnostic: per-source evidence sums
+            lr_sum_price: state.dir_lr_sum_price,
+            lr_sum_fill: state.dir_lr_sum_fill,
+            lr_sum_as: state.dir_lr_sum_as,
+            lr_sum_flow: state.dir_lr_sum_flow,
         }
     }
 
@@ -1905,5 +1944,377 @@ mod tests {
         assert!(sigmoid(5.0) > 0.99);
         assert!(sigmoid(-5.0) < 0.01);
         assert!((sigmoid(1.0) + sigmoid(-1.0) - 1.0).abs() < 1e-10);
+    }
+
+    // =========================================================================
+    // Phase 1: Burst → Belief Pipeline Tests
+    // =========================================================================
+
+    #[test]
+    fn test_burst_event_shifts_log_odds_bearish() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Buy burst (sell aggressor) → bearish → prob_bearish increases
+        beliefs.update(BeliefUpdate::BurstEvent {
+            is_buy_side: true,
+            intensity_ratio: 3.0,
+            fill_count: 5,
+            timestamp_ms: 1000,
+        });
+
+        let snapshot = beliefs.snapshot();
+        assert!(
+            snapshot.drift_vol.prob_bearish > 0.6,
+            "Buy burst should push bearish: prob_bearish={}",
+            snapshot.drift_vol.prob_bearish
+        );
+    }
+
+    #[test]
+    fn test_burst_event_shifts_log_odds_bullish() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Sell burst (buy aggressor) → bullish → prob_bearish decreases
+        beliefs.update(BeliefUpdate::BurstEvent {
+            is_buy_side: false,
+            intensity_ratio: 3.0,
+            fill_count: 5,
+            timestamp_ms: 1000,
+        });
+
+        let snapshot = beliefs.snapshot();
+        assert!(
+            snapshot.drift_vol.prob_bullish > 0.6,
+            "Sell burst should push bullish: prob_bullish={}",
+            snapshot.drift_vol.prob_bullish
+        );
+    }
+
+    #[test]
+    fn test_burst_log_odds_clamped() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Extreme burst — should not exceed dir_max_log_odds=5.0
+        for _ in 0..20 {
+            beliefs.update(BeliefUpdate::BurstEvent {
+                is_buy_side: true,
+                intensity_ratio: 10.0,
+                fill_count: 10,
+                timestamp_ms: 1000,
+            });
+        }
+
+        let snapshot = beliefs.snapshot();
+        // sigmoid(5.0) ≈ 0.993
+        assert!(
+            snapshot.drift_vol.prob_bearish < 1.0,
+            "Must be clamped below 1.0: {}",
+            snapshot.drift_vol.prob_bearish
+        );
+        assert!(
+            snapshot.drift_vol.prob_bearish > 0.99,
+            "Should be near max: {}",
+            snapshot.drift_vol.prob_bearish
+        );
+    }
+
+    #[test]
+    fn test_burst_combined_with_fills() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // First: fill evidence pushing bearish
+        for i in 0..5 {
+            beliefs.update(BeliefUpdate::OwnFill {
+                price: 100.01,
+                size: 1.0,
+                mid: 100.0,
+                is_buy: true,
+                is_aligned: true,
+                realized_as_bps: 2.0,
+                realized_edge_bps: 1.0,
+                timestamp_ms: i * 1000,
+                order_id: Some(i),
+                quoted_size: 1.0,
+            });
+        }
+
+        let before = beliefs.snapshot();
+        let prob_before = before.drift_vol.prob_bearish;
+
+        // Then: burst event compounding the bearish signal
+        beliefs.update(BeliefUpdate::BurstEvent {
+            is_buy_side: true,
+            intensity_ratio: 3.0,
+            fill_count: 5,
+            timestamp_ms: 6000,
+        });
+
+        let after = beliefs.snapshot();
+        assert!(
+            after.drift_vol.prob_bearish > prob_before,
+            "Burst should compound fill evidence: before={}, after={}",
+            prob_before,
+            after.drift_vol.prob_bearish
+        );
+    }
+
+    // =========================================================================
+    // Phase 2: Confidence Cold-Start Tests
+    // =========================================================================
+
+    #[test]
+    fn test_confidence_cold_start_floor() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Push strong directional signal with few observations
+        // A burst gives a strong signal but doesn't increment evidence counters
+        // Use a single burst to create strong directional signal
+        beliefs.update(BeliefUpdate::BurstEvent {
+            is_buy_side: true,
+            intensity_ratio: 5.0,
+            fill_count: 6,
+            timestamp_ms: 1000,
+        });
+
+        // Add a few price observations so total_n > 0
+        for i in 0..5 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.003,
+                dt_secs: 1.0,
+                timestamp_ms: 1000 + (i + 1) * 100,
+            });
+        }
+
+        let snapshot = beliefs.snapshot();
+        // With floor, even at n=5, confidence should be meaningful when signal is strong
+        assert!(
+            snapshot.drift_vol.confidence > 0.05,
+            "Cold-start confidence should exceed 0.05 with strong signal: conf={}",
+            snapshot.drift_vol.confidence
+        );
+    }
+
+    #[test]
+    fn test_confidence_converges_at_50() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // 60 observations of consistent bearish returns
+        for i in 0..60 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.002,
+                dt_secs: 1.0,
+                timestamp_ms: i * 1000,
+            });
+        }
+
+        let snapshot = beliefs.snapshot();
+        // At n=60 (> 50), evidence_weight ≈ 0.3 + 0.7*1.0 = 1.0
+        // dir_conf is strong → confidence should be substantial
+        assert!(
+            snapshot.drift_vol.confidence > 0.3,
+            "At 60 observations, confidence should exceed 0.3: conf={}",
+            snapshot.drift_vol.confidence
+        );
+    }
+
+    #[test]
+    fn test_confidence_monotonic_with_evidence() {
+        let beliefs = CentralBeliefState::default_config();
+        let mut last_conf = 0.0;
+
+        for step in 0..5 {
+            // Add 10 consistent bearish observations per step
+            for i in 0..10 {
+                let ts = (step * 10 + i) as u64 * 1000;
+                beliefs.update(BeliefUpdate::PriceReturn {
+                    return_frac: -0.002,
+                    dt_secs: 1.0,
+                    timestamp_ms: ts,
+                });
+            }
+
+            let snapshot = beliefs.snapshot();
+            // Confidence should generally increase with more evidence
+            // (allow small dips due to time decay if timestamps advance)
+            if step > 0 {
+                assert!(
+                    snapshot.drift_vol.confidence >= last_conf * 0.8,
+                    "Confidence should increase with evidence: step={}, prev={}, now={}",
+                    step,
+                    last_conf,
+                    snapshot.drift_vol.confidence
+                );
+            }
+            last_conf = snapshot.drift_vol.confidence;
+        }
+
+        // Final confidence should be meaningful
+        assert!(
+            last_conf > 0.2,
+            "Final confidence should exceed 0.2: {}",
+            last_conf
+        );
+    }
+
+    // =========================================================================
+    // Phase 3: AS Scale Configuration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_as_scale_configurable() {
+        // Default: 15.0
+        let beliefs_default = CentralBeliefState::default_config();
+
+        // Custom: 5.0 (original hardcoded value)
+        let config = CentralBeliefConfig {
+            dir_as_scale_bps: 5.0,
+            ..Default::default()
+        };
+        let beliefs_custom = CentralBeliefState::new(config);
+
+        // Same fill with AS=10 bps
+        let fill = BeliefUpdate::OwnFill {
+            price: 100.01,
+            size: 1.0,
+            mid: 100.0,
+            is_buy: true,
+            is_aligned: true,
+            realized_as_bps: 10.0,
+            realized_edge_bps: -10.0,
+            timestamp_ms: 1000,
+            order_id: Some(1),
+            quoted_size: 1.0,
+        };
+
+        // Send same fill to both
+        beliefs_default.update(BeliefUpdate::OwnFill {
+            price: 100.01,
+            size: 1.0,
+            mid: 100.0,
+            is_buy: true,
+            is_aligned: true,
+            realized_as_bps: 10.0,
+            realized_edge_bps: -10.0,
+            timestamp_ms: 1000,
+            order_id: Some(1),
+            quoted_size: 1.0,
+        });
+        beliefs_custom.update(fill);
+
+        let snap_default = beliefs_default.snapshot();
+        let snap_custom = beliefs_custom.snapshot();
+
+        // With scale=5.0, 10 bps AS → mag = (10/5).clamp(0,2) = 2.0 (saturated)
+        // With scale=15.0, 10 bps AS → mag = (10/15).clamp(0,2) ≈ 0.67 (not saturated)
+        // So custom (scale=5) should show stronger bearish shift
+        assert!(
+            snap_custom.drift_vol.prob_bearish > snap_default.drift_vol.prob_bearish,
+            "Smaller AS scale should produce stronger signal: custom={}, default={}",
+            snap_custom.drift_vol.prob_bearish,
+            snap_default.drift_vol.prob_bearish
+        );
+    }
+
+    #[test]
+    fn test_as_signal_resolution() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // 10 bps AS fill
+        beliefs.update(BeliefUpdate::OwnFill {
+            price: 100.01,
+            size: 1.0,
+            mid: 100.0,
+            is_buy: true,
+            is_aligned: true,
+            realized_as_bps: 10.0,
+            realized_edge_bps: -10.0,
+            timestamp_ms: 1000,
+            order_id: Some(1),
+            quoted_size: 1.0,
+        });
+        let snap_10 = beliefs.snapshot();
+
+        // Reset and try 20 bps AS fill
+        let beliefs2 = CentralBeliefState::default_config();
+        beliefs2.update(BeliefUpdate::OwnFill {
+            price: 100.01,
+            size: 1.0,
+            mid: 100.0,
+            is_buy: true,
+            is_aligned: true,
+            realized_as_bps: 20.0,
+            realized_edge_bps: -20.0,
+            timestamp_ms: 1000,
+            order_id: Some(1),
+            quoted_size: 1.0,
+        });
+        let snap_20 = beliefs2.snapshot();
+
+        // With scale=15.0: 10/15=0.67, 20/15=1.33 — meaningfully different
+        assert!(
+            snap_20.drift_vol.prob_bearish > snap_10.drift_vol.prob_bearish,
+            "20 bps AS should produce stronger signal than 10 bps: 10bps={}, 20bps={}",
+            snap_10.drift_vol.prob_bearish,
+            snap_20.drift_vol.prob_bearish
+        );
+        // They should differ by a meaningful amount (not just floating point noise)
+        let diff = snap_20.drift_vol.prob_bearish - snap_10.drift_vol.prob_bearish;
+        assert!(
+            diff > 0.01,
+            "AS signal should have resolution: diff={}",
+            diff
+        );
+    }
+
+    // =========================================================================
+    // Phase 4: Diagnostic Fields Tests
+    // =========================================================================
+
+    #[test]
+    fn test_lr_sum_diagnostic_fields() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Price evidence
+        for i in 0..10 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.002,
+                dt_secs: 1.0,
+                timestamp_ms: i * 1000,
+            });
+        }
+
+        // Fill evidence
+        beliefs.update(BeliefUpdate::OwnFill {
+            price: 100.01,
+            size: 1.0,
+            mid: 100.0,
+            is_buy: true,
+            is_aligned: true,
+            realized_as_bps: 5.0,
+            realized_edge_bps: -5.0,
+            timestamp_ms: 11_000,
+            order_id: Some(1),
+            quoted_size: 1.0,
+        });
+
+        let snapshot = beliefs.snapshot();
+        // Price evidence should be non-zero (bearish)
+        assert!(
+            snapshot.drift_vol.lr_sum_price != 0.0,
+            "lr_sum_price should be non-zero: {}",
+            snapshot.drift_vol.lr_sum_price
+        );
+        // Fill evidence should be non-zero
+        assert!(
+            snapshot.drift_vol.lr_sum_fill != 0.0,
+            "lr_sum_fill should be non-zero: {}",
+            snapshot.drift_vol.lr_sum_fill
+        );
+        // AS evidence should be non-zero
+        assert!(
+            snapshot.drift_vol.lr_sum_as != 0.0,
+            "lr_sum_as should be non-zero: {}",
+            snapshot.drift_vol.lr_sum_as
+        );
     }
 }

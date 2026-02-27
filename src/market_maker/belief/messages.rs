@@ -112,6 +112,21 @@ pub enum BeliefUpdate {
         observation: f64,
     },
 
+    /// Fill burst/cascade event from cascade tracker.
+    ///
+    /// Published by: Fill handler when burst or cascade detected.
+    /// Bursts are high-information: a 6-fill sweep is strong directional evidence.
+    BurstEvent {
+        /// Side of the burst (true = buy fills = sell aggressor = bearish)
+        is_buy_side: bool,
+        /// Hawkes intensity ratio (higher = more extreme)
+        intensity_ratio: f64,
+        /// Number of fills in the burst window
+        fill_count: u32,
+        /// Timestamp (epoch ms)
+        timestamp_ms: u64,
+    },
+
     /// Continuation signal updates from external estimators.
     ///
     /// Published by: MomentumModel, TrendPersistenceTracker

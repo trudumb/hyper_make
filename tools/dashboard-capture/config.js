@@ -4,7 +4,7 @@
 export const config = {
   // Dashboard connection
   dashboardUrl: process.env.DASHBOARD_URL || 'http://localhost:3000/mm-dashboard-fixed.html',
-  wsUrl: process.env.WS_URL || 'ws://localhost:8080/ws/dashboard',
+  wsUrl: process.env.WS_URL || 'ws://localhost:9090/ws/dashboard',
 
   // Capture settings
   captureIntervalMs: parseInt(process.env.CAPTURE_INTERVAL_MS) || 5000,

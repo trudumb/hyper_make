@@ -167,6 +167,16 @@ pub struct DriftVolatilityBeliefs {
     ///
     /// Asymmetry in drift belief; affects directional confidence.
     pub drift_skewness: f64,
+
+    // === Diagnostic: Per-source evidence sums (for calibration dashboards) ===
+    /// Cumulative log-likelihood ratio from price evidence
+    pub lr_sum_price: f64,
+    /// Cumulative log-likelihood ratio from fill evidence
+    pub lr_sum_fill: f64,
+    /// Cumulative log-likelihood ratio from adverse selection evidence
+    pub lr_sum_as: f64,
+    /// Cumulative log-likelihood ratio from flow evidence
+    pub lr_sum_flow: f64,
 }
 
 impl Default for DriftVolatilityBeliefs {
@@ -183,6 +193,11 @@ impl Default for DriftVolatilityBeliefs {
             sigma_skewness: 0.5, // Slight positive (typical for vol)
             sigma_kurtosis: 0.0, // Gaussian
             drift_skewness: 0.0, // Symmetric
+            // Diagnostic: per-source evidence sums
+            lr_sum_price: 0.0,
+            lr_sum_fill: 0.0,
+            lr_sum_as: 0.0,
+            lr_sum_flow: 0.0,
         }
     }
 }

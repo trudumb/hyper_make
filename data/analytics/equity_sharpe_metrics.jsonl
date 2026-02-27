@@ -1565,3 +1565,7 @@
 {"sharpe_all":82.49464664578139,"sharpe_1h":82.49464664578139,"max_drawdown_bps":10027.860011073944,"snapshot_count":16,"latest_equity_usd":0.006387984000001248}
 {"sharpe_all":82.49464664578139,"sharpe_1h":82.49464664578139,"max_drawdown_bps":10027.860011073944,"snapshot_count":16,"latest_equity_usd":0.006387984000001248}
 {"sharpe_all":74.84661917279341,"sharpe_1h":74.84661917279341,"max_drawdown_bps":10480.946702649959,"snapshot_count":17,"latest_equity_usd":-0.001588469999997585}
+{"sharpe_all":0.0,"sharpe_1h":0.0,"max_drawdown_bps":0.0,"snapshot_count":1,"latest_equity_usd":0.0}
+{"sharpe_all":0.0,"sharpe_1h":0.0,"max_drawdown_bps":0.0,"snapshot_count":1,"latest_equity_usd":0.0}
+{"sharpe_all":0.0,"sharpe_1h":0.0,"max_drawdown_bps":0.0,"snapshot_count":2,"latest_equity_usd":0.0}
+{"sharpe_all":0.0,"sharpe_1h":0.0,"max_drawdown_bps":0.0,"snapshot_count":3,"latest_equity_usd":0.0}

@@ -608,9 +608,22 @@
             regimeCascade: '#ef4444',
         };
 
-        // API Configuration
-        const API_BASE = 'http://localhost:8080';  // Change to your market maker's metrics port
-        const WS_URL = 'ws://localhost:8080/ws/dashboard';  // WebSocket endpoint
+        // API Configuration — auto-resolves port and asset from URL params
+        function resolveBackendConfig() {
+            const params = new URLSearchParams(window.location.search);
+            const host = window.location.hostname || 'localhost';
+            let port = 9090; // matches Rust MonitoringConfig::default (src/market_maker/config/core.rs:215)
+            if (params.has('port')) {
+                port = parseInt(params.get('port'), 10);
+            } else if (window.location.port && window.location.port !== '3000' && window.location.port !== '') {
+                port = parseInt(window.location.port, 10);
+            }
+            const asset = params.get('asset') || null; // resolved from backend data or defaults to null
+            return { port, host, asset, apiBase: 'http://' + host + ':' + port, wsUrl: 'ws://' + host + ':' + port + '/ws/dashboard' };
+        }
+        const BACKEND = resolveBackendConfig();
+        const API_BASE = BACKEND.apiBase;
+        const WS_URL = BACKEND.wsUrl;
 
         // WebSocket Dashboard Client
         class DashboardWebSocket {
@@ -691,16 +704,16 @@
             }
         }
 
-        // Default data for when API is unavailable
+        // Default data for when API is unavailable — null signals "no data" vs real zero
         const defaultQuotes = {
-            mid: '0.00',
-            spreadBps: '0.0',
-            inventory: '0.000',
-            regime: 'Unknown',
-            kappa: '0',
-            gamma: '0.000',
-            fillProb: '0.0',
-            asProb: '0.0',
+            mid: null,
+            spreadBps: null,
+            inventory: null,
+            regime: null,
+            kappa: null,
+            gamma: null,
+            fillProb: null,
+            asProb: null,
         };
 
         const defaultPnL = {
@@ -834,16 +847,22 @@
             e('div', {className: 'flex flex-col'},
                 e('span', {className: 'text-xs uppercase tracking-wider mb-1 mono', style: {color: C.textMuted}}, label),
                 e('div', {className: 'flex items-baseline gap-1'},
-                    e('span', {className: 'text-2xl font-bold tabular-nums mono', style: {color: C.text}}, value),
-                    unit && e('span', {className: 'text-sm', style: {color: C.textMuted}}, unit)
+                    e('span', {className: 'text-2xl font-bold tabular-nums mono', style: {color: value == null ? C.textDim : C.text}}, value == null ? '--' : value),
+                    unit && value != null && e('span', {className: 'text-sm', style: {color: C.textMuted}}, unit)
                 )
             );
 
         const RegimeBadge = ({regime}) => {
+            if (regime == null) {
+                return e('span', {
+                    className: 'px-2 py-0.5 rounded text-xs font-medium uppercase tracking-wider mono',
+                    style: {backgroundColor: C.textDim + '20', color: C.textDim}
+                }, '--');
+            }
             const colors = {Quiet: C.regimeQuiet, Trending: C.regimeTrending, Volatile: C.regimeVolatile, Cascade: C.regimeCascade};
             return e('span', {
                 className: 'px-2 py-0.5 rounded text-xs font-medium uppercase tracking-wider mono',
-                style: {backgroundColor: colors[regime] + '20', color: colors[regime]}
+                style: {backgroundColor: (colors[regime] || C.textDim) + '20', color: colors[regime] || C.textDim}
             }, regime);
         };
 
@@ -1734,6 +1753,8 @@
         const Dashboard = () => {
             const [tab, setTab] = useState('overview');
             const [connected, setConnected] = useState(false);
+            const [reconnectAttempts, setReconnectAttempts] = useState(0);
+            const [asset, setAsset] = useState(BACKEND.asset);
             const [quotes, setQuotes] = useState(defaultQuotes);
             const [regime, setRegime] = useState([]);
             const [pnl, setPnl] = useState(defaultPnL);
@@ -1913,6 +1934,7 @@
                     () => {         // onConnected
                         setConnected(true);
                         setWsConnected(true);
+                        setReconnectAttempts(0);
                         // Clear HTTP fallback if running
                         if (httpFallbackInterval) {
                             clearInterval(httpFallbackInterval);
@@ -1922,6 +1944,7 @@
                     () => {         // onDisconnected
                         setConnected(false);
                         setWsConnected(false);
+                        setReconnectAttempts(n => n + 1);
                         // Start HTTP fallback polling
                         if (!httpFallbackInterval) {
                             httpFallbackInterval = setInterval(async () => {
@@ -1960,7 +1983,7 @@
                     e('div', {className: 'flex flex-col md:flex-row md:items-center md:justify-between gap-4'},
                         e('div', null,
                             e('h1', {className: 'text-2xl md:text-3xl font-bold tracking-tight'}, 'STOCHASTIC MM'),
-                            e('p', {className: 'text-sm mt-1', style: {color: C.textMuted}}, 'Real-time Market Making Analytics • Hyperliquid BTC-PERP')
+                            e('p', {className: 'text-sm mt-1', style: {color: C.textMuted}}, 'Real-time Market Making Analytics • Hyperliquid ' + (asset ? asset + '-PERP' : ''))
                         ),
                         e('div', {className: 'flex items-center gap-4'},
                             e('div', {className: 'flex items-center gap-2'},
@@ -1976,12 +1999,26 @@
                     )
                 ),
 
+                // Connection diagnostic banner
+                !connected && e('div', {className: 'mb-4 p-3 rounded-lg border', style: {backgroundColor: C.red + '10', borderColor: C.red + '40'}},
+                    e('div', {className: 'flex items-center justify-between flex-wrap gap-2'},
+                        e('div', {className: 'flex items-center gap-2'},
+                            e('div', {className: 'w-2 h-2 rounded-full animate-pulse', style: {backgroundColor: C.red}}),
+                            e('span', {className: 'text-sm font-medium mono', style: {color: C.red}}, 'Disconnected')
+                        ),
+                        e('span', {className: 'text-xs mono', style: {color: C.textMuted}},
+                            'Trying ' + WS_URL + (reconnectAttempts > 0 ? ' (attempt ' + reconnectAttempts + ')' : ''))
+                    ),
+                    e('div', {className: 'text-xs mt-1', style: {color: C.textMuted}},
+                        'Ensure the market maker is running with --metrics-port ' + BACKEND.port)
+                ),
+
                 // Live Banner
                 e(Card, {accent: C.accent},
                     e('div', {className: 'grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4'},
                         e(Metric, {label: 'Mid Price', value: quotes.mid, unit: 'USD'}),
                         e(Metric, {label: 'Spread', value: quotes.spreadBps, unit: 'bps'}),
-                        e(Metric, {label: 'Inventory', value: quotes.inventory, unit: 'BTC'}),
+                        e(Metric, {label: 'Inventory', value: quotes.inventory, unit: asset || ''}),
                         e('div', {className: 'flex flex-col'},
                             e('span', {className: 'text-xs uppercase tracking-wider mb-1 mono', style: {color: C.textMuted}}, 'Regime'),
                             e(RegimeBadge, {regime: quotes.regime})
@@ -2058,13 +2095,17 @@
                             e('div', {className: 'mt-4 grid grid-cols-2 gap-4'},
                                 e('div', {className: 'p-3 rounded', style: {backgroundColor: C.bg}},
                                     e('div', {className: 'text-xs uppercase mb-2 mono', style: {color: C.textMuted}}, 'Brier Score'),
-                                    e('div', {className: 'text-xl font-bold mono'}, calibMetrics.fill.brier.toFixed(3)),
-                                    e('div', {className: 'text-xs mt-1', style: {color: calibMetrics.fill.brier < 0.25 ? C.green : calibMetrics.fill.brier < 0.35 ? C.yellow : C.red}}, calibMetrics.fill.brier < 0.25 ? 'Good' : calibMetrics.fill.brier < 0.35 ? 'Fair' : 'Poor')
+                                    e('div', {className: 'text-xl font-bold mono', style: {color: calib.length === 0 ? C.textDim : C.text}},
+                                        calib.length === 0 ? '--' : calibMetrics.fill.brier.toFixed(3)),
+                                    e('div', {className: 'text-xs mt-1', style: {color: calib.length === 0 ? C.textDim : calibMetrics.fill.brier < 0.25 ? C.green : calibMetrics.fill.brier < 0.35 ? C.yellow : C.red}},
+                                        calib.length === 0 ? 'No data' : calibMetrics.fill.brier < 0.25 ? 'Good' : calibMetrics.fill.brier < 0.35 ? 'Fair' : 'Poor')
                                 ),
                                 e('div', {className: 'p-3 rounded', style: {backgroundColor: C.bg}},
                                     e('div', {className: 'text-xs uppercase mb-2 mono', style: {color: C.textMuted}}, 'Info Ratio'),
-                                    e('div', {className: 'text-xl font-bold mono'}, calibMetrics.fill.ir.toFixed(2)),
-                                    e('div', {className: 'text-xs mt-1', style: {color: calibMetrics.fill.ir > 1.0 ? C.green : calibMetrics.fill.ir > 0.8 ? C.yellow : C.red}}, calibMetrics.fill.ir > 1.0 ? 'Predictive' : calibMetrics.fill.ir > 0.8 ? 'Marginal' : 'No edge')
+                                    e('div', {className: 'text-xl font-bold mono', style: {color: calib.length === 0 ? C.textDim : C.text}},
+                                        calib.length === 0 ? '--' : calibMetrics.fill.ir.toFixed(2)),
+                                    e('div', {className: 'text-xs mt-1', style: {color: calib.length === 0 ? C.textDim : calibMetrics.fill.ir > 1.0 ? C.green : calibMetrics.fill.ir > 0.8 ? C.yellow : C.red}},
+                                        calib.length === 0 ? 'No data' : calibMetrics.fill.ir > 1.0 ? 'Predictive' : calibMetrics.fill.ir > 0.8 ? 'Marginal' : 'No edge')
                                 )
                             )
                         ),
@@ -2073,13 +2114,17 @@
                             e('div', {className: 'mt-4 grid grid-cols-2 gap-4'},
                                 e('div', {className: 'p-3 rounded', style: {backgroundColor: C.bg}},
                                     e('div', {className: 'text-xs uppercase mb-2 mono', style: {color: C.textMuted}}, 'Brier Score'),
-                                    e('div', {className: 'text-xl font-bold mono'}, calibMetrics.as.brier.toFixed(3)),
-                                    e('div', {className: 'text-xs mt-1', style: {color: calibMetrics.as.brier < 0.25 ? C.green : calibMetrics.as.brier < 0.35 ? C.yellow : C.red}}, calibMetrics.as.brier < 0.25 ? 'Good' : calibMetrics.as.brier < 0.35 ? 'Fair' : 'Poor')
+                                    e('div', {className: 'text-xl font-bold mono', style: {color: calib.length === 0 ? C.textDim : C.text}},
+                                        calib.length === 0 ? '--' : calibMetrics.as.brier.toFixed(3)),
+                                    e('div', {className: 'text-xs mt-1', style: {color: calib.length === 0 ? C.textDim : calibMetrics.as.brier < 0.25 ? C.green : calibMetrics.as.brier < 0.35 ? C.yellow : C.red}},
+                                        calib.length === 0 ? 'No data' : calibMetrics.as.brier < 0.25 ? 'Good' : calibMetrics.as.brier < 0.35 ? 'Fair' : 'Poor')
                                 ),
                                 e('div', {className: 'p-3 rounded', style: {backgroundColor: C.bg}},
                                     e('div', {className: 'text-xs uppercase mb-2 mono', style: {color: C.textMuted}}, 'Info Ratio'),
-                                    e('div', {className: 'text-xl font-bold mono'}, calibMetrics.as.ir.toFixed(2)),
-                                    e('div', {className: 'text-xs mt-1', style: {color: calibMetrics.as.ir > 1.0 ? C.green : calibMetrics.as.ir > 0.8 ? C.yellow : C.red}}, calibMetrics.as.ir > 1.0 ? 'Predictive' : calibMetrics.as.ir > 0.8 ? 'Marginal' : 'No edge')
+                                    e('div', {className: 'text-xl font-bold mono', style: {color: calib.length === 0 ? C.textDim : C.text}},
+                                        calib.length === 0 ? '--' : calibMetrics.as.ir.toFixed(2)),
+                                    e('div', {className: 'text-xs mt-1', style: {color: calib.length === 0 ? C.textDim : calibMetrics.as.ir > 1.0 ? C.green : calibMetrics.as.ir > 0.8 ? C.yellow : C.red}},
+                                        calib.length === 0 ? 'No data' : calibMetrics.as.ir > 1.0 ? 'Predictive' : calibMetrics.as.ir > 0.8 ? 'Marginal' : 'No edge')
                                 )
                             )
                         )
@@ -2116,7 +2161,7 @@
                                 e(Metric, {label: 'Eff. Gamma', value: quotes.gamma}),
                                 e(Metric, {label: 'Kappa Mult', value: '1.15'}),
                                 e(Metric, {label: 'Floor', value: '8.0', unit: 'bps'}),
-                                e(Metric, {label: 'Max Inv', value: '0.65', unit: 'BTC'})
+                                e(Metric, {label: 'Max Inv', value: '0.65', unit: asset || ''})
                             )
                         )
                     ),

@@ -1024,6 +1024,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Boost drift estimator responsiveness on cascade events.
                 // 3x process noise → Kalman tracks rapid moves within 2-3 updates.
                 self.drift_estimator.boost_responsiveness(3.0);
+
+                // Push cascade evidence into centralized beliefs so next quote
+                // cycle incorporates the directional shift (prevents re-sweep).
+                self.central_beliefs.update(BeliefUpdate::BurstEvent {
+                    is_buy_side: is_buy,
+                    intensity_ratio: self.fill_cascade_tracker.max_intensity_ratio(),
+                    fill_count: 3, // cascade threshold is typically lower
+                    timestamp_ms: fill.time,
+                });
             }
 
             // Check for fill burst (fast cascade reaction — 3 fills in 5s).
@@ -1031,6 +1040,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             if self.fill_cascade_tracker.check_burst(fill_side) {
                 // Burst detected — boost drift estimator too for fast reaction
                 self.drift_estimator.boost_responsiveness(2.0);
+                // Push burst evidence into centralized beliefs
+                self.central_beliefs.update(BeliefUpdate::BurstEvent {
+                    is_buy_side: is_buy,
+                    intensity_ratio: self.fill_cascade_tracker.max_intensity_ratio(),
+                    fill_count: self.fill_cascade_tracker.burst_count_threshold() as u32,
+                    timestamp_ms: fill.time,
+                });
             }
 
             // Count-based burst detection: 4+ same-side fills in 2s → emergency cancel.
@@ -1051,6 +1067,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         .cancel_bulk_orders(&self.config.asset, oids)
                         .await;
                 }
+                // Strong belief update for count-based burst (prevents re-sweep)
+                self.central_beliefs.update(BeliefUpdate::BurstEvent {
+                    is_buy_side: is_buy,
+                    intensity_ratio: self.fill_cascade_tracker.max_intensity_ratio().max(3.0),
+                    fill_count: self.fill_cascade_tracker.burst_count_threshold() as u32,
+                    timestamp_ms: fill.time,
+                });
             }
 
             // WS4: Feed cascade events to BayesianHawkes for posterior updating.

@@ -66,6 +66,21 @@ const REGIME_COLORS = { Quiet: COLORS.green, Trending: COLORS.purple, Volatile: 
 const MAX_FILLS = 100;
 const MAX_HISTORY = 500;
 
+// ─── Backend Config ───
+function resolveBackendConfig() {
+    const params = new URLSearchParams(window.location.search);
+    const host = window.location.hostname || 'localhost';
+    let port = 9090;
+    if (params.has('port')) {
+        port = parseInt(params.get('port'), 10);
+    } else if (window.location.port && window.location.port !== '3000' && window.location.port !== '') {
+        port = parseInt(window.location.port, 10);
+    }
+    const asset = params.get('asset') || null;
+    return { port, host, asset, apiBase: 'http://' + host + ':' + port, wsUrl: 'ws://' + host + ':' + port + '/ws/dashboard' };
+}
+const BACKEND = resolveBackendConfig();
+
 // ─── Utilities ───
 function fmt(v, decimals) {
   if (v == null || isNaN(v)) return '--';
@@ -103,8 +118,7 @@ class DashboardWS {
   }
 
   connect() {
-    const host = window.location.hostname || 'localhost';
-    const url = 'ws://' + host + ':8080/ws/dashboard';
+    const url = BACKEND.wsUrl;
     try {
       this.ws = new WebSocket(url);
       this.ws.onopen = () => {
@@ -158,8 +172,7 @@ class DashboardWS {
 
   startFallback() {
     if (this.fallbackInterval) return;
-    const host = window.location.hostname || 'localhost';
-    const url = 'http://' + host + ':8080/api/dashboard';
+    const url = BACKEND.apiBase + '/api/dashboard';
     this.fallbackInterval = setInterval(() => {
       fetch(url).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }).then(data => {
         if (this.mode !== 'ws') {
@@ -1406,7 +1419,7 @@ function NoDataOverlay({ wsStatus }) {
       h('div', { className: 'text-gray-600 text-sm' },
         wsStatus === 'http'
           ? 'WebSocket unavailable. Data may be delayed.'
-          : 'Waiting for WebSocket connection at ws://localhost:8080/ws/dashboard')
+          : 'Waiting for WebSocket connection at ' + BACKEND.wsUrl)
     )
   );
 }

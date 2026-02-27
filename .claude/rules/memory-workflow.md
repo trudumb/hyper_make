@@ -5,13 +5,51 @@ globs:
 
 # Memory Management
 
-Plans and memories are **living documents** — update them continuously as work progresses, not just at creation or session end. They should always reflect the current state of the work.
+## Memory Layers
 
-- **Auto memory** (`~/.claude/projects/.../memory/MEMORY.md`): Update after every significant milestone — commit, fix validated, architecture decision made, bug discovered, or live run completed. Keep the timeline table and "Current State" section current.
-- **Serena memories** (`.serena/memories/`): Write a session memory at the end of each session with: what changed, why, validation results, and open issues. Name format: `session_YYYY-MM-DD_<topic>`.
-- **Plans ↔ Memories in sync**: When a plan changes direction, update the memory to explain why. When a memory captures a discovery, update the plan to reflect it. Neither should go stale while the other advances.
-- **What to record immediately**: bug root causes, parameter values that worked/failed, architectural decisions with rationale, test results, live run metrics, anything that cost time to figure out.
-- **Keep it honest**: Record actual commit hashes, real metrics, and ground truth — not aspirational numbers. If something is broken, say so.
+Three layers, each with a distinct role:
+
+1. **Auto memory MEMORY.md** (`~/.claude/projects/-home-trudumb-hyper-make/memory/MEMORY.md`)
+   - Loaded into EVERY session automatically — keep under 200 lines
+   - Contains: current state, topic file index, key patterns (top 12), recent changes
+   - Update after: commits, architecture decisions, production runs, significant milestones
+
+2. **Auto memory topic files** (`~/.claude/projects/-home-trudumb-hyper-make/memory/*.md`)
+   - Read on demand when relevant to current task — can be longer
+   - `architecture.md` — module relationships, GLFT flow, key APIs, wiring patterns
+   - `debugging.md` — bug root causes, fix patterns, production incidents
+   - `live-trading.md` — production results, parameter values, incidents, postmortems
+   - `agent-work-log.md` — what each agent team has built/fixed, with dates
+   - Update when: new bugs found, production runs completed, architecture changes, agent work done
+
+3. **Agent memory** (`.claude/agent-memory/{agent}/MEMORY.md`)
+   - Lean (~20-30 lines): current open issues, pending work, domain-specific gotchas
+   - NOT for historical records (those go in auto memory topic files)
+   - Update when: issues resolved, new domain-specific gotchas discovered
+
+4. **Serena memories** (`.serena/memories/`)
+   - Archived session logs — read only when investigating historical incidents
+   - No longer the primary storage for session knowledge
+   - New session insights go into auto memory topic files instead
+
+## What Goes Where
+
+| Content Type | Destination |
+|-------------|-------------|
+| Key pattern / lesson learned | MEMORY.md "Key Patterns" section |
+| Bug root cause + fix | `debugging.md` |
+| Architecture decision | `architecture.md` |
+| Production run results | `live-trading.md` |
+| Agent implementation work | `agent-work-log.md` |
+| Agent-specific open issue | `.claude/agent-memory/{agent}/MEMORY.md` |
+| Recent significant change | MEMORY.md "Recent Changes" table |
+| Current project phase | MEMORY.md "Current State" section |
+
+## Update Discipline
+
+- **Record immediately**: bug root causes, parameter values that worked/failed, architectural decisions with rationale, test results, live run metrics
+- **Keep it honest**: actual commit hashes, real metrics, ground truth — not aspirational numbers
+- Plans and memories are **living documents** — update continuously as work progresses
 
 ## Plan Workflow
 

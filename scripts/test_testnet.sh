@@ -17,8 +17,8 @@
 #
 # Dashboard:
 #   When --dashboard is enabled:
-#   - Metrics API runs at http://localhost:8080/api/dashboard
-#   - Dashboard HTML served at http://localhost:3000/mm-dashboard-fixed.html
+#   - Metrics API runs at http://localhost:9090/api/dashboard
+#   - Dashboard HTML served at http://localhost:3000/mm-dashboard-fixed.html?port=9090&asset=BTC
 #   - Shows live quotes, P&L, regime, fills, and calibration data
 #
 # Screenshot Capture:
@@ -41,7 +41,7 @@ DURATION="${2:-60}"
 DIAGNOSTICS=false
 DASHBOARD=false
 CAPTURE=false
-METRICS_PORT=8080
+METRICS_PORT=9090
 
 for arg in "$@"; do
     case $arg in
@@ -83,7 +83,7 @@ echo -e "Asset:     ${GREEN}${ASSET}${NC}"
 echo -e "Duration:  ${GREEN}${DURATION}s${NC}"
 echo -e "Log File:  ${GREEN}${LOG_FILE}${NC}"
 if [ "$DASHBOARD" = true ]; then
-    echo -e "Dashboard: ${GREEN}http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo -e "Dashboard: ${GREEN}http://localhost:3000/mm-dashboard-fixed.html?port=${METRICS_PORT}&asset=${ASSET}${NC}"
     echo -e "API:       ${GREEN}http://localhost:${METRICS_PORT}/api/dashboard${NC}"
 fi
 if [ "$CAPTURE" = true ]; then
@@ -126,7 +126,7 @@ if [ "$DASHBOARD" = true ]; then
     python3 -m http.server 3000 &>/dev/null &
     DASHBOARD_PID=$!
     echo -e "${GREEN}Dashboard server started (PID: ${DASHBOARD_PID})${NC}"
-    echo -e "${GREEN}Open: http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo -e "${GREEN}Open: http://localhost:3000/mm-dashboard-fixed.html?port=${METRICS_PORT}&asset=${ASSET}${NC}"
     echo ""
 fi
 

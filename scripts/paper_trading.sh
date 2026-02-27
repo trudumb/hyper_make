@@ -48,7 +48,7 @@ NETWORK="mainnet"
 DASHBOARD=false
 CAPTURE=false
 PAPER_MODE=true
-METRICS_PORT=8080
+METRICS_PORT=9090
 
 for arg in "$@"; do
     case $arg in
@@ -103,7 +103,7 @@ echo -e "Asset:     ${GREEN}${ASSET}${NC}"
 echo -e "Duration:  ${GREEN}${DURATION}s${NC}"
 echo -e "Output:    ${GREEN}${OUTPUT_DIR}${NC}"
 if [ "$DASHBOARD" = true ]; then
-    echo -e "Dashboard: ${GREEN}http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo -e "Dashboard: ${GREEN}http://localhost:3000/mm-dashboard-fixed.html?port=${METRICS_PORT}&asset=${ASSET}${NC}"
     echo -e "API:       ${GREEN}http://localhost:${METRICS_PORT}/api/dashboard${NC}"
 fi
 if [ "$CAPTURE" = true ]; then
@@ -166,7 +166,7 @@ if [ "$DASHBOARD" = true ]; then
     python3 -m http.server 3000 &>/dev/null &
     DASHBOARD_PID=$!
     echo -e "${GREEN}Dashboard server started (PID: ${DASHBOARD_PID})${NC}"
-    echo -e "${GREEN}Open: http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo -e "${GREEN}Open: http://localhost:3000/mm-dashboard-fixed.html?port=${METRICS_PORT}&asset=${ASSET}${NC}"
     echo ""
 fi
 
