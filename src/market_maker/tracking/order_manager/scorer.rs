@@ -303,6 +303,7 @@ pub fn score_all(
 ) -> Vec<ScoredUpdate> {
     let mut results = Vec::with_capacity(targets.len() + current_orders.len());
     let mut matched_orders = std::collections::HashSet::new();
+    let mut matched_target_indices = std::collections::HashSet::new();
 
     let horizon_s = config.queue_horizon_seconds;
 
@@ -326,6 +327,7 @@ pub fn score_all(
 
         if let Some(order) = best_order {
             matched_orders.insert(order.oid);
+            matched_target_indices.insert(target_idx);
 
             let action = classify_action(order, target, config, sz_decimals);
             let api_cost = flat_api_cost_bps(action);
@@ -429,12 +431,14 @@ pub fn score_all(
             continue;
         }
 
-        // Check if this order is close to ANY target.
-        let close_to_any = targets
-            .iter()
-            .any(|t| (bps_diff(order.price, t.price) as f64) <= config.max_match_distance_bps);
+        // Check if this order is close to any UNMATCHED target.
+        // Orders near only already-matched targets are redundant and must be cancelled.
+        let close_to_unmatched_target = targets.iter().enumerate().any(|(idx, t)| {
+            !matched_target_indices.contains(&idx)
+                && (bps_diff(order.price, t.price) as f64) <= config.max_match_distance_bps
+        });
 
-        if !close_to_any {
+        if !close_to_unmatched_target {
             let api_cost = flat_api_cost_bps(ActionType::StaleCancel);
 
             // EV of keeping a stale order: low but not zero.
@@ -801,5 +805,85 @@ mod tests {
         assert_eq!(ActionType::CancelPlace.api_calls(), 2);
         assert_eq!(ActionType::NewPlace.api_calls(), 1);
         assert_eq!(ActionType::StaleCancel.api_calls(), 1);
+    }
+
+    // --- Test 13: Excess orders at matched target price get StaleCancel ---
+    // Regression test for the close-to-matched-target bug:
+    // 3 bids at same price, 1 target → expect 1 Latch + 2 StaleCancel
+    #[test]
+    fn test_excess_orders_at_matched_target() {
+        let o1 = make_order(1, 100.0, 1.0, Side::Buy);
+        let o2 = make_order(2, 100.0, 1.0, Side::Buy);
+        let o3 = make_order(3, 100.0, 1.0, Side::Buy);
+        let target = make_target(100.0, 1.0, 10.0);
+        let config = default_config();
+        let qv = default_queue_value();
+
+        let scores = score_all(
+            &[&o1, &o2, &o3],
+            &[target],
+            Side::Buy,
+            &config,
+            None,
+            &qv,
+            ToxicityRegime::Benign,
+            100.5,
+            2,
+        );
+
+        let latches: Vec<_> = scores
+            .iter()
+            .filter(|s| s.action == ActionType::Latch)
+            .collect();
+        let stale_cancels: Vec<_> = scores
+            .iter()
+            .filter(|s| s.action == ActionType::StaleCancel)
+            .collect();
+
+        assert_eq!(latches.len(), 1, "Expected exactly 1 Latch");
+        assert_eq!(
+            stale_cancels.len(),
+            2,
+            "Expected exactly 2 StaleCancel for redundant orders"
+        );
+    }
+
+    // --- Test 14: Unmatched order near unmatched target is preserved ---
+    // Defensive test: orders close to unmatched targets should NOT be cancelled
+    #[test]
+    fn test_unmatched_order_near_unmatched_target_preserved() {
+        // Order at 100.0, targets at 100.0 and 100.01 (within match distance)
+        // Order should match target 0, and target 1 stays unmatched.
+        // A second order near target 1 should NOT get StaleCancel.
+        let o1 = make_order(1, 100.0, 1.0, Side::Buy);
+        let o2 = make_order(2, 100.01, 1.0, Side::Buy);
+        let t1 = make_target(100.0, 1.0, 10.0);
+        let t2 = make_target(100.01, 1.0, 10.0);
+        let config = default_config();
+        let qv = default_queue_value();
+
+        let scores = score_all(
+            &[&o1, &o2],
+            &[t1, t2],
+            Side::Buy,
+            &config,
+            None,
+            &qv,
+            ToxicityRegime::Benign,
+            100.5,
+            2,
+        );
+
+        // Both orders should match their respective targets (both Latch)
+        // No StaleCancel should be generated
+        let stale_cancels: Vec<_> = scores
+            .iter()
+            .filter(|s| s.action == ActionType::StaleCancel)
+            .collect();
+        assert_eq!(
+            stale_cancels.len(),
+            0,
+            "No StaleCancel expected when orders match unmatched targets"
+        );
     }
 }

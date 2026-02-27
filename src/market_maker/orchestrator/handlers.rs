@@ -1531,10 +1531,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     let mins = (ts_secs / 60) % 60;
                     format!("{:02}:{:02}", hrs, mins)
                 };
+                let fill_pnl = fill.closed_pnl.parse::<f64>().unwrap_or(0.0);
                 let record = super::super::infra::metrics::dashboard::FillRecord {
                     time: time_label,
                     timestamp_ms: fill.time as i64,
-                    pnl: 0.0, // Deferred to markout
+                    pnl: fill_pnl,
                     cum_pnl,
                     side: if is_buy {
                         "BID".to_string()
@@ -1549,6 +1550,28 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let _ = ws
                     .sender()
                     .send(super::super::infra::dashboard_ws::DashboardPush::Fill { record });
+
+                // Accumulate per-regime PnL
+                if fill_pnl != 0.0 {
+                    let regime_label = if let Some(mp) = self.cached_market_params.as_ref() {
+                        let cascade_sev = if mp.should_pull_quotes {
+                            1.0
+                        } else {
+                            (mp.tail_risk_intensity - 1.0) / 4.0
+                        };
+                        super::super::infra::metrics::dashboard::classify_regime(
+                            cascade_sev,
+                            mp.jump_ratio,
+                            mp.sigma,
+                        )
+                    } else {
+                        "Quiet".to_string()
+                    };
+                    self.infra
+                        .prometheus
+                        .dashboard()
+                        .record_regime_pnl(&regime_label, fill_pnl);
+                }
             }
         }
 

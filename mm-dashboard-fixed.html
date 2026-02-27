@@ -780,9 +780,9 @@
                 time: f.time,
                 timestamp_ms: f.timestamp_ms,
                 pnl: f.pnl,
-                cumPnl: f.cumPnl,
+                cumPnl: f.cum_pnl,
                 side: f.side,
-                as: f.as
+                as: f.adverse_selection
             }));
         };
 
@@ -887,9 +887,14 @@
                 series: [
                     {},
                     { label: 'Quiet', stroke: C.regimeQuiet, fill: C.regimeQuiet + '99', width: 1 },
-                    { label: 'Trending', stroke: C.regimeTrending, fill: C.regimeTrending + '99', width: 1 },
-                    { label: 'Volatile', stroke: C.regimeVolatile, fill: C.regimeVolatile + '99', width: 1 },
-                    { label: 'Cascade', stroke: C.regimeCascade, fill: C.regimeCascade + '99', width: 1 }
+                    { label: 'Trending', stroke: C.regimeTrending, fill: null, width: 1 },
+                    { label: 'Volatile', stroke: C.regimeVolatile, fill: null, width: 1 },
+                    { label: 'Cascade', stroke: C.regimeCascade, fill: null, width: 1 }
+                ],
+                bands: [
+                    { series: [4, 3], fill: C.regimeCascade + '99' },
+                    { series: [3, 2], fill: C.regimeVolatile + '99' },
+                    { series: [2, 1], fill: C.regimeTrending + '99' },
                 ]
             };
 
@@ -1769,6 +1774,11 @@
 
             // Track accumulated fills from WebSocket
             const [wsConnected, setWsConnected] = useState(false);
+            // Per-regime PnL accumulator: { Quiet: {pnl, fills}, Trending: {...}, ... }
+            const [regimePnl, setRegimePnl] = useState({
+                Quiet: {pnl: 0, fills: 0}, Trending: {pnl: 0, fills: 0},
+                Volatile: {pnl: 0, fills: 0}, Cascade: {pnl: 0, fills: 0}
+            });
 
             // Create chart sync manager for synchronized time scales
             const syncManagerRef = useRef(null);
@@ -1809,6 +1819,16 @@
                     if (data.changepoint_diagnostics) setChangepointDiag(data.changepoint_diagnostics);
                     // Feature health data
                     if (data.feature_health) setFeatureHealth(data.feature_health);
+                    // Per-regime PnL from backend
+                    if (data.pnl_by_regime) {
+                        const rp = data.pnl_by_regime;
+                        setRegimePnl({
+                            Quiet: {pnl: rp.Quiet || 0, fills: 0},
+                            Trending: {pnl: rp.Trending || 0, fills: 0},
+                            Volatile: {pnl: rp.Volatile || 0, fills: 0},
+                            Cascade: {pnl: rp.Cascade || 0, fills: 0},
+                        });
+                    }
                 }
                 setTime(new Date().toLocaleTimeString());
             };
@@ -1836,20 +1856,47 @@
                     });
                 }
                 if (update.regime) {
-                    // Could update regime state here
+                    // Append current probabilities to regime history
+                    const probs = update.regime.probabilities;
+                    if (probs) {
+                        const now = update.timestamp_ms || Date.now();
+                        setRegime(prev => [...prev.slice(-119), {
+                            time: new Date(now).toLocaleTimeString(),
+                            timestamp_ms: now,
+                            Quiet: probs.quiet,
+                            Trending: probs.trending,
+                            Volatile: probs.volatile,
+                            Cascade: probs.cascade,
+                        }]);
+                    }
+                    // Update regime label in quotes display
+                    if (update.regime.current) {
+                        setQuotes(prev => ({...prev, regime: update.regime.current}));
+                    }
                 }
                 setTime(new Date().toLocaleTimeString());
             };
 
-            // Add new fill to fills array
+            // Add new fill to fills array and accumulate per-regime PnL
             const addFill = (record) => {
                 setFills(prev => [...prev.slice(-99), {
                     time: record.time,
+                    timestamp_ms: record.timestamp_ms,
                     pnl: record.pnl,
                     cumPnl: record.cum_pnl,
                     side: record.side,
                     as: record.adverse_selection
                 }]);
+                // Accumulate PnL into the current regime bucket
+                setQuotes(prev => {
+                    const r = prev.regime || 'Quiet';
+                    const fillPnl = record.pnl || 0;
+                    setRegimePnl(rp => ({
+                        ...rp,
+                        [r]: { pnl: (rp[r]?.pnl || 0) + fillPnl, fills: (rp[r]?.fills || 0) + 1 }
+                    }));
+                    return prev;
+                });
             };
 
             // Connect via WebSocket with HTTP fallback
@@ -2197,7 +2244,12 @@
                         e(Card, {title: 'Cumulative', accent: C.accent}, e(PnLChart, {data: fills, syncManager})),
                         e(Card, {title: 'By Regime', accent: C.purple},
                             e('div', {className: 'space-y-4'},
-                                [{r: 'Quiet', pnl: 89.20, pct: 68}, {r: 'Trending', pnl: -45.60, pct: 28}, {r: 'Volatile', pnl: -12.30, pct: 3.5}, {r: 'Cascade', pnl: -158.75, pct: 0.5}].map(x =>
+                                (() => {
+                                    const totalFills = Object.values(regimePnl).reduce((s, v) => s + v.fills, 0) || 1;
+                                    return ['Quiet', 'Trending', 'Volatile', 'Cascade'].map(r => ({
+                                        r, pnl: regimePnl[r]?.pnl || 0, pct: ((regimePnl[r]?.fills || 0) / totalFills * 100)
+                                    }));
+                                })().map(x =>
                                     e('div', {key: x.r, className: 'flex items-center gap-4'},
                                         e('div', {className: 'w-20'}, e(RegimeBadge, {regime: x.r})),
                                         e('div', {className: 'flex-1'},

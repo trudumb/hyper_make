@@ -5,7 +5,7 @@
 
 use crate::market_maker::tracking::{CalibrationMetrics, CalibrationTracker};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -703,6 +703,10 @@ pub struct DashboardState {
     /// Risk summary for risk tab.
     #[serde(default)]
     pub risk_summary: RiskSummary,
+
+    /// Accumulated PnL per regime label.
+    #[serde(default)]
+    pub pnl_by_regime: HashMap<String, f64>,
 }
 
 impl Default for DashboardState {
@@ -731,6 +735,8 @@ impl Default for DashboardState {
             // Pipeline and risk
             pipeline: BayesianPipelineState::default(),
             risk_summary: RiskSummary::default(),
+            // Per-regime PnL
+            pnl_by_regime: HashMap::new(),
         }
     }
 }
@@ -982,6 +988,8 @@ pub struct DashboardAggregator {
     kappa_diagnostics: RwLock<KappaDiagnostics>,
     /// Latest changepoint diagnostics.
     changepoint_diagnostics: RwLock<ChangepointDiagnostics>,
+    /// Accumulated PnL per regime label.
+    pnl_by_regime: RwLock<HashMap<String, f64>>,
 }
 
 impl DashboardAggregator {
@@ -1007,6 +1015,7 @@ impl DashboardAggregator {
             last_signal_snapshot: RwLock::new(Instant::now()),
             kappa_diagnostics: RwLock::new(KappaDiagnostics::default()),
             changepoint_diagnostics: RwLock::new(ChangepointDiagnostics::default()),
+            pnl_by_regime: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1143,6 +1152,17 @@ impl DashboardAggregator {
     /// Get accumulated fees.
     pub fn total_fees(&self) -> f64 {
         *self.total_fees.read().unwrap()
+    }
+
+    /// Record PnL for a specific regime label.
+    pub fn record_regime_pnl(&self, regime: &str, pnl: f64) {
+        let mut map = self.pnl_by_regime.write().unwrap();
+        *map.entry(regime.to_string()).or_insert(0.0) += pnl;
+    }
+
+    /// Get accumulated PnL by regime.
+    pub fn pnl_by_regime(&self) -> HashMap<String, f64> {
+        self.pnl_by_regime.read().unwrap().clone()
     }
 
     /// Record a signal snapshot if interval has elapsed.
@@ -1282,6 +1302,8 @@ impl DashboardAggregator {
             // Pipeline and risk populated by output.rs after snapshot
             pipeline: BayesianPipelineState::default(),
             risk_summary: RiskSummary::default(),
+            // Per-regime PnL
+            pnl_by_regime: self.pnl_by_regime(),
         }
     }
 

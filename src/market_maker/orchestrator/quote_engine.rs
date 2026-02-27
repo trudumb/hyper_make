@@ -15,7 +15,8 @@ use crate::market_maker::analytics::ToxicityInput;
 use crate::market_maker::config::{CapacityBudget, Viability};
 use crate::market_maker::estimator::EnhancedFlowContext;
 use crate::market_maker::infra::metrics::dashboard::{
-    ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
+    classify_regime, compute_regime_probabilities, ChangepointDiagnostics, KappaDiagnostics,
+    PnLAttribution, QuoteDecisionRecord, RegimeState, SignalSnapshot,
 };
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
 
@@ -4003,22 +4004,61 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === Push incremental update to WebSocket dashboard clients ===
         if let Some(ref ws) = self.infra.dashboard_ws {
+            let mp = self.cached_market_params.as_ref();
+            let cascade_sev = mp
+                .map(|p| {
+                    if p.should_pull_quotes {
+                        1.0
+                    } else {
+                        (p.tail_risk_intensity - 1.0) / 4.0
+                    }
+                })
+                .unwrap_or(0.0);
+            let jump_r = mp.map(|p| p.jump_ratio).unwrap_or(1.0);
+            let sigma = mp.map(|p| p.sigma).unwrap_or(0.001);
+            let spread_bps = self.tier2.spread_tracker.current_spread_bps();
+
+            let regime_label = classify_regime(cascade_sev, jump_r, sigma);
+            let regime_probs = compute_regime_probabilities(cascade_sev, jump_r, sigma);
+
             let quotes = super::super::infra::metrics::dashboard::LiveQuotes {
                 mid: self.latest_mid,
-                spread_bps: self.tier2.spread_tracker.current_spread_bps(),
+                spread_bps,
                 inventory: self.position.position(),
-                regime: self.stochastic.regime_state.regime_label().to_string(),
+                regime: regime_label.clone(),
                 kappa: self.estimator.kappa(),
                 gamma: self.config.risk_aversion,
-                fill_prob: 0.0,
+                fill_prob: (0.3 / (1.0 + spread_bps / 10.0)).clamp(0.05, 0.5) * 100.0,
                 adverse_prob: self.tier1.adverse_selection.realized_as_bps() / 10.0,
             };
+
+            // Build PnL attribution from dashboard aggregator
+            let dash = self.infra.prometheus.dashboard();
+            let sc = dash.total_spread_capture();
+            let as_loss = dash.total_adverse_selection();
+            let inv = dash.total_inventory_cost();
+            let fee = dash.total_fees();
+            let pnl_attr = PnLAttribution {
+                spread_capture: sc,
+                adverse_selection: as_loss,
+                inventory_cost: inv,
+                fees: fee,
+                total: sc + as_loss + inv + fee,
+            };
+
+            // Build regime state (no history in Updates — keep lightweight)
+            let regime_state = RegimeState {
+                current: regime_label,
+                probabilities: regime_probs,
+                history: Vec::new(),
+            };
+
             let _ = ws
                 .sender()
                 .send(super::super::infra::dashboard_ws::DashboardPush::Update {
                     quotes: Some(quotes),
-                    pnl: None,
-                    regime: None,
+                    pnl: Some(pnl_attr),
+                    regime: Some(regime_state),
                     pipeline: None,
                     risk: None,
                     timestamp_ms: chrono::Utc::now().timestamp_millis(),

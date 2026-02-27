@@ -34,11 +34,8 @@
 
 set -e
 
-# Configuration
-ASSET="${1:-BTC}"
-DEX="${2:-hyna}"
-DURATION="${3:-60}"
-SPREAD_PROFILE="${4:-hip3}"  # Default to hip3 for HIP-3 DEX testing
+# Configuration — parse positional args vs flags in one pass
+POSITIONAL=()
 DASHBOARD=false
 CAPTURE=false
 METRICS_PORT=8080
@@ -52,8 +49,16 @@ for arg in "$@"; do
             CAPTURE=true
             DASHBOARD=true  # --capture implies --dashboard
             ;;
+        *)
+            POSITIONAL+=("$arg")
+            ;;
     esac
 done
+
+ASSET="${POSITIONAL[0]:-BTC}"
+DEX="${POSITIONAL[1]:-hyna}"
+DURATION="${POSITIONAL[2]:-60}"
+SPREAD_PROFILE="${POSITIONAL[3]:-hip3}"  # Default to hip3 for HIP-3 DEX testing
 
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 LOG_DIR="logs"

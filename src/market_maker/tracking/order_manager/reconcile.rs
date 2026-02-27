@@ -992,16 +992,18 @@ pub fn priority_based_matching(
     // Phase 2: Cancel any orders not matched to any target (stale orders)
     for order in current.iter() {
         if !matched_orders.contains(&order.oid) {
-            // Check if this order is close to ANY target before cancelling
-            let close_to_any_target = targets
-                .iter()
-                .any(|t| bps_diff(order.price, t.price) as f64 <= config.max_match_distance_bps);
+            // Check if this order is close to any UNMATCHED target before cancelling.
+            // Orders near only already-matched targets are redundant and must be cancelled.
+            let close_to_unmatched_target = targets.iter().enumerate().any(|(idx, t)| {
+                !matched_targets.contains(&idx)
+                    && bps_diff(order.price, t.price) as f64 <= config.max_match_distance_bps
+            });
 
-            if !close_to_any_target {
+            if !close_to_unmatched_target {
                 debug!(
                     oid = order.oid,
                     price = order.price,
-                    "Priority matching: cancelling stale order (not close to any target)"
+                    "Priority matching: cancelling stale order (not close to any unmatched target)"
                 );
                 actions.push(LadderAction::Cancel { oid: order.oid });
             }
@@ -1511,5 +1513,108 @@ mod tests {
             "Default size hysteresis should be 20%, got {:.0}%",
             config.latch_size_fraction * 100.0
         );
+    }
+
+    // Regression test: 3 bids at same price, 1 target → expect 2 Cancel actions
+    // for the redundant orders. Previously these were silently skipped because
+    // Phase 2 checked "close to ANY target" instead of "close to any UNMATCHED target".
+    #[test]
+    fn test_excess_orders_at_matched_target_priority_matching() {
+        let o1 = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
+        let o2 = TrackedOrder::new(2, Side::Buy, 100.00, 1.0, 0.0);
+        let o3 = TrackedOrder::new(3, Side::Buy, 100.00, 1.0, 0.0);
+        let current = vec![&o1, &o2, &o3];
+
+        let target = vec![LadderLevel {
+            price: 100.00,
+            size: 1.0,
+            depth_bps: 5.0,
+        }];
+
+        let config = DynamicReconcileConfig {
+            best_level_tolerance_bps: 5.0,
+            outer_level_tolerance_bps: 10.0,
+            max_match_distance_bps: 50.0,
+            queue_value_threshold: 0.5,
+            queue_horizon_seconds: 10.0,
+            optimal_spread_bps: 4.0,
+            max_modify_price_bps: 10.0,
+            use_priority_matching: true,
+            latch_threshold_bps: 2.5,
+            latch_size_fraction: 0.10,
+            use_hjb_queue_value: false,
+            hjb_queue_alpha: 0.0,
+            hjb_queue_beta: 0.0,
+            hjb_queue_modify_cost_bps: 0.0,
+        };
+
+        let (actions, latched) =
+            priority_based_matching(&current, &target, Side::Buy, &config, None, 2, None);
+
+        // 1 order should be latched, 2 should be cancelled
+        assert_eq!(latched.len(), 1, "Expected 1 latched order");
+        let cancel_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Cancel { .. }))
+            .count();
+        assert_eq!(
+            cancel_count, 2,
+            "Expected 2 Cancel actions for redundant orders, got {}",
+            cancel_count
+        );
+    }
+
+    // Defensive test: unmatched order near an unmatched target should NOT be cancelled
+    #[test]
+    fn test_unmatched_order_near_unmatched_target_preserved_priority_matching() {
+        let o1 = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
+        let o2 = TrackedOrder::new(2, Side::Buy, 99.95, 1.0, 0.0);
+        let current = vec![&o1, &o2];
+
+        // Two targets: o1 matches t1, o2 is unmatched but close to t2
+        let target = vec![
+            LadderLevel {
+                price: 100.00,
+                size: 1.0,
+                depth_bps: 5.0,
+            },
+            LadderLevel {
+                price: 99.95,
+                size: 1.0,
+                depth_bps: 10.0,
+            },
+        ];
+
+        let config = DynamicReconcileConfig {
+            best_level_tolerance_bps: 5.0,
+            outer_level_tolerance_bps: 10.0,
+            max_match_distance_bps: 50.0,
+            queue_value_threshold: 0.5,
+            queue_horizon_seconds: 10.0,
+            optimal_spread_bps: 4.0,
+            max_modify_price_bps: 10.0,
+            use_priority_matching: true,
+            latch_threshold_bps: 2.5,
+            latch_size_fraction: 0.10,
+            use_hjb_queue_value: false,
+            hjb_queue_alpha: 0.0,
+            hjb_queue_beta: 0.0,
+            hjb_queue_modify_cost_bps: 0.0,
+        };
+
+        let (actions, latched) =
+            priority_based_matching(&current, &target, Side::Buy, &config, None, 2, None);
+
+        // Both should be latched (or matched), no cancels
+        let cancel_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Cancel { .. }))
+            .count();
+        assert_eq!(
+            cancel_count, 0,
+            "No Cancel expected when each order matches a target, got {} cancels",
+            cancel_count
+        );
+        assert_eq!(latched.len(), 2, "Expected 2 latched orders");
     }
 }
