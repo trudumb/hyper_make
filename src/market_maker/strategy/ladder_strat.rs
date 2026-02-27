@@ -1409,25 +1409,55 @@ impl LadderStrategy {
             );
             let usable_margin = available_margin * margin_utilization;
 
-            // === TWO-SIDED MARGIN ALLOCATION (POSTERIOR-DRIVEN) ===
-            // Split usable margin using Bayesian posterior P(drift < 0).
-            // p_down ≈ 1.0 → most margin to asks (selling), minimal to bids.
-            // p_down ≈ 0.0 → most margin to bids (buying), minimal to asks.
-            // p_down ≈ 0.5 → symmetric 50/50 split.
-            // No floor clamps — Guaranteed Quote Floor ensures minimum market presence.
+            // === TWO-SIDED MARGIN ALLOCATION (GLFT-DERIVED, GAMMA-SCALED) ===
+            // Principled analog of GLFT inventory penalty in capital domain.
+            // Asymmetry scales with: inventory ratio, risk aversion (gamma), and urgency.
+            //
+            // asymmetry = |q_ratio| × BASE_SCALE × gamma_mult × (1 + urgency × 0.5)
+            // Bounds [0.15, 0.85] prevent total starvation (exchange min-notional).
+            const BASE_SCALE: f64 = 0.3; // at q=1.0, base asymmetry → 80/20
+            const GAMMA_REFERENCE: f64 = 1.0; // Normal regime reference
+
             let p_down = market_params.prob_bearish;
-            let ask_margin_weight = p_down;
-            let bid_margin_weight = 1.0 - p_down;
+
+            // q_ratio: normalized inventory from bid/ask budget asymmetry
+            let q_ratio = if market_params.dynamic_max_position > 0.0 {
+                (market_params.available_bid_budget - market_params.available_ask_budget)
+                    / (2.0 * market_params.dynamic_max_position)
+            } else {
+                0.0
+            }
+            .clamp(-1.0, 1.0);
+
+            // Gamma modulation: higher gamma → more aggressive mean-reversion
+            let gamma_mult =
+                (market_params.regime_gamma_multiplier / GAMMA_REFERENCE).clamp(0.5, 2.0);
+
+            // Urgency: when drift opposes position, boost reduction allocation
+            // drift_sign > 0 = bearish, q_ratio > 0 = long → same sign = drift hurts position
+            let drift_sign = if p_down > 0.5 { 1.0 } else { -1.0 };
+            let opposition = drift_sign * q_ratio.signum();
+            let drift_confidence = market_params.belief_confidence;
+            let urgency = (opposition * drift_confidence).clamp(0.0, 1.0);
+
+            let asymmetry = q_ratio.abs() * BASE_SCALE * gamma_mult * (1.0 + urgency * 0.5);
+            let inv_factor = (q_ratio.signum() * asymmetry).clamp(-0.35, 0.35);
+
+            let ask_margin_weight = (0.5 + inv_factor).clamp(0.15, 0.85);
+            let bid_margin_weight = 1.0 - ask_margin_weight;
             let margin_for_bids = usable_margin * bid_margin_weight;
             let margin_for_asks = usable_margin * ask_margin_weight;
 
             info!(
                 usable_margin = %format!("{:.2}", usable_margin),
                 p_down = %format!("{:.3}", p_down),
+                q_ratio = %format!("{:.3}", q_ratio),
+                gamma_mult = %format!("{:.2}", gamma_mult),
+                urgency = %format!("{:.3}", urgency),
                 bid_margin_weight = %format!("{:.3}", bid_margin_weight),
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
-                "Margin allocation (posterior-driven split)"
+                "Margin allocation (GLFT-derived, gamma-scaled)"
             );
 
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
@@ -2842,57 +2872,120 @@ fn adverse_selection_at_depth(depth_bps: f64, params: &LadderParams) -> f64 {
 mod tests {
     use super::*;
 
-    /// Compute posterior-driven margin split weights.
-    /// p_down = P(drift < 0) from Bayesian belief system.
+    /// Compute GLFT-derived, gamma-scaled margin split.
+    /// q_ratio: normalized inventory [-1, 1] (positive = more bid budget = long)
+    /// gamma_mult: regime gamma multiplier (1.0 = Normal)
+    /// drift_direction: +1.0 bearish, -1.0 bullish
+    /// drift_confidence: belief confidence [0, 1]
     /// Returns (bid_weight, ask_weight).
-    fn compute_posterior_margin_split(p_down: f64) -> (f64, f64) {
-        let ask_w = p_down;
-        let bid_w = 1.0 - p_down;
+    fn compute_posterior_margin_split(
+        q_ratio: f64,
+        gamma_mult: f64,
+        drift_direction: f64,
+        drift_confidence: f64,
+    ) -> (f64, f64) {
+        const BASE_SCALE: f64 = 0.3;
+        const GAMMA_REFERENCE: f64 = 1.0;
+
+        let gamma_m = (gamma_mult / GAMMA_REFERENCE).clamp(0.5, 2.0);
+        let opposition = drift_direction * q_ratio.signum();
+        let urgency = (opposition * drift_confidence).clamp(0.0, 1.0);
+        let asymmetry = q_ratio.abs() * BASE_SCALE * gamma_m * (1.0 + urgency * 0.5);
+        let inv_factor = (q_ratio.signum() * asymmetry).clamp(-0.35, 0.35);
+        let ask_w = (0.5 + inv_factor).clamp(0.15, 0.85);
+        let bid_w = 1.0 - ask_w;
         (bid_w, ask_w)
     }
 
     #[test]
     fn test_margin_split_neutral_is_equal() {
-        // p_down = 0.5 → symmetric split
-        let (bid_w, ask_w) = compute_posterior_margin_split(0.5);
-        assert!((bid_w - 0.5).abs() < 1e-10);
-        assert!((ask_w - 0.5).abs() < 1e-10);
+        // q_ratio=0 → 50/50 regardless of other params
+        let (bid_w, ask_w) = compute_posterior_margin_split(0.0, 1.0, 1.0, 0.5);
+        assert!(
+            (bid_w - 0.5).abs() < 1e-10,
+            "Flat should be 50/50: bid={bid_w}"
+        );
+        assert!(
+            (ask_w - 0.5).abs() < 1e-10,
+            "Flat should be 50/50: ask={ask_w}"
+        );
+
+        // Even with extreme gamma, flat position → 50/50
+        let (bid_w2, ask_w2) = compute_posterior_margin_split(0.0, 2.0, -1.0, 1.0);
+        assert!((bid_w2 - 0.5).abs() < 1e-10);
+        assert!((ask_w2 - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_margin_split_scales_with_inventory() {
+        // q_ratio=0.5, gamma=1.0, no urgency (drift aligns with position)
+        let (bid_w, ask_w) = compute_posterior_margin_split(0.5, 1.0, -1.0, 0.0);
+        // asymmetry = 0.5 * 0.3 * 1.0 * 1.0 = 0.15 → ask_w = 0.65
+        assert!(
+            (ask_w - 0.65).abs() < 0.01,
+            "50% long should give ~65/35 ask-heavy: bid={bid_w:.3}, ask={ask_w:.3}"
+        );
+    }
+
+    #[test]
+    fn test_margin_split_gamma_modulates() {
+        // Same inventory, different gamma
+        let (_, ask_low) = compute_posterior_margin_split(0.5, 0.5, -1.0, 0.0);
+        let (_, ask_mid) = compute_posterior_margin_split(0.5, 1.0, -1.0, 0.0);
+        let (_, ask_high) = compute_posterior_margin_split(0.5, 2.0, -1.0, 0.0);
+        assert!(ask_high > ask_mid, "Higher gamma should be more asymmetric");
+        assert!(ask_mid > ask_low, "Lower gamma should be less asymmetric");
+    }
+
+    #[test]
+    fn test_margin_split_urgency_boosts_reduction() {
+        // Long position + bearish drift + high confidence → stronger ask allocation
+        let (_, ask_no_urgency) = compute_posterior_margin_split(0.5, 1.0, -1.0, 0.0);
+        let (_, ask_urgency) = compute_posterior_margin_split(0.5, 1.0, 1.0, 0.8);
+        assert!(
+            ask_urgency > ask_no_urgency,
+            "Urgency should boost ask allocation: no_urgency={ask_no_urgency:.3}, urgency={ask_urgency:.3}"
+        );
+    }
+
+    #[test]
+    fn test_margin_split_extreme_clamped() {
+        // q_ratio=1.0, max gamma, max urgency → clamped at 85/15
+        let (bid_w, ask_w) = compute_posterior_margin_split(1.0, 2.0, 1.0, 1.0);
+        assert!(
+            ask_w <= 0.85 + 1e-10,
+            "Should be clamped at 0.85: ask={ask_w}"
+        );
+        assert!(
+            bid_w >= 0.15 - 1e-10,
+            "Should be clamped at 0.15: bid={bid_w}"
+        );
+        // Never 100/0
+        assert!(
+            bid_w > 0.1,
+            "Minority side must never be starved: bid={bid_w}"
+        );
     }
 
     #[test]
     fn test_margin_split_bearish_favors_asks() {
-        // p_down = 0.8 → bearish → more margin to asks (selling)
-        let (bid_w, ask_w) = compute_posterior_margin_split(0.8);
+        // Long position (q_ratio > 0) means bid budget > ask budget → long position
+        // The system should allocate more to asks to reduce
+        let (bid_w, ask_w) = compute_posterior_margin_split(0.5, 1.0, 1.0, 0.5);
         assert!(
             ask_w > bid_w,
-            "Bearish should favor asks: bid={bid_w:.3}, ask={ask_w:.3}"
+            "Long + bearish should favor asks: bid={bid_w:.3}, ask={ask_w:.3}"
         );
-        assert!((ask_w - 0.8).abs() < 1e-10);
-        assert!((bid_w - 0.2).abs() < 1e-10);
     }
 
     #[test]
     fn test_margin_split_bullish_favors_bids() {
-        // p_down = 0.2 → bullish → more margin to bids (buying)
-        let (bid_w, ask_w) = compute_posterior_margin_split(0.2);
+        // Short position (q_ratio < 0) with bullish drift → reduce short
+        let (bid_w, ask_w) = compute_posterior_margin_split(-0.5, 1.0, -1.0, 0.5);
         assert!(
             bid_w > ask_w,
-            "Bullish should favor bids: bid={bid_w:.3}, ask={ask_w:.3}"
+            "Short + bullish should favor bids: bid={bid_w:.3}, ask={ask_w:.3}"
         );
-        assert!((bid_w - 0.8).abs() < 1e-10);
-        assert!((ask_w - 0.2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_margin_split_extreme_conviction() {
-        // p_down = 0.98 → strong bearish → 2% bids, 98% asks
-        let (bid_w, ask_w) = compute_posterior_margin_split(0.98);
-        assert!((bid_w - 0.02).abs() < 1e-10);
-        assert!((ask_w - 0.98).abs() < 1e-10);
-        // p_down = 0.02 → strong bullish → 98% bids, 2% asks
-        let (bid_w2, ask_w2) = compute_posterior_margin_split(0.02);
-        assert!((bid_w2 - 0.98).abs() < 1e-10);
-        assert!((ask_w2 - 0.02).abs() < 1e-10);
     }
 
     #[test]

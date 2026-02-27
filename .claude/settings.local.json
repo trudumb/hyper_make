@@ -92,7 +92,10 @@
       "mcp__playwright__browser_evaluate",
       "Bash(node:*)",
       "Bash(./scripts/paper_trading.sh:*)",
-      "WebFetch(domain:docs.claude.com)"
+      "WebFetch(domain:docs.claude.com)",
+      "Bash(./scripts/paper_trading.sh BTC:*)",
+      "Bash(sed:*)",
+      "Bash(rustup show:*)"
     ]
   }
 }

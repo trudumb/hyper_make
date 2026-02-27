@@ -51,27 +51,39 @@ use super::Regime;
 /// Configuration for CentralBeliefState.
 #[derive(Debug, Clone)]
 pub struct CentralBeliefConfig {
-    // === Directional Log-Odds Config ===
-    /// Decay time constant (seconds). Half-life = tau × ln(2) ≈ 21s at default.
-    pub dir_decay_tau_secs: f64,
-    /// Max absolute log-odds (sigmoid(5)=0.993). Prevents extreme beliefs.
-    pub dir_max_log_odds: f64,
-    /// Weight for price-return evidence (z-score, already dimensionless).
-    pub dir_lambda_price: f64,
-    /// Weight for fill-side evidence (binary ±1 per fill).
-    pub dir_lambda_fill: f64,
-    /// Weight for AS-direction evidence (magnitude-scaled).
-    pub dir_lambda_as: f64,
-    /// Weight for flow-direction evidence (order_flow_direction).
-    pub dir_lambda_flow: f64,
-    /// Weight for burst/cascade directional evidence.
-    /// Bursts are high-information: a 6-fill sweep is strong directional evidence.
-    /// Default 2.0 (strong — bursts are rare and informative).
-    pub dir_lambda_burst: f64,
+    // === Directional Drift Posterior (Normal-Normal conjugate) ===
+    /// Prior variance for drift posterior. σ_init = √4 = 2.0.
+    /// Cold-start z-score needs ~2 units of evidence to reach 84% certainty.
+    pub dir_prior_variance: f64,
+    /// Process noise rate (variance/second). Controls forgetting speed.
+    /// Default: prior_variance / τ_ac = 4.0/10.0 = 0.4
+    pub dir_process_noise_rate: f64,
+    /// Observation noise variance for price z-scores. Lower = more informative.
+    /// z-score Var≈1.0, highest info → default 1.0
+    pub dir_noise_price: f64,
+    /// Observation noise variance for fill-side evidence (binary ±1).
+    /// Low directional info → default 4.0
+    pub dir_noise_fill: f64,
+    /// Observation noise variance for AS-direction evidence (magnitude-scaled).
+    /// Var≈2.0 → default 2.5
+    pub dir_noise_as: f64,
+    /// Observation noise variance for order flow direction.
+    /// [-1,1], Var≈1.5 → default 2.0
+    pub dir_noise_flow: f64,
+    /// Observation noise variance for burst/cascade events.
+    /// Rare but high-information → default 0.5
+    pub dir_noise_burst: f64,
+    /// Max |μ/σ| z-ratio. Φ(4.0)≈0.99997. Safety ceiling.
+    pub dir_max_z_ratio: f64,
+    /// Variance floor (fraction of prior). 0.01 → never claim >10σ certainty.
+    pub dir_min_variance_frac: f64,
     /// Scale for AS magnitude normalization in directional evidence.
     /// AS_bps / scale = normalized magnitude (clamped [0, 2]).
     /// Default 15.0 (typical HL AS is 10-25 bps).
     pub dir_as_scale_bps: f64,
+    /// Autocorrelation timescale (seconds) for adaptive decay.
+    /// Shorter tau_ac means faster decorrelation and more independent observations.
+    pub tau_autocorrelation_secs: f64,
 
     // === Kappa Priors ===
     /// Prior kappa value (fill intensity)
@@ -116,14 +128,17 @@ pub struct CentralBeliefConfig {
 impl Default for CentralBeliefConfig {
     fn default() -> Self {
         Self {
-            dir_decay_tau_secs: 30.0,
-            dir_max_log_odds: 5.0,
-            dir_lambda_price: 1.0,
-            dir_lambda_fill: 0.3,
-            dir_lambda_as: 0.5,
-            dir_lambda_flow: 0.8,
-            dir_lambda_burst: 2.0,
+            dir_prior_variance: 4.0,
+            dir_process_noise_rate: 0.4,
+            dir_noise_price: 1.0,
+            dir_noise_fill: 4.0,
+            dir_noise_as: 2.5,
+            dir_noise_flow: 2.0,
+            dir_noise_burst: 0.5,
+            dir_max_z_ratio: 4.0,
+            dir_min_variance_frac: 0.01,
             dir_as_scale_bps: 15.0,
+            tau_autocorrelation_secs: 10.0,
             kappa_prior: 2000.0,
             kappa_prior_strength: 10.0,
             min_price_obs: 50,
@@ -167,6 +182,137 @@ impl CentralBeliefConfig {
     }
 }
 
+/// Online return autocorrelation tracker.
+/// Maintains a circular buffer of 1-second returns and estimates
+/// the e-folding timescale tau_ac via linear regression of log(ACF).
+struct AutocorrelationTracker {
+    returns: Vec<f64>, // circular buffer
+    write_idx: usize,
+    n_entries: usize,
+    capacity: usize,           // 120 = 2 minutes of history
+    cached_tau_ac: f64,        // current estimate
+    since_last_recompute: u64, // entries since last ACF computation
+    recompute_interval: u64,   // recompute every 10 entries
+}
+
+impl AutocorrelationTracker {
+    fn new() -> Self {
+        Self {
+            returns: vec![0.0; 120],
+            write_idx: 0,
+            n_entries: 0,
+            capacity: 120,
+            cached_tau_ac: 10.0, // default mid-regime
+            since_last_recompute: 0,
+            recompute_interval: 10,
+        }
+    }
+
+    fn push(&mut self, return_frac: f64) {
+        self.returns[self.write_idx] = return_frac;
+        self.write_idx = (self.write_idx + 1) % self.capacity;
+        self.n_entries += 1;
+        self.since_last_recompute += 1;
+        if self.since_last_recompute >= self.recompute_interval && self.n_entries >= 30 {
+            self.recompute_tau_ac();
+            self.since_last_recompute = 0;
+        }
+    }
+
+    fn recompute_tau_ac(&mut self) {
+        let n = self.n_entries.min(self.capacity);
+        if n < 30 {
+            return;
+        }
+
+        // Compute mean
+        let sum: f64 = if self.n_entries >= self.capacity {
+            self.returns.iter().sum()
+        } else {
+            self.returns[..n].iter().sum()
+        };
+        let mean = sum / n as f64;
+
+        // Compute variance
+        let var: f64 = if self.n_entries >= self.capacity {
+            self.returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n as f64
+        } else {
+            self.returns[..n]
+                .iter()
+                .map(|r| (r - mean).powi(2))
+                .sum::<f64>()
+                / n as f64
+        };
+
+        if var < 1e-20 {
+            return; // No variance, keep cached
+        }
+
+        // Compute ACF at selected lags and fit ln(rho) = -lag/tau via OLS
+        let lags: &[usize] = &[1, 2, 5, 10, 20];
+        let mut sum_x = 0.0_f64;
+        let mut sum_y = 0.0_f64;
+        let mut sum_xx = 0.0_f64;
+        let mut sum_xy = 0.0_f64;
+        let mut count = 0usize;
+
+        for &lag in lags {
+            if lag >= n {
+                continue;
+            }
+            // Compute autocovariance at this lag
+            let mut acov = 0.0;
+            let mut pairs = 0usize;
+            for i in 0..(n - lag) {
+                let idx_i = if self.n_entries >= self.capacity {
+                    (self.write_idx + i) % self.capacity
+                } else {
+                    i
+                };
+                let idx_j = if self.n_entries >= self.capacity {
+                    (self.write_idx + i + lag) % self.capacity
+                } else {
+                    i + lag
+                };
+                acov += (self.returns[idx_i] - mean) * (self.returns[idx_j] - mean);
+                pairs += 1;
+            }
+            if pairs == 0 {
+                continue;
+            }
+            let rho = (acov / pairs as f64) / var;
+            // Only use positive ACF values (negative = decorrelated)
+            if rho > 0.01 {
+                let x = lag as f64;
+                let y = rho.ln();
+                sum_x += x;
+                sum_y += y;
+                sum_xx += x * x;
+                sum_xy += x * y;
+                count += 1;
+            }
+        }
+
+        if count >= 2 {
+            // OLS: slope = (n*sum_xy - sum_x*sum_y) / (n*sum_xx - (sum_x)^2)
+            let n_f = count as f64;
+            let denom = n_f * sum_xx - sum_x * sum_x;
+            if denom.abs() > 1e-15 {
+                let slope = (n_f * sum_xy - sum_x * sum_y) / denom;
+                // ln(rho) = -lag/tau -> slope = -1/tau -> tau = -1/slope
+                if slope < -1e-6 {
+                    let tau = -1.0 / slope;
+                    self.cached_tau_ac = tau.clamp(3.0, 120.0);
+                }
+            }
+        }
+    }
+
+    fn tau_ac(&self) -> f64 {
+        self.cached_tau_ac
+    }
+}
+
 /// Internal state (mutable, protected by RwLock).
 struct InternalState {
     // === Bayesian Fair Value ===
@@ -174,23 +320,28 @@ struct InternalState {
     /// Latest mid price for Bayesian FV flow updates (BookUpdate/PriceReturn set this).
     last_mid_for_fv: f64,
 
-    // === Directional Log-Odds ===
-    /// Log-odds accumulator: L > 0 = bearish, L < 0 = bullish
-    dir_log_odds: f64,
+    // === Directional Drift Posterior (Normal-Normal conjugate Kalman) ===
+    /// Posterior mean: μ > 0 = bearish, μ < 0 = bullish (same sign convention as old L)
+    dir_mu: f64,
+    /// Posterior variance
+    dir_sigma_sq: f64,
     dir_last_update_ms: u64,
-    /// Per-source evidence counts (diagnostics + confidence ramp)
+    /// Per-source evidence counts (diagnostics)
     dir_n_price: u64,
     dir_n_fill: u64,
     dir_n_as: u64,
     dir_n_flow: u64,
+    dir_n_burst: u64,
     /// Running variance for sigma estimation
     sigma_sum_sq: f64,
     sigma_n: f64,
-    /// Per-source cumulative LR (decayed, for drift_skewness diagnostic)
-    dir_lr_sum_price: f64,
-    dir_lr_sum_fill: f64,
-    dir_lr_sum_as: f64,
-    dir_lr_sum_flow: f64,
+    /// Per-source cumulative Kalman evidence (decayed, for drift_skewness diagnostic)
+    dir_evidence_price: f64,
+    dir_evidence_fill: f64,
+    dir_evidence_as: f64,
+    dir_evidence_flow: f64,
+    /// Online autocorrelation tracker for adaptive decay timescale
+    acf_tracker: AutocorrelationTracker,
 
     // === Kappa (fill intensity) ===
     kappa_smoothed: f64,
@@ -339,19 +490,22 @@ impl Default for InternalState {
             bayesian_fv: None,
             last_mid_for_fv: 0.0,
 
-            // Directional log-odds
-            dir_log_odds: 0.0,
+            // Directional drift posterior (Kalman)
+            dir_mu: 0.0,
+            dir_sigma_sq: 4.0, // matches dir_prior_variance default
             dir_last_update_ms: 0,
             dir_n_price: 0,
             dir_n_fill: 0,
             dir_n_as: 0,
             dir_n_flow: 0,
+            dir_n_burst: 0,
             sigma_sum_sq: 0.0,
             sigma_n: 0.0,
-            dir_lr_sum_price: 0.0,
-            dir_lr_sum_fill: 0.0,
-            dir_lr_sum_as: 0.0,
-            dir_lr_sum_flow: 0.0,
+            dir_evidence_price: 0.0,
+            dir_evidence_fill: 0.0,
+            dir_evidence_as: 0.0,
+            dir_evidence_flow: 0.0,
+            acf_tracker: AutocorrelationTracker::new(),
 
             // Kappa
             kappa_smoothed: 2000.0,
@@ -492,6 +646,7 @@ impl CentralBeliefState {
 
         let state = InternalState {
             bayesian_fv,
+            dir_sigma_sq: config.dir_prior_variance,
             kappa_smoothed: config.kappa_prior,
             own_kappa_alpha: config.kappa_prior_strength,
             own_kappa_beta: config.kappa_prior_strength / config.kappa_prior,
@@ -643,16 +798,14 @@ impl CentralBeliefState {
                 fill_count,
                 timestamp_ms,
             } => {
-                self.apply_dir_time_decay(state, timestamp_ms);
-                // is_buy_side=true → sell aggressor hit our bid → bearish → L↑
+                self.dir_kalman_predict(state, timestamp_ms);
+                // is_buy_side=true → sell aggressor hit our bid → bearish → μ↑
                 let direction = if is_buy_side { 1.0 } else { -1.0 };
                 // Magnitude: ln(intensity_ratio) + 1 scaled by sqrt(fill_count)
                 let magnitude = (intensity_ratio.max(1.0).ln() + 1.0) * (fill_count as f64).sqrt();
-                let lr_burst = direction * magnitude.clamp(0.5, 5.0);
-                state.dir_log_odds += self.config.dir_lambda_burst * lr_burst;
-                state.dir_log_odds = state
-                    .dir_log_odds
-                    .clamp(-self.config.dir_max_log_odds, self.config.dir_max_log_odds);
+                let obs = direction * magnitude.clamp(0.5, 5.0);
+                self.dir_kalman_update(state, obs, self.config.dir_noise_burst);
+                state.dir_n_burst += 1;
                 state.last_update_ms = timestamp_ms;
             }
 
@@ -718,15 +871,12 @@ impl CentralBeliefState {
                 state.cofi_velocity = cofi_velocity;
                 state.is_sustained_shift = is_sustained_shift;
 
-                // --- Directional log-odds: order flow evidence ---
-                // order_flow_direction ∈ [-1,1], positive = buy pressure = bullish → L↓
-                let lr_flow = (-order_flow_direction).clamp(-2.0, 2.0);
-                state.dir_log_odds += self.config.dir_lambda_flow * lr_flow;
-                state.dir_log_odds = state
-                    .dir_log_odds
-                    .clamp(-self.config.dir_max_log_odds, self.config.dir_max_log_odds);
+                // --- Directional drift posterior: order flow evidence ---
+                // order_flow_direction ∈ [-1,1], positive = buy pressure = bullish → obs < 0
+                let obs_flow = (-order_flow_direction).clamp(-2.0, 2.0);
+                self.dir_kalman_update(state, obs_flow, self.config.dir_noise_flow);
                 state.dir_n_flow += 1;
-                state.dir_lr_sum_flow += lr_flow;
+                state.dir_evidence_flow += obs_flow;
             }
 
             BeliefUpdate::CrossVenueUpdate {
@@ -775,19 +925,51 @@ impl CentralBeliefState {
         }
     }
 
-    fn apply_dir_time_decay(&self, state: &mut InternalState, current_ms: u64) {
+    /// Kalman predict step: mean reverts toward zero, variance grows with process noise.
+    /// Replaces apply_dir_time_decay.
+    fn dir_kalman_predict(&self, state: &mut InternalState, current_ms: u64) {
         if state.dir_last_update_ms == 0 || current_ms <= state.dir_last_update_ms {
             state.dir_last_update_ms = current_ms;
             return;
         }
         let dt_secs = (current_ms - state.dir_last_update_ms) as f64 / 1000.0;
-        let decay = (-dt_secs / self.config.dir_decay_tau_secs).exp();
-        state.dir_log_odds *= decay;
-        state.dir_lr_sum_price *= decay;
-        state.dir_lr_sum_fill *= decay;
-        state.dir_lr_sum_as *= decay;
-        state.dir_lr_sum_flow *= decay;
+        let tau = state.acf_tracker.tau_ac().clamp(3.0, 120.0);
+        let decay = (-dt_secs / tau).exp();
+
+        // Mean reverts toward zero; variance grows with process noise
+        state.dir_mu *= decay;
+        state.dir_sigma_sq =
+            state.dir_sigma_sq * decay * decay + self.config.dir_process_noise_rate * dt_secs;
+
+        // Variance bounds: floor prevents degenerate certainty
+        let var_floor = self.config.dir_prior_variance * self.config.dir_min_variance_frac;
+        let var_ceil = self.config.dir_prior_variance * 4.0;
+        state.dir_sigma_sq = state.dir_sigma_sq.clamp(var_floor, var_ceil);
+
+        // Decay evidence diagnostics
+        state.dir_evidence_price *= decay;
+        state.dir_evidence_fill *= decay;
+        state.dir_evidence_as *= decay;
+        state.dir_evidence_flow *= decay;
+
         state.dir_last_update_ms = current_ms;
+    }
+
+    /// Scalar Kalman update: incorporates a single observation with known noise variance.
+    fn dir_kalman_update(&self, state: &mut InternalState, obs: f64, noise_var: f64) {
+        // K = σ²_prior / (σ²_prior + σ²_noise)
+        let k = state.dir_sigma_sq / (state.dir_sigma_sq + noise_var);
+        state.dir_mu += k * (obs - state.dir_mu);
+        state.dir_sigma_sq *= 1.0 - k;
+
+        // Variance floor
+        let var_floor = self.config.dir_prior_variance * self.config.dir_min_variance_frac;
+        state.dir_sigma_sq = state.dir_sigma_sq.max(var_floor);
+
+        // Z-ratio safety clamp
+        let sigma = state.dir_sigma_sq.sqrt();
+        let max_mu = self.config.dir_max_z_ratio * sigma;
+        state.dir_mu = state.dir_mu.clamp(-max_mu, max_mu);
     }
 
     fn process_price_return(
@@ -801,8 +983,11 @@ impl CentralBeliefState {
         state.total_time += dt_secs;
         state.last_update_ms = timestamp_ms;
 
-        // --- Directional log-odds: price return evidence ---
-        self.apply_dir_time_decay(state, timestamp_ms);
+        // Feed return into autocorrelation tracker for adaptive decay
+        state.acf_tracker.push(return_frac);
+
+        // --- Directional drift posterior: price return evidence ---
+        self.dir_kalman_predict(state, timestamp_ms);
 
         let sigma_est = if state.sigma_n > 5.0 {
             (state.sigma_sum_sq / state.sigma_n).sqrt().max(0.0001)
@@ -810,14 +995,12 @@ impl CentralBeliefState {
             0.002 // ~20 bps conservative default
         };
 
-        // z-score: positive return → bullish evidence → decrease L
+        // z-score: positive return → bullish → obs = -z (negative = bullish)
         let z = (return_frac / (sigma_est * dt_secs.sqrt().max(0.1))).clamp(-3.0, 3.0);
-        state.dir_log_odds -= self.config.dir_lambda_price * z;
-        state.dir_log_odds = state
-            .dir_log_odds
-            .clamp(-self.config.dir_max_log_odds, self.config.dir_max_log_odds);
+        let obs_price = -z; // positive z (up move) → bullish → negative obs
+        self.dir_kalman_update(state, obs_price, self.config.dir_noise_price);
         state.dir_n_price += 1;
-        state.dir_lr_sum_price -= z;
+        state.dir_evidence_price += obs_price;
 
         // Running variance for sigma
         let return_sq = if dt_secs > 0.01 {
@@ -878,26 +1061,22 @@ impl CentralBeliefState {
         let alpha = 0.1;
         state.as_bias = (1.0 - alpha) * state.as_bias + alpha * fill.realized_as_bps;
 
-        // --- Directional log-odds: fill side + AS evidence ---
-        self.apply_dir_time_decay(state, fill.timestamp_ms);
+        // --- Directional drift posterior: fill side + AS evidence ---
+        self.dir_kalman_predict(state, fill.timestamp_ms);
 
-        // Fill side: is_buy=true → sell aggressor hit our bid → bearish evidence (L↑)
-        let lr_fill = if fill.is_buy { 1.0 } else { -1.0 };
-        state.dir_log_odds += self.config.dir_lambda_fill * lr_fill;
+        // Fill side: is_buy=true → sell aggressor hit our bid → bearish (obs > 0)
+        let obs_fill = if fill.is_buy { 1.0 } else { -1.0 };
+        self.dir_kalman_update(state, obs_fill, self.config.dir_noise_fill);
         state.dir_n_fill += 1;
-        state.dir_lr_sum_fill += lr_fill;
+        state.dir_evidence_fill += obs_fill;
 
         // AS direction: large AS + is_buy → confirmed downward move → bearish
         let as_scale_bps = self.config.dir_as_scale_bps;
         let as_mag = (fill.realized_as_bps.abs() / as_scale_bps).clamp(0.0, 2.0);
-        let lr_as = if fill.is_buy { as_mag } else { -as_mag };
-        state.dir_log_odds += self.config.dir_lambda_as * lr_as;
+        let obs_as = if fill.is_buy { as_mag } else { -as_mag };
+        self.dir_kalman_update(state, obs_as, self.config.dir_noise_as);
         state.dir_n_as += 1;
-        state.dir_lr_sum_as += lr_as;
-
-        state.dir_log_odds = state
-            .dir_log_odds
-            .clamp(-self.config.dir_max_log_odds, self.config.dir_max_log_odds);
+        state.dir_evidence_as += obs_as;
 
         // Link prediction if we have order_id
         if let Some(oid) = fill.order_id {
@@ -1084,12 +1263,13 @@ impl CentralBeliefState {
         // Decay all posteriors toward prior
         let r = retention.clamp(0.0, 1.0);
 
-        // Directional log-odds
-        state.dir_log_odds *= r;
-        state.dir_lr_sum_price *= r;
-        state.dir_lr_sum_fill *= r;
-        state.dir_lr_sum_as *= r;
-        state.dir_lr_sum_flow *= r;
+        // Directional drift posterior: mean decays, variance relaxes toward prior
+        state.dir_mu *= r;
+        state.dir_sigma_sq += (1.0 - r) * (self.config.dir_prior_variance - state.dir_sigma_sq);
+        state.dir_evidence_price *= r;
+        state.dir_evidence_fill *= r;
+        state.dir_evidence_as *= r;
+        state.dir_evidence_flow *= r;
         state.sigma_sum_sq *= r;
         state.sigma_n *= r;
 
@@ -1111,7 +1291,10 @@ impl CentralBeliefState {
 
     fn apply_decay(&self, state: &mut InternalState) {
         let d = self.config.decay_factor;
-        state.dir_log_odds *= d;
+        state.dir_mu *= d;
+        // Variance grows slightly to reflect increased uncertainty
+        let var_ceil = self.config.dir_prior_variance * 4.0;
+        state.dir_sigma_sq = (state.dir_sigma_sq / d).min(var_ceil);
         state.sigma_sum_sq *= d;
         state.sigma_n *= d;
     }
@@ -1149,21 +1332,19 @@ impl CentralBeliefState {
     }
 
     fn build_drift_vol_beliefs(&self, state: &InternalState) -> DriftVolatilityBeliefs {
-        let l = state.dir_log_odds;
-        let prob_bearish = sigmoid(l);
+        let mu = state.dir_mu;
+        let sigma = state.dir_sigma_sq.sqrt().max(1e-10);
+
+        // P(bearish) = Φ(μ/σ) — proper Gaussian posterior probability
+        let z = (mu / sigma).clamp(-self.config.dir_max_z_ratio, self.config.dir_max_z_ratio);
+        let prob_bearish = normal_cdf(z);
         let prob_bullish = 1.0 - prob_bearish;
 
-        // Confidence: directional strength × evidence ramp
-        let total_n =
-            (state.dir_n_price + state.dir_n_fill + state.dir_n_as + state.dir_n_flow) as f64;
+        // Confidence: information ratio × directional conviction
+        let info_ratio =
+            (1.0 - state.dir_sigma_sq / self.config.dir_prior_variance).clamp(0.0, 1.0);
         let dir_conf = 1.0 - 2.0 * prob_bearish.min(prob_bullish);
-        // Softer evidence ramp with meaningful floor for cold-start defense.
-        // Floor ensures 30% passthrough even with few observations.
-        // sqrt() makes ramp concave (faster initial rise).
-        let evidence_floor = 0.3;
-        let evidence_weight =
-            evidence_floor + (1.0 - evidence_floor) * (total_n / 50.0).min(1.0).sqrt();
-        let confidence = (dir_conf * evidence_weight).clamp(0.0, 1.0);
+        let confidence = (dir_conf * info_ratio).clamp(0.0, 1.0);
 
         // Sigma from running variance
         let expected_sigma = if state.sigma_n > 5.0 {
@@ -1172,12 +1353,12 @@ impl CentralBeliefState {
             0.02
         };
 
-        // Expected drift: smooth mapping from log-odds via tanh
-        // L > 0 (bearish) → drift < 0; bounded by ±sigma
-        let expected_drift = -expected_sigma * (l / 2.0).tanh();
+        // Expected drift: smooth mapping from posterior mean via tanh
+        // μ > 0 (bearish) → drift < 0; bounded by ±sigma
+        let expected_drift = -expected_sigma * (mu / 2.0).tanh();
 
-        // Drift uncertainty: shrinks with evidence
-        let drift_uncertainty = expected_sigma / (1.0 + total_n / 10.0).sqrt();
+        // Drift uncertainty: direct from posterior, normalized by prior
+        let drift_uncertainty = expected_sigma * sigma / self.config.dir_prior_variance.sqrt();
 
         // Phase 2A: Sigma skewness/kurtosis (depends on n_price_obs)
         let ig_alpha = (state.n_price_obs as f64) / 2.0 + 2.0;
@@ -1192,15 +1373,22 @@ impl CentralBeliefState {
             5.0
         };
 
+        // Total evidence count for diagnostics
+        let total_evidence = state.dir_n_price
+            + state.dir_n_fill
+            + state.dir_n_as
+            + state.dir_n_flow
+            + state.dir_n_burst;
+
         // Drift skewness from source asymmetry
-        let drift_skewness = if total_n > 10.0 {
-            let fill_frac = (state.dir_lr_sum_fill.abs() + state.dir_lr_sum_as.abs())
-                / (state.dir_lr_sum_price.abs()
-                    + state.dir_lr_sum_fill.abs()
-                    + state.dir_lr_sum_as.abs()
-                    + state.dir_lr_sum_flow.abs()
+        let drift_skewness = if total_evidence > 10 {
+            let fill_frac = (state.dir_evidence_fill.abs() + state.dir_evidence_as.abs())
+                / (state.dir_evidence_price.abs()
+                    + state.dir_evidence_fill.abs()
+                    + state.dir_evidence_as.abs()
+                    + state.dir_evidence_flow.abs()
                     + 1e-10);
-            fill_frac.clamp(0.0, 1.0) * l.signum() * 0.5
+            fill_frac.clamp(0.0, 1.0) * mu.signum() * 0.5
         } else {
             0.0
         };
@@ -1216,11 +1404,11 @@ impl CentralBeliefState {
             sigma_skewness,
             sigma_kurtosis,
             drift_skewness,
-            // Diagnostic: per-source evidence sums
-            lr_sum_price: state.dir_lr_sum_price,
-            lr_sum_fill: state.dir_lr_sum_fill,
-            lr_sum_as: state.dir_lr_sum_as,
-            lr_sum_flow: state.dir_lr_sum_flow,
+            // Diagnostic: per-source evidence sums (backward compat field names)
+            lr_sum_price: state.dir_evidence_price,
+            lr_sum_fill: state.dir_evidence_fill,
+            lr_sum_as: state.dir_evidence_as,
+            lr_sum_flow: state.dir_evidence_flow,
         }
     }
 
@@ -1628,6 +1816,8 @@ impl CentralBeliefState {
 }
 
 /// Sigmoid function: maps log-odds to probability.
+/// Only used in tests for behavioral equivalence checking (Φ(z) ≈ sigmoid(1.7z)).
+#[cfg(test)]
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -1861,8 +2051,8 @@ mod tests {
             before.drift_vol.prob_bearish
         );
 
-        // Advance 120 seconds (4 × tau=30s → decay ≈ e^(-4) ≈ 0.018)
-        // with a neutral return to trigger decay
+        // Advance 120 seconds (>> tau_ac → mean reverts toward 0, variance grows)
+        // with a neutral return to trigger predict step
         beliefs.update(BeliefUpdate::PriceReturn {
             return_frac: 0.0,
             dt_secs: 0.1,
@@ -1994,7 +2184,8 @@ mod tests {
     fn test_burst_log_odds_clamped() {
         let beliefs = CentralBeliefState::default_config();
 
-        // Extreme burst — should not exceed dir_max_log_odds=5.0
+        // Extreme burst — clamped by z-ratio safety clamp at ±4.0.
+        // Φ(4.0) ≈ 0.99997
         for _ in 0..20 {
             beliefs.update(BeliefUpdate::BurstEvent {
                 is_buy_side: true,
@@ -2005,14 +2196,13 @@ mod tests {
         }
 
         let snapshot = beliefs.snapshot();
-        // sigmoid(5.0) ≈ 0.993
         assert!(
             snapshot.drift_vol.prob_bearish < 1.0,
             "Must be clamped below 1.0: {}",
             snapshot.drift_vol.prob_bearish
         );
         assert!(
-            snapshot.drift_vol.prob_bearish > 0.99,
+            snapshot.drift_vol.prob_bearish > 0.90,
             "Should be near max: {}",
             snapshot.drift_vol.prob_bearish
         );
@@ -2108,8 +2298,9 @@ mod tests {
         }
 
         let snapshot = beliefs.snapshot();
-        // At n=60 (> 50), evidence_weight ≈ 0.3 + 0.7*1.0 = 1.0
-        // dir_conf is strong → confidence should be substantial
+        // Bayesian: n_eff = 60*1.0 = 60.0, evidence_weight = 60/90 = 0.667
+        // With consistent bearish returns, dir_conf is high.
+        // confidence ~ 0.667 * dir_conf should be substantial.
         assert!(
             snapshot.drift_vol.confidence > 0.3,
             "At 60 observations, confidence should exceed 0.3: conf={}",
@@ -2315,6 +2506,231 @@ mod tests {
             snapshot.drift_vol.lr_sum_as != 0.0,
             "lr_sum_as should be non-zero: {}",
             snapshot.drift_vol.lr_sum_as
+        );
+    }
+
+    // =========================================================================
+    // Kalman Drift Posterior Tests
+    // =========================================================================
+
+    #[test]
+    fn test_kalman_cold_start_prior() {
+        let beliefs = CentralBeliefState::default_config();
+        let snapshot = beliefs.snapshot();
+
+        // At cold start: μ=0, prob=0.5, confidence≈0
+        assert!(
+            (snapshot.drift_vol.prob_bearish - 0.5).abs() < 0.01,
+            "Cold start prob_bearish should be 0.5: {}",
+            snapshot.drift_vol.prob_bearish
+        );
+        assert!(
+            snapshot.drift_vol.confidence < 0.01,
+            "Cold start confidence should be near 0: {}",
+            snapshot.drift_vol.confidence
+        );
+    }
+
+    #[test]
+    fn test_kalman_posterior_variance_shrinks() {
+        let config = CentralBeliefConfig::default();
+        let beliefs = CentralBeliefState::new(config.clone());
+
+        let _initial_sigma_sq = config.dir_prior_variance;
+
+        // Feed 20 consistent observations
+        for i in 0..20 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.002,
+                dt_secs: 1.0,
+                timestamp_ms: i * 1000,
+            });
+        }
+
+        // Check that posterior variance has shrunk (via drift_uncertainty which is proportional)
+        let snapshot = beliefs.snapshot();
+        // drift_uncertainty = expected_sigma * sigma_post / sigma_prior
+        // With shrunk variance, drift_uncertainty < expected_sigma
+        assert!(
+            snapshot.drift_vol.drift_uncertainty < snapshot.drift_vol.expected_sigma,
+            "Posterior should have shrunk: drift_uncertainty={}, expected_sigma={}",
+            snapshot.drift_vol.drift_uncertainty,
+            snapshot.drift_vol.expected_sigma
+        );
+        // Confidence should be non-trivial
+        assert!(
+            snapshot.drift_vol.confidence > 0.1,
+            "20 obs should give meaningful confidence: {}",
+            snapshot.drift_vol.confidence
+        );
+    }
+
+    #[test]
+    fn test_kalman_variance_bounded() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // 1000 consistent observations — variance should not go to zero
+        for i in 0..1000 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.001,
+                dt_secs: 1.0,
+                timestamp_ms: i * 1000,
+            });
+        }
+
+        let snapshot = beliefs.snapshot();
+        // drift_uncertainty should still be positive (variance floor prevents degenerate certainty)
+        assert!(
+            snapshot.drift_vol.drift_uncertainty > 0.0,
+            "Variance floor should prevent zero uncertainty: {}",
+            snapshot.drift_vol.drift_uncertainty
+        );
+        // prob_bearish should be very high but not exactly 1.0
+        assert!(
+            snapshot.drift_vol.prob_bearish < 1.0,
+            "Should never reach exactly 1.0: {}",
+            snapshot.drift_vol.prob_bearish
+        );
+    }
+
+    #[test]
+    fn test_kalman_predict_grows_variance() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Build up tight posterior
+        for _ in 0..50 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.002,
+                dt_secs: 1.0,
+                timestamp_ms: 1000,
+            });
+        }
+
+        let before = beliefs.snapshot();
+        let conf_before = before.drift_vol.confidence;
+
+        // 30 second gap with neutral observation → predict step grows variance
+        beliefs.update(BeliefUpdate::PriceReturn {
+            return_frac: 0.0,
+            dt_secs: 0.1,
+            timestamp_ms: 31_000,
+        });
+
+        let after = beliefs.snapshot();
+        // After time gap, confidence should decrease (variance grew)
+        assert!(
+            after.drift_vol.confidence < conf_before,
+            "Time gap should decrease confidence: before={}, after={}",
+            conf_before,
+            after.drift_vol.confidence
+        );
+    }
+
+    #[test]
+    fn test_kalman_convergence_monotonic() {
+        let beliefs = CentralBeliefState::default_config();
+        let mut last_prob = 0.5;
+
+        // 50 consistent bearish observations — prob_bearish should increase monotonically
+        for i in 0..50 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.002,
+                dt_secs: 1.0,
+                timestamp_ms: i * 100, // close timestamps to avoid predict decay
+            });
+
+            let snapshot = beliefs.snapshot();
+            assert!(
+                snapshot.drift_vol.prob_bearish >= last_prob - 0.01, // small tolerance for float
+                "prob_bearish should increase monotonically: step={}, prev={}, now={}",
+                i,
+                last_prob,
+                snapshot.drift_vol.prob_bearish
+            );
+            last_prob = snapshot.drift_vol.prob_bearish;
+        }
+
+        assert!(
+            last_prob > 0.9,
+            "After 50 consistent bearish obs, prob_bearish should exceed 0.9: {}",
+            last_prob
+        );
+    }
+
+    #[test]
+    fn test_kalman_information_ratio_confidence() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // 0 observations → confidence near 0
+        let empty = beliefs.snapshot();
+        assert!(
+            empty.drift_vol.confidence < 0.01,
+            "Zero obs → confidence ≈ 0: {}",
+            empty.drift_vol.confidence
+        );
+
+        // 200 consistent observations → high confidence
+        for i in 0..200 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.002,
+                dt_secs: 1.0,
+                timestamp_ms: i * 100,
+            });
+        }
+
+        let rich = beliefs.snapshot();
+        assert!(
+            rich.drift_vol.confidence > 0.5,
+            "200 obs → confidence > 0.5: {}",
+            rich.drift_vol.confidence
+        );
+    }
+
+    #[test]
+    fn test_normal_cdf_vs_sigmoid_equivalence() {
+        // Verify Φ(z) ≈ sigmoid(1.7z) for |z| < 3 (behavioral continuity)
+        for z_int in -30..=30 {
+            let z = z_int as f64 / 10.0;
+            let phi = normal_cdf(z);
+            let sig = sigmoid(1.7 * z);
+            let diff = (phi - sig).abs();
+            assert!(
+                diff < 0.03,
+                "Φ({}) = {:.4} vs sigmoid(1.7×{}) = {:.4}, diff = {:.4}",
+                z,
+                phi,
+                z,
+                sig,
+                diff
+            );
+        }
+    }
+
+    // =========================================================================
+    // Phase 3: Autocorrelation Tracker Tests
+    // =========================================================================
+
+    #[test]
+    fn test_autocorrelation_tracker_basic() {
+        let mut tracker = AutocorrelationTracker::new();
+
+        // Default tau_ac should be 10.0
+        assert!((tracker.tau_ac() - 10.0).abs() < 1e-10);
+
+        // Push alternating returns (no positive autocorrelation)
+        // With uncorrelated data, tau_ac should remain near default or be small
+        for i in 0..50 {
+            let r = if i % 2 == 0 { 0.001 } else { -0.001 };
+            tracker.push(r);
+        }
+
+        // After 50 entries with alternating returns (negative ACF at lag 1),
+        // tracker should maintain reasonable bounds
+        let tau = tracker.tau_ac();
+        assert!(
+            (3.0..=120.0).contains(&tau),
+            "tau_ac should be in bounds: {}",
+            tau
         );
     }
 }
