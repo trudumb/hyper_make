@@ -10,3 +10,7 @@ data/checkpoints/
 # Dashboard capture tool
 tools/dashboard-capture/screenshots/
 tools/dashboard-capture/node_modules/
+data/analytics/equity_sharpe_metrics.jsonl
+data/analytics/sharpe_metrics.jsonl
+data/analytics/signal_contributions.jsonl
+data/analytics/signal_pnl.jsonl

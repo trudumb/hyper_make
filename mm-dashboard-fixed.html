@@ -2172,11 +2172,11 @@
                                 e('div', {className: 'text-2xl font-bold mono', style: {color: featureHealth.signal_decay?.issue_count > 0 ? C.yellow : C.green}}, featureHealth.signal_decay?.issue_count || 0)
                             ),
                             e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: '3px solid ' + C.purple}},
-                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Features Tracked'},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Features Tracked'),
                                 e('div', {className: 'text-2xl font-bold mono'}, featureHealth.correlation?.feature_names?.length || 0)
                             ),
                             e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: '3px solid ' + (featureHealth.lag_analysis?.signal_ready ? C.green : C.yellow)}},
-                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Lag Signal'},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Lag Signal'),
                                 e('div', {className: 'text-2xl font-bold', style: {color: featureHealth.lag_analysis?.signal_ready ? C.green : C.yellow}},
                                     featureHealth.lag_analysis?.signal_ready ? '✓ Ready' : 'Warming'
                                 )
