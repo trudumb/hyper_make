@@ -85,7 +85,13 @@
       "Bash(sccache:*)",
       "Bash(cargo install:*)",
       "Bash(gh auth:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(ss:*)",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_console_messages",
+      "mcp__playwright__browser_evaluate",
+      "Bash(node:*)",
+      "Bash(./scripts/paper_trading.sh:*)"
     ]
   }
 }

@@ -7,7 +7,7 @@
 #   ./scripts/paper_trading.sh BTC 300                 # 5 minute simulation
 #   ./scripts/paper_trading.sh BTC 3600 --report       # 1 hour with calibration report
 #   ./scripts/paper_trading.sh BTC 300 --verbose       # With verbose logging
-#   ./scripts/paper_trading.sh BTC 3600 --dashboard    # With live dashboard
+#   ./scripts/paper_trading.sh HYPE 3600 --dashboard    # With live dashboard
 #   ./scripts/paper_trading.sh BTC 300 --capture       # With dashboard + screenshot capture
 #
 # Options:
@@ -143,23 +143,20 @@ else
     export RUST_LOG="hyperliquid_rust_sdk::market_maker::simulation=info,market_maker=info"
 fi
 
-# Build command args
-PT_ARGS="paper --asset ${ASSET} --duration ${DURATION}"
-if [ "$REPORT" = true ]; then
-    PT_ARGS="${PT_ARGS} --report"
-fi
-if [ "$VERBOSE" = true ]; then
-    PT_ARGS="${PT_ARGS} --verbose"
-fi
+# Build command args - top-level args go before subcommand, paper args after
+CLI_ARGS="--asset ${ASSET}"
+PAPER_ARGS="--duration ${DURATION}"
+
 if [ "$NETWORK" = "testnet" ]; then
-    PT_ARGS="${PT_ARGS} --network testnet"
+    CLI_ARGS="${CLI_ARGS} --network testnet"
 fi
 if [ "$DASHBOARD" = true ]; then
-    PT_ARGS="${PT_ARGS} --dashboard --metrics-port ${METRICS_PORT}"
+    CLI_ARGS="${CLI_ARGS} --metrics-port ${METRICS_PORT}"
 fi
-if [ "$PAPER_MODE" = true ]; then
-    PT_ARGS="${PT_ARGS} --paper-mode"
-fi
+
+# Note: --report, --verbose, --dashboard, --paper-mode are script-level flags
+# that control script behavior (RUST_LOG, HTTP server, capture tool).
+# They are NOT passed to the binary.
 
 # Start dashboard HTTP server if requested
 DASHBOARD_PID=""
@@ -196,7 +193,7 @@ if [ "$CAPTURE" = true ]; then
 fi
 
 # Run paper trader with tee to capture output
-./target/debug/market_maker ${PT_ARGS} 2>&1 | tee "${LOG_FILE}" || true
+./target/debug/market_maker ${CLI_ARGS} paper ${PAPER_ARGS} 2>&1 | tee "${LOG_FILE}" || true
 
 # Stop capture tool if started
 if [ -n "$CAPTURE_PID" ]; then
