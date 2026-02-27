@@ -1116,6 +1116,55 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         "Kill switch status"
                     );
 
+                    // === Connection health: detect stale data and reconnect ===
+                    // Two-tier check:
+                    // 1. Global connection supervisor (tracks ALL market data)
+                    // 2. Per-asset data quality monitor (tracks THIS asset's L2/trades)
+                    //
+                    // The supervisor can miss per-asset staleness because AllMids (which
+                    // covers all assets) keeps flowing even when L2Book/Trades for a
+                    // specific coin silently drops. So we also check the data quality
+                    // monitor and trigger reconnection if the asset is stale for >30s.
+                    let supervisor_stats = self.infra.connection_supervisor.stats();
+                    let asset_stale_ms = self.infra.data_quality
+                        .time_since_last_update(&self.config.asset)
+                        .unwrap_or(0);
+                    let needs_reconnect = self.infra.connection_supervisor.is_reconnect_recommended()
+                        || asset_stale_ms > 45_000; // 45s of per-asset staleness → reconnect
+
+                    if needs_reconnect {
+                        let attempt = self.infra.connection_health.current_attempt() + 1;
+                        warn!(
+                            time_since_market_data_secs = supervisor_stats.time_since_market_data.as_secs_f64(),
+                            asset_stale_ms = asset_stale_ms,
+                            connection_state = %supervisor_stats.connection_state,
+                            reconnection_attempt = attempt,
+                            "Stale data detected - initiating WebSocket reconnection"
+                        );
+
+                        self.infra.connection_supervisor.record_reconnection_start();
+
+                        if let Err(e) = self.environment.reconnect().await {
+                            warn!(
+                                error = %e,
+                                attempt = attempt,
+                                "Failed to initiate WebSocket reconnection"
+                            );
+                            if !self.infra.connection_supervisor.record_reconnection_failed() {
+                                error!(
+                                    "Reconnection permanently failed after max retries - kill switch will trigger"
+                                );
+                            }
+                        } else {
+                            info!(
+                                attempt = attempt,
+                                "WebSocket reconnection initiated - waiting for data to resume"
+                            );
+                        }
+
+                        self.infra.connection_supervisor.clear_reconnect_recommendation();
+                    }
+
                     // === Push dashboard state to WebSocket clients ===
                     if let Some(ref ws) = self.infra.dashboard_ws {
                         let state = self.infra.prometheus.to_dashboard_state();

@@ -193,4 +193,13 @@ pub trait TradingEnvironment: Send + Sync + 'static {
 
     /// Whether this is a live environment (controls safety sync, margin refresh).
     fn is_live(&self) -> bool;
+
+    /// Force reconnect the underlying WebSocket data feed.
+    ///
+    /// Default: no-op (returns Ok). Environments with their own InfoClient
+    /// (e.g., PaperEnvironment) should override to trigger WS reconnection
+    /// when the connection supervisor detects stale data.
+    async fn reconnect(&self) -> Result<()> {
+        Ok(())
+    }
 }

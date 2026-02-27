@@ -222,6 +222,14 @@ impl TradingEnvironment for PaperEnvironment {
     fn is_live(&self) -> bool {
         false
     }
+
+    async fn reconnect(&self) -> Result<()> {
+        if let Some(ref client) = self.info_client {
+            client.reconnect().await
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // ============================================================================
