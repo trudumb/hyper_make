@@ -1187,7 +1187,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Convert to gamma discount: gamma_discount = 1/spread_mult.
                 let prior_gamma = 1.0 / spread_multiplier_from_confidence(prior_conf);
                 let prior_sz = size_multiplier_from_confidence(prior_conf);
-                // Take the LESS conservative of fill-based and prior-based
+                // Take the LESS conservative (prior helps bootstrap, never hinders)
                 (
                     warmup_gamma_discount.max(prior_gamma),
                     warmup_sz.max(prior_sz),
@@ -1593,6 +1593,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // - Informed flow decomposition
         // - Regime-conditioned kappa
         // - Model gating (IR-based confidence)
+
+        // Wire MI-based signal attenuation from health monitor → signal integrator.
+        // Stale signals (MI << baseline) are soft-gated toward zero contribution.
+        {
+            let factors = self
+                .stochastic
+                .model_calibration
+                .health_monitor()
+                .signal_attenuation_factors();
+            self.stochastic
+                .signal_integrator
+                .set_mi_attenuation(factors);
+        }
         let mut signals = self.stochastic.signal_integrator.get_signals();
 
         // Inject cross-asset signals (Sprint 4.1): BTC lead-lag + funding divergence
@@ -3005,6 +3018,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // Wire warmup size multiplier into market_params for ladder margin scaling.
+        market_params.warmup_size_mult = warmup_size_mult;
+
         if !capacity_budget.should_quote() {
             if let Viability::NotViable {
                 ref reason,
@@ -3097,6 +3113,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.effective_max_position, // First-principles limit
             kelly_adjusted_liquidity,    // Decision + Kelly-adjusted viable size
             &market_params,
+        );
+
+        // Cache risk features and gamma for online Bayesian gamma calibration.
+        // At markout resolution, these are fed to the RLS calibrator.
+        self.stochastic.last_gamma_cache = self.strategy.gamma_features_cache(
+            &market_params,
+            self.position.position(),
+            self.effective_max_position,
         );
 
         // Snap ladder prices to grid to prevent sub-tick oscillations from
@@ -3567,6 +3591,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     self_impact_bps: 0.0,
                     inventory_beta: 0.0,
                     continuation_gamma_mult: 1.0,
+                    kappa_variance: market_params.kappa_variance,
                 };
                 if let Some(best_bid) = viable.bids.first() {
                     let half_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;

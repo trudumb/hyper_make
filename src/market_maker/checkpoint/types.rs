@@ -175,6 +175,10 @@ pub struct CheckpointBundle {
     /// Shadow Tuner state: current best params, optimizer sigma, generation count.
     #[serde(default)]
     pub shadow_tuner: Option<crate::market_maker::simulation::shadow_tuner::ShadowTunerCheckpoint>,
+    /// Online Bayesian gamma calibrator: learned beta coefficients and RLS state.
+    /// Persists learned gamma calibration across restarts.
+    #[serde(default)]
+    pub gamma_calibrator: crate::market_maker::adaptive::OnlineBayesianGammaCalibrator,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -820,6 +824,7 @@ mod tests {
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
+            gamma_calibrator: Default::default(),
         };
 
         // Serialize to JSON
@@ -921,6 +926,7 @@ mod tests {
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
+            gamma_calibrator: Default::default(),
         };
 
         // Serialize to JSON
@@ -976,6 +982,7 @@ mod tests {
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
+            gamma_calibrator: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -1020,6 +1027,7 @@ mod tests {
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
+            gamma_calibrator: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");

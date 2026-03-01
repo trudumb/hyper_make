@@ -97,7 +97,9 @@
       "Bash(sed:*)",
       "Bash(rustup show:*)",
       "Bash(RUST_LOG=\"market_maker=info\" timeout 45 ./target/debug/market_maker:*)",
-      "Bash(env:*)"
+      "Bash(env:*)",
+      "Bash(pkill:*)",
+      "Bash(./target/debug/market_maker:*)"
     ]
   }
 }

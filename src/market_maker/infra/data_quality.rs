@@ -266,6 +266,16 @@ impl DataQualityMonitor {
         }
     }
 
+    /// Mark that data was received for a symbol (updates freshness timestamp).
+    ///
+    /// Called from AllMids handler to keep per-asset staleness fresh even when
+    /// L2Book/Trades arrive infrequently. Without this, low-volume assets trigger
+    /// spurious stale-data reconnections every ~50s despite valid AllMids flow.
+    pub fn mark_data_received(&mut self, symbol: &str) {
+        self.last_update_times
+            .insert(symbol.to_string(), Instant::now());
+    }
+
     /// Update cached BBO (best bid/ask) for the given asset.
     ///
     /// Called from L2 book handler to keep BBO in sync for quote gating.

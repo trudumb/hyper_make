@@ -129,11 +129,11 @@ impl Default for CentralBeliefConfig {
     fn default() -> Self {
         Self {
             dir_prior_variance: 4.0,
-            dir_process_noise_rate: 0.4,
+            dir_process_noise_rate: 0.15,
             dir_noise_price: 1.0,
-            dir_noise_fill: 4.0,
+            dir_noise_fill: 16.0,
             dir_noise_as: 2.5,
-            dir_noise_flow: 2.0,
+            dir_noise_flow: 1.0,
             dir_noise_burst: 0.5,
             dir_max_z_ratio: 4.0,
             dir_min_variance_frac: 0.01,

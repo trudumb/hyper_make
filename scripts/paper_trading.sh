@@ -7,15 +7,18 @@
 #   ./scripts/paper_trading.sh BTC 300                 # 5 minute simulation
 #   ./scripts/paper_trading.sh BTC 3600 --report       # 1 hour with calibration report
 #   ./scripts/paper_trading.sh BTC 300 --verbose       # With verbose logging
-#   ./scripts/paper_trading.sh HYPE 3600 --dashboard    # With live dashboard
+#   ./scripts/paper_trading.sh HYPE 1200 --dex hyna    # HIP-3 DEX paper trading
+#   ./scripts/paper_trading.sh HYPE 3600 --dex hyna --capture  # HIP-3 with capture
 #   ./scripts/paper_trading.sh BTC 300 --capture       # With dashboard + screenshot capture
 #
 # Options:
-#   --report    Generate calibration report at end
-#   --verbose   Enable verbose logging
-#   --testnet   Use testnet instead of mainnet data
-#   --dashboard Enable live dashboard at http://localhost:3000
-#   --capture   Enable dashboard screenshots for Claude vision (implies --dashboard)
+#   --report              Generate calibration report at end
+#   --verbose             Enable verbose logging
+#   --testnet             Use testnet instead of mainnet data
+#   --dex <name>          HIP-3 DEX name (e.g., hyna, flx). Auto-sets spread profile to hip3.
+#   --spread-profile <p>  Spread profile: default, hip3, aggressive (auto-set with --dex)
+#   --dashboard           Enable live dashboard at http://localhost:3000
+#   --capture             Enable dashboard screenshots for Claude vision (implies --dashboard)
 #
 # Screenshot Capture:
 #   When --capture is enabled:
@@ -49,8 +52,17 @@ DASHBOARD=false
 CAPTURE=false
 PAPER_MODE=true
 METRICS_PORT=9090
+DEX=""
+SPREAD_PROFILE="default"
 
-for arg in "$@"; do
+# Parse flags (supports both --flag and --key value)
+SKIP_NEXT=false
+for i in $(seq 1 $#); do
+    if [ "$SKIP_NEXT" = true ]; then
+        SKIP_NEXT=false
+        continue
+    fi
+    arg="${!i}"
     case $arg in
         --report)
             REPORT=true
@@ -70,6 +82,20 @@ for arg in "$@"; do
             ;;
         --no-paper-mode)
             PAPER_MODE=false
+            ;;
+        --dex)
+            NEXT=$((i + 1))
+            DEX="${!NEXT}"
+            SKIP_NEXT=true
+            # Auto-set spread profile for HIP-3 DEX
+            if [ "$SPREAD_PROFILE" = "default" ]; then
+                SPREAD_PROFILE="hip3"
+            fi
+            ;;
+        --spread-profile)
+            NEXT=$((i + 1))
+            SPREAD_PROFILE="${!NEXT}"
+            SKIP_NEXT=true
             ;;
     esac
 done
@@ -100,6 +126,10 @@ echo ""
 echo -e "Mode:      ${CYAN}SIMULATION${NC} (no real orders)"
 echo -e "Network:   ${GREEN}${NETWORK}${NC} (data source)"
 echo -e "Asset:     ${GREEN}${ASSET}${NC}"
+if [ -n "$DEX" ]; then
+    echo -e "DEX:       ${GREEN}${DEX}${NC} (HIP-3)"
+    echo -e "Profile:   ${GREEN}${SPREAD_PROFILE}${NC}"
+fi
 echo -e "Duration:  ${GREEN}${DURATION}s${NC}"
 echo -e "Output:    ${GREEN}${OUTPUT_DIR}${NC}"
 if [ "$DASHBOARD" = true ]; then
@@ -147,8 +177,18 @@ fi
 CLI_ARGS="--asset ${ASSET}"
 PAPER_ARGS="--duration ${DURATION}"
 
-if [ "$NETWORK" = "testnet" ]; then
-    CLI_ARGS="${CLI_ARGS} --network testnet"
+# Use market_maker_live.toml if it exists (same as test_mainnet.sh)
+if [ -f "market_maker_live.toml" ]; then
+    CLI_ARGS="${CLI_ARGS} --config market_maker_live.toml"
+elif [ -f "market_maker.toml" ]; then
+    CLI_ARGS="${CLI_ARGS} --config market_maker.toml"
+fi
+
+# Always pass --network (default config defaults to testnet otherwise!)
+CLI_ARGS="${CLI_ARGS} --network ${NETWORK}"
+
+if [ -n "$DEX" ]; then
+    CLI_ARGS="${CLI_ARGS} --dex ${DEX} --spread-profile ${SPREAD_PROFILE}"
 fi
 if [ "$DASHBOARD" = true ]; then
     CLI_ARGS="${CLI_ARGS} --metrics-port ${METRICS_PORT}"

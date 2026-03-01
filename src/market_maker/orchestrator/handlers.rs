@@ -133,6 +133,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         if result.is_some() {
+            // AllMids contains a valid mid for our asset — mark data as fresh.
+            // This prevents spurious per-asset staleness on low-volume assets where
+            // L2Book/Trades arrive infrequently but AllMids flows every 1-3s.
+            self.infra
+                .data_quality
+                .mark_data_received(&self.config.asset);
+
             // Update learning module with current mid for prediction scoring
             self.learning.update_mid(self.latest_mid);
 
@@ -529,6 +536,32 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     self.strategy.record_kelly_win(fill_pnl_bps);
                 } else if fill_pnl_bps < 0.0 {
                     self.strategy.record_kelly_loss(-fill_pnl_bps); // loss as positive magnitude
+                }
+
+                // === Online Bayesian Gamma Calibration ===
+                // Feed fill outcome to RLS calibrator for beta coefficient learning.
+                // Uses cached features/gamma from most recent quote cycle (~5s ago).
+                if let Some((features, gamma_used)) = self.stochastic.last_gamma_cache {
+                    self.stochastic
+                        .gamma_calibrator
+                        .update(&features, gamma_used, fill_pnl_bps);
+                    // Periodically apply calibrated betas to the risk model
+                    // (every 50 fills, after warmup)
+                    if self.stochastic.gamma_calibrator.is_warmed_up()
+                        && self
+                            .stochastic
+                            .gamma_calibrator
+                            .n_samples
+                            .is_multiple_of(50)
+                    {
+                        let calibrated = self.stochastic.gamma_calibrator.effective_betas();
+                        self.strategy.apply_calibrated_gamma_betas(&calibrated);
+                        tracing::info!(
+                            n_samples = self.stochastic.gamma_calibrator.n_samples,
+                            blend = %format!("{:.2}", self.stochastic.gamma_calibrator.blend_ratio()),
+                            "[GAMMA CAL] applied calibrated betas to risk model"
+                        );
+                    }
                 }
 
                 tracing::info!(
@@ -2180,12 +2213,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     ///
     /// This replaces the periodic REST polling in `refresh_exchange_limits`.
     /// Updates position limits (max long/short) and available margin in real-time.
+    ///
+    /// In paper mode, this is skipped to preserve synthetic capacity. The WS
+    /// carries real account data (often $0 available) that would overwrite the
+    /// paper-initialized limits, causing the oscillation bug where every other
+    /// cycle sees `available_bids=0, available_asks=0`.
     fn handle_active_asset_data(
         &mut self,
         active_asset_data: crate::ws::message_types::ActiveAssetData,
     ) -> Result<()> {
         // Filter to our asset (should already match since we subscribed per-coin)
         if active_asset_data.data.coin != *self.config.asset {
+            return Ok(());
+        }
+
+        // In paper mode, exchange limits are synthetically initialized.
+        // Real ActiveAssetData would overwrite synthetic capacity with real
+        // account data (often $0 available), causing the oscillation bug.
+        if self.infra.exchange_limits.is_paper_mode() {
             return Ok(());
         }
 
@@ -2212,6 +2257,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     ///
     /// This replaces the periodic REST polling in `refresh_margin_state` and `sync_position_from_exchange`.
     fn handle_web_data2(&mut self, web_data2: crate::ws::message_types::WebData2) -> Result<()> {
+        // In paper mode, margin state is synthetically seeded via with_paper_balance().
+        // Real WebData2 would overwrite the synthetic $1000 paper balance with the
+        // real account's margin data (possibly $0), breaking kill switch limits.
+        if self.infra.exchange_limits.is_paper_mode() {
+            return Ok(());
+        }
+
         // Note: web_data2.data does not contain 'user', so we assume it matches our subscription.
 
         let state = &web_data2.data.clearinghouse_state;

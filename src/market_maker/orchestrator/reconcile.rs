@@ -2355,27 +2355,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.effective_max_position
             };
 
-            // Sum resting order exposure by side
-            let resting_bid_size: f64 = self
-                .orders
-                .get_all_by_side(Side::Buy)
-                .iter()
-                .map(|o| o.remaining())
-                .sum();
-            let resting_ask_size: f64 = self
-                .orders
-                .get_all_by_side(Side::Sell)
-                .iter()
-                .map(|o| o.remaining())
-                .sum();
-
-            // Proposed new exposure from target levels
+            // Proposed exposure from target levels (the desired final state).
+            // The reconciler will REPLACE resting orders with proposed — not add
+            // on top. Using resting + proposed double-counts and causes oscillation:
+            // cycle N places 14 levels, cycle N+1 sees 14 resting + proposed > max,
+            // trims to 0, cancels everything, cycle N+2 places 14 again.
             let proposed_bid_size: f64 = bid_levels.iter().map(|l| l.size).sum();
             let proposed_ask_size: f64 = ask_levels.iter().map(|l| l.size).sum();
 
-            // Worst case: all resting + all proposed fill simultaneously
-            let worst_long = current_pos + resting_bid_size + proposed_bid_size;
-            let worst_short = -current_pos + resting_ask_size + proposed_ask_size;
+            // Worst case: current position + all proposed fill simultaneously
+            let worst_long = current_pos + proposed_bid_size;
+            let worst_short = -current_pos + proposed_ask_size;
 
             // Trim bids if worst-case long exceeds max
             if worst_long > max_pos && !bid_levels.is_empty() {

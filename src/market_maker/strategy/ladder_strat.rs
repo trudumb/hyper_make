@@ -907,11 +907,35 @@ impl LadderStrategy {
         // Options-theoretic volatility floor (from market_params, computed by quote_engine).
         let option_floor_bps = market_params.option_floor_bps;
 
-        let effective_floor_bps = fee_bps
+        let physical_floor_bps = fee_bps
             .max(tick_floor_bps)
             .max(latency_floor_bps)
             .max(self.risk_config.min_spread_floor * 10_000.0)
             .max(option_floor_bps);
+
+        // === BAYESIAN SPREAD FLOOR: Widen when model parameters are uncertain ===
+        // Delta method: propagate posterior uncertainty through GLFT formula.
+        // σ²_δ = (∂δ/∂κ)² × Var[κ] + (∂δ/∂σ)² × Var[σ]
+        // Spread floor = physical_floor + z_α × σ_δ, z_α=0.674 for P(edge>0)≥75%
+        let bayesian_floor_bps =
+            if market_params.kappa_variance > 0.0 && kappa > 1.0 && gamma > 1e-6 {
+                let d_delta_d_kappa = -1.0 / (kappa * (kappa + gamma));
+                let spread_var_from_kappa =
+                    d_delta_d_kappa.powi(2) * market_params.kappa_variance * (10_000.0_f64).powi(2);
+                // Sigma uncertainty: conservative 10% CV heuristic
+                let sigma_cv = 0.10;
+                let d_delta_d_sigma = gamma * market_params.sigma * 1.0; // T≈1s
+                let spread_var_from_sigma =
+                    (d_delta_d_sigma * sigma_cv * market_params.sigma * 10_000.0).powi(2);
+                let spread_std_bps = (spread_var_from_kappa + spread_var_from_sigma).sqrt();
+                const P_THRESHOLD_Z: f64 = 0.674; // z for P(edge>0) ≥ 75%
+                physical_floor_bps + P_THRESHOLD_Z * spread_std_bps
+            } else {
+                physical_floor_bps
+            };
+
+        // Use Bayesian floor but cap at 25 bps to prevent absurd floors
+        let effective_floor_bps = physical_floor_bps.max(bayesian_floor_bps).min(25.0);
 
         let params = LadderParams {
             mid_price: effective_mid,
@@ -980,6 +1004,11 @@ impl LadderStrategy {
         // - dynamic_spread_ceiling_bps: From fill rate controller + market spread p80
         //
         // This replaces arbitrary hardcoded values with principled model-driven bounds.
+
+        // Symmetric kappa: κ is a structural order book parameter. Directional adjustment
+        // is handled by the drift depth adjustment δ ± μT/2 (Avellaneda-Stoikov), which is
+        // mathematically equivalent to asymmetric fill rates under the exponential model.
+        // Adjusting kappa per-side would double-count.
         let mut dynamic_depths = if market_params.use_dynamic_bounds {
             // Use model-driven bounds from Bayesian estimation
             self.depth_generator.compute_depths_with_dynamic_bounds(
@@ -1221,6 +1250,7 @@ impl LadderStrategy {
                 self_impact_bps: 0.0, // self impact handled by actuary later
                 inventory_beta: self.risk_model.beta_inventory,
                 continuation_gamma_mult: cont_gamma_mult,
+                kappa_variance: market_params.kappa_variance,
             };
 
             let mut ask_params = bid_params.clone();
@@ -1407,57 +1437,63 @@ impl LadderStrategy {
                 market_params.kill_switch_headroom,
                 market_params.adaptive_warmup_progress,
             );
-            let usable_margin = available_margin * margin_utilization;
+            let usable_margin =
+                available_margin * margin_utilization * market_params.warmup_size_mult;
 
-            // === TWO-SIDED MARGIN ALLOCATION (GLFT-DERIVED, GAMMA-SCALED) ===
-            // Principled analog of GLFT inventory penalty in capital domain.
-            // Asymmetry scales with: inventory ratio, risk aversion (gamma), and urgency.
-            //
-            // asymmetry = |q_ratio| × BASE_SCALE × gamma_mult × (1 + urgency × 0.5)
-            // Bounds [0.15, 0.85] prevent total starvation (exchange min-notional).
-            const BASE_SCALE: f64 = 0.3; // at q=1.0, base asymmetry → 80/20
-            const GAMMA_REFERENCE: f64 = 1.0; // Normal regime reference
-
-            let p_down = market_params.prob_bearish;
-
-            // q_ratio: normalized inventory from bid/ask budget asymmetry
-            let q_ratio = if market_params.dynamic_max_position > 0.0 {
-                (market_params.available_bid_budget - market_params.available_ask_budget)
-                    / (2.0 * market_params.dynamic_max_position)
+            // === CARTEA-JAIMUNGAL OPTIMAL INVENTORY TARGET (SNR-SCALED) ===
+            // Bayesian inventory target: q* = q_max × tanh(SNR / SNR_scale) × sign(drift)
+            // where SNR = |drift_raw_bps| / drift_uncertainty_bps.
+            // When SNR is low (uncertain drift), q* → 0 (symmetric quoting).
+            // When SNR is high (confident drift), q* → q_max (full tilt).
+            // This replaces the old γσ²-based formula which saturated at ±0.5 in 99.7% of cycles.
+            let gamma_market = self.effective_gamma(market_params, 0.0, effective_max_position);
+            let drift_snr = if market_params.drift_uncertainty_bps > 1e-6 {
+                let drift_bps = market_params.drift_rate_per_sec_raw * 10_000.0;
+                drift_bps / market_params.drift_uncertainty_bps
             } else {
                 0.0
-            }
-            .clamp(-1.0, 1.0);
+            };
+            const SNR_SCALE: f64 = 2.0; // 2-sigma drift → ~76% of q_max
+            let q_target = 0.5 * (drift_snr / SNR_SCALE).tanh();
+            // q_target is already signed via drift_snr (drift_bps preserves sign)
 
-            // Gamma modulation: higher gamma → more aggressive mean-reversion
-            let gamma_mult =
-                (market_params.regime_gamma_multiplier / GAMMA_REFERENCE).clamp(0.5, 2.0);
+            let q_current = if effective_max_position > EPSILON {
+                (position / effective_max_position).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
 
-            // Urgency: when drift opposes position, boost reduction allocation
-            // drift_sign > 0 = bearish, q_ratio > 0 = long → same sign = drift hurts position
-            let drift_sign = if p_down > 0.5 { 1.0 } else { -1.0 };
-            let opposition = drift_sign * q_ratio.signum();
-            let drift_confidence = market_params.belief_confidence;
-            let urgency = (opposition * drift_confidence).clamp(0.0, 1.0);
+            // SNR already encodes confidence via drift_uncertainty (incorporates
+            // observation count and Kalman posterior variance). No drift_conf scaling needed.
+            let drift_conf = market_params.belief_confidence; // Kept for observability
+            let effective_q_target = q_target;
+            let delta_q = effective_q_target - q_current;
 
-            let asymmetry = q_ratio.abs() * BASE_SCALE * gamma_mult * (1.0 + urgency * 0.5);
-            let inv_factor = (q_ratio.signum() * asymmetry).clamp(-0.35, 0.35);
+            // tanh: principled saturation (smooth, sign-preserving, derivative=1 near 0)
+            let cj_allocation = (delta_q * 2.0).tanh() * 0.35;
 
-            let ask_margin_weight = (0.5 + inv_factor).clamp(0.15, 0.85);
+            let ask_margin_weight = (0.5 - cj_allocation).clamp(0.15, 0.85);
             let bid_margin_weight = 1.0 - ask_margin_weight;
             let margin_for_bids = usable_margin * bid_margin_weight;
             let margin_for_asks = usable_margin * ask_margin_weight;
 
             info!(
                 usable_margin = %format!("{:.2}", usable_margin),
-                p_down = %format!("{:.3}", p_down),
-                q_ratio = %format!("{:.3}", q_ratio),
-                gamma_mult = %format!("{:.2}", gamma_mult),
-                urgency = %format!("{:.3}", urgency),
+                warmup_size_mult = %format!("{:.3}", market_params.warmup_size_mult),
+                gamma_market = %format!("{:.4}", gamma_market),
+                gamma_spread = %format!("{:.4}", gamma),
+                drift_raw_bps = %format!("{:.2}", market_params.drift_rate_per_sec_raw * 10_000.0),
+                drift_shrunken_bps = %format!("{:.2}", market_params.drift_rate_per_sec * 10_000.0),
+                drift_snr = %format!("{:.2}", drift_snr),
+                q_target = %format!("{:.4}", q_target),
+                q_current = %format!("{:.4}", q_current),
+                drift_conf = %format!("{:.3}", drift_conf),
+                delta_q = %format!("{:.4}", delta_q),
+                cj_allocation = %format!("{:.4}", cj_allocation),
                 bid_margin_weight = %format!("{:.3}", bid_margin_weight),
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
-                "Margin allocation (GLFT-derived, gamma-scaled)"
+                "Margin allocation (Cartea-Jaimungal SNR-scaled inventory)"
             );
 
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
@@ -2618,7 +2654,15 @@ impl LadderStrategy {
                         5,
                         config.decimals,
                     );
-                    let bid_size = quantum.min_viable_size;
+                    // Recompute min viable size at actual quote price to avoid notional
+                    // violation when price drifts below quantum's stale mark_px.
+                    let bid_size = if bid_price > 0.0 {
+                        let raw_min = quantum.min_notional / bid_price;
+                        let steps = (raw_min / quantum.step).ceil() as u64;
+                        (steps as f64 * quantum.step).max(quantum.min_viable_size)
+                    } else {
+                        quantum.min_viable_size
+                    };
 
                     if bid_size > 0.0 && bid_price > 0.0 {
                         ladder.bids.push(LadderLevel {
@@ -2647,7 +2691,15 @@ impl LadderStrategy {
                         5,
                         config.decimals,
                     );
-                    let ask_size = quantum.min_viable_size;
+                    // Ask price is above microprice, so quantum.min_viable_size is safe.
+                    // But recompute for symmetry and future-proofing.
+                    let ask_size = if ask_price > 0.0 {
+                        let raw_min = quantum.min_notional / ask_price;
+                        let steps = (raw_min / quantum.step).ceil() as u64;
+                        (steps as f64 * quantum.step).max(quantum.min_viable_size)
+                    } else {
+                        quantum.min_viable_size
+                    };
 
                     if ask_size > 0.0 && ask_price > 0.0 {
                         ladder.asks.push(LadderLevel {
@@ -2762,6 +2814,30 @@ impl QuotingStrategy for LadderStrategy {
             None
         }
     }
+
+    fn gamma_features_cache(
+        &self,
+        market_params: &MarketParams,
+        position: f64,
+        max_position: f64,
+    ) -> Option<([f64; 15], f64)> {
+        let features = RiskFeatures::from_params(
+            market_params,
+            position,
+            max_position,
+            &self.risk_model_config,
+        );
+        let gamma = self.risk_model.compute_gamma_with_policy(
+            &features,
+            market_params.capital_tier,
+            market_params.capital_policy.warmup_gamma_max_inflation,
+        );
+        Some((features.as_array(), gamma))
+    }
+
+    fn apply_calibrated_gamma_betas(&mut self, betas: &[f64; 15]) {
+        self.risk_model.apply_calibrated_betas(betas);
+    }
 }
 
 // ============================================================================
@@ -2872,119 +2948,116 @@ fn adverse_selection_at_depth(depth_bps: f64, params: &LadderParams) -> f64 {
 mod tests {
     use super::*;
 
-    /// Compute GLFT-derived, gamma-scaled margin split.
-    /// q_ratio: normalized inventory [-1, 1] (positive = more bid budget = long)
-    /// gamma_mult: regime gamma multiplier (1.0 = Normal)
-    /// drift_direction: +1.0 bearish, -1.0 bullish
-    /// drift_confidence: belief confidence [0, 1]
+    /// Compute Cartea-Jaimungal margin allocation (SNR-scaled).
+    /// q* = 0.5 × tanh(SNR / SNR_SCALE), where SNR = |drift_bps| / uncertainty_bps.
+    /// drift_rate is in fraction/sec, uncertainty_bps is the Kalman posterior √P.
     /// Returns (bid_weight, ask_weight).
-    fn compute_posterior_margin_split(
-        q_ratio: f64,
-        gamma_mult: f64,
-        drift_direction: f64,
-        drift_confidence: f64,
+    fn compute_cj_margin_split(
+        drift_rate: f64,
+        _gamma: f64,
+        _sigma: f64,
+        position: f64,
+        max_position: f64,
+        uncertainty_bps: f64,
     ) -> (f64, f64) {
-        const BASE_SCALE: f64 = 0.3;
-        const GAMMA_REFERENCE: f64 = 1.0;
-
-        let gamma_m = (gamma_mult / GAMMA_REFERENCE).clamp(0.5, 2.0);
-        let opposition = drift_direction * q_ratio.signum();
-        let urgency = (opposition * drift_confidence).clamp(0.0, 1.0);
-        let asymmetry = q_ratio.abs() * BASE_SCALE * gamma_m * (1.0 + urgency * 0.5);
-        let inv_factor = (q_ratio.signum() * asymmetry).clamp(-0.35, 0.35);
-        let ask_w = (0.5 + inv_factor).clamp(0.15, 0.85);
+        let drift_snr = if uncertainty_bps > 1e-6 {
+            let drift_bps = drift_rate * 10_000.0;
+            drift_bps / uncertainty_bps
+        } else {
+            0.0
+        };
+        const SNR_SCALE: f64 = 2.0;
+        let q_target = 0.5 * (drift_snr / SNR_SCALE).tanh();
+        let q_current = if max_position > 1e-10 {
+            (position / max_position).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let effective_q_target = q_target;
+        let delta_q = effective_q_target - q_current;
+        let cj_allocation = (delta_q * 2.0).tanh() * 0.35;
+        let ask_w = (0.5 - cj_allocation).clamp(0.15, 0.85);
         let bid_w = 1.0 - ask_w;
         (bid_w, ask_w)
     }
 
     #[test]
-    fn test_margin_split_neutral_is_equal() {
-        // q_ratio=0 → 50/50 regardless of other params
-        let (bid_w, ask_w) = compute_posterior_margin_split(0.0, 1.0, 1.0, 0.5);
-        assert!(
-            (bid_w - 0.5).abs() < 1e-10,
-            "Flat should be 50/50: bid={bid_w}"
-        );
-        assert!(
-            (ask_w - 0.5).abs() < 1e-10,
-            "Flat should be 50/50: ask={ask_w}"
-        );
-
-        // Even with extreme gamma, flat position → 50/50
-        let (bid_w2, ask_w2) = compute_posterior_margin_split(0.0, 2.0, -1.0, 1.0);
-        assert!((bid_w2 - 0.5).abs() < 1e-10);
-        assert!((ask_w2 - 0.5).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_margin_split_scales_with_inventory() {
-        // q_ratio=0.5, gamma=1.0, no urgency (drift aligns with position)
-        let (bid_w, ask_w) = compute_posterior_margin_split(0.5, 1.0, -1.0, 0.0);
-        // asymmetry = 0.5 * 0.3 * 1.0 * 1.0 = 0.15 → ask_w = 0.65
-        assert!(
-            (ask_w - 0.65).abs() < 0.01,
-            "50% long should give ~65/35 ask-heavy: bid={bid_w:.3}, ask={ask_w:.3}"
-        );
-    }
-
-    #[test]
-    fn test_margin_split_gamma_modulates() {
-        // Same inventory, different gamma
-        let (_, ask_low) = compute_posterior_margin_split(0.5, 0.5, -1.0, 0.0);
-        let (_, ask_mid) = compute_posterior_margin_split(0.5, 1.0, -1.0, 0.0);
-        let (_, ask_high) = compute_posterior_margin_split(0.5, 2.0, -1.0, 0.0);
-        assert!(ask_high > ask_mid, "Higher gamma should be more asymmetric");
-        assert!(ask_mid > ask_low, "Lower gamma should be less asymmetric");
-    }
-
-    #[test]
-    fn test_margin_split_urgency_boosts_reduction() {
-        // Long position + bearish drift + high confidence → stronger ask allocation
-        let (_, ask_no_urgency) = compute_posterior_margin_split(0.5, 1.0, -1.0, 0.0);
-        let (_, ask_urgency) = compute_posterior_margin_split(0.5, 1.0, 1.0, 0.8);
-        assert!(
-            ask_urgency > ask_no_urgency,
-            "Urgency should boost ask allocation: no_urgency={ask_no_urgency:.3}, urgency={ask_urgency:.3}"
-        );
-    }
-
-    #[test]
-    fn test_margin_split_extreme_clamped() {
-        // q_ratio=1.0, max gamma, max urgency → clamped at 85/15
-        let (bid_w, ask_w) = compute_posterior_margin_split(1.0, 2.0, 1.0, 1.0);
-        assert!(
-            ask_w <= 0.85 + 1e-10,
-            "Should be clamped at 0.85: ask={ask_w}"
-        );
-        assert!(
-            bid_w >= 0.15 - 1e-10,
-            "Should be clamped at 0.15: bid={bid_w}"
-        );
-        // Never 100/0
-        assert!(
-            bid_w > 0.1,
-            "Minority side must never be starved: bid={bid_w}"
-        );
-    }
-
-    #[test]
-    fn test_margin_split_bearish_favors_asks() {
-        // Long position (q_ratio > 0) means bid budget > ask budget → long position
-        // The system should allocate more to asks to reduce
-        let (bid_w, ask_w) = compute_posterior_margin_split(0.5, 1.0, 1.0, 0.5);
-        assert!(
-            ask_w > bid_w,
-            "Long + bearish should favor asks: bid={bid_w:.3}, ask={ask_w:.3}"
-        );
-    }
-
-    #[test]
-    fn test_margin_split_bullish_favors_bids() {
-        // Short position (q_ratio < 0) with bullish drift → reduce short
-        let (bid_w, ask_w) = compute_posterior_margin_split(-0.5, 1.0, -1.0, 0.5);
+    fn test_cj_margin_bullish_flat_favors_bids() {
+        // Positive drift (10 bps/s), uncertainty=1 bps → SNR=10 → strong signal → favor bids
+        let (bid_w, ask_w) = compute_cj_margin_split(0.001, 0.0, 0.0, 0.0, 10.0, 1.0);
         assert!(
             bid_w > ask_w,
-            "Short + bullish should favor bids: bid={bid_w:.3}, ask={ask_w:.3}"
+            "Bullish + flat should favor bids: bid={bid_w:.3}, ask={ask_w:.3}"
+        );
+    }
+
+    #[test]
+    fn test_cj_margin_bearish_flat_favors_asks() {
+        // Negative drift (-10 bps/s), uncertainty=1 bps → SNR=-10 → favor asks
+        let (bid_w, ask_w) = compute_cj_margin_split(-0.001, 0.0, 0.0, 0.0, 10.0, 1.0);
+        assert!(
+            ask_w > bid_w,
+            "Bearish + flat should favor asks: bid={bid_w:.3}, ask={ask_w:.3}"
+        );
+    }
+
+    #[test]
+    fn test_cj_margin_no_drift_long_mean_reverts() {
+        // No drift, long position → SNR=0 → q_target=0, q_current>0 → mean-revert to asks
+        let (bid_w, ask_w) = compute_cj_margin_split(0.0, 0.0, 0.0, 5.0, 10.0, 1.0);
+        assert!(
+            ask_w > bid_w,
+            "No drift + long should mean-revert (favor asks): bid={bid_w:.3}, ask={ask_w:.3}"
+        );
+    }
+
+    #[test]
+    fn test_cj_margin_high_uncertainty_attenuates_drift() {
+        // High uncertainty (100 bps) attenuates drift (10 bps/s) → SNR=0.1 → near-zero q_target
+        // Long position → mean-reverts
+        let (bid_w_high_unc, ask_w_high_unc) =
+            compute_cj_margin_split(0.001, 0.0, 0.0, 5.0, 10.0, 100.0);
+        assert!(
+            ask_w_high_unc > bid_w_high_unc,
+            "High uncertainty + long should mean-revert: bid={bid_w_high_unc:.3}, ask={ask_w_high_unc:.3}"
+        );
+
+        // Low uncertainty (0.5 bps) → SNR=20 → strong bullish → overrides mean-reversion
+        let (bid_w_low_unc, _) = compute_cj_margin_split(0.001, 0.0, 0.0, 5.0, 10.0, 0.5);
+        // Lower uncertainty should allocate more to bids (drift direction)
+        assert!(
+            bid_w_low_unc > bid_w_high_unc,
+            "Lower uncertainty should allocate more to drift direction"
+        );
+    }
+
+    #[test]
+    fn test_cj_margin_at_optimal_is_balanced() {
+        // SNR-scaled: drift=0.0002 (2 bps/s), uncertainty=1 bps → SNR=2 → q_target≈0.38
+        // Position at 38% of max → q_current=0.38, Δq≈0 → balanced
+        // q_target = 0.5 * tanh(2/2) = 0.5 * tanh(1) ≈ 0.5 * 0.762 = 0.381
+        let (bid_w, ask_w) = compute_cj_margin_split(0.0002, 0.0, 0.0, 3.81, 10.0, 1.0);
+        assert!(
+            (bid_w - 0.5).abs() < 0.05,
+            "At optimal inventory should be ~balanced: bid={bid_w:.3}, ask={ask_w:.3}"
+        );
+        assert!(
+            (ask_w - 0.5).abs() < 0.05,
+            "At optimal inventory should be ~balanced: bid={bid_w:.3}, ask={ask_w:.3}"
+        );
+    }
+
+    #[test]
+    fn test_cj_margin_extreme_clamped() {
+        // Extreme drift (10000 bps/s), tiny uncertainty → huge SNR → tanh saturates at 0.5
+        // Then cj_allocation saturated → clamped at 85/15
+        let (bid_w, ask_w) = compute_cj_margin_split(1.0, 0.0, 0.0, 0.0, 10.0, 0.001);
+        assert!(bid_w <= 0.85 + 1e-10, "Should be clamped: bid={bid_w}");
+        assert!(ask_w >= 0.15 - 1e-10, "Should be clamped: ask={ask_w}");
+        // Never 100/0
+        assert!(
+            ask_w > 0.1,
+            "Minority side must never be starved: ask={ask_w}"
         );
     }
 

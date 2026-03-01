@@ -248,6 +248,7 @@ mod tests {
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
+            gamma_calibrator: Default::default(),
         }
     }
 

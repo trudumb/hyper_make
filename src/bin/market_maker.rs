@@ -2873,7 +2873,7 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         AdverseSelectionConfig::default(),
         QueueConfig::default(),
         LiquidationConfig::default(),
-        KillSwitchConfig::default(),
+        KillSwitchConfig::for_capital(paper_balance),
         HawkesConfig::default(),
         FundingConfig::default(),
         SpreadConfig::default(),

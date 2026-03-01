@@ -168,6 +168,28 @@ pub trait QuotingStrategy: Send + Sync {
     fn kelly_fraction(&self) -> Option<f64> {
         None // Default: Kelly disabled
     }
+
+    /// Compute and return cached risk features and gamma for Bayesian gamma calibration.
+    ///
+    /// Strategies with a `CalibratedRiskModel` implement this to provide the feature
+    /// vector and gamma used during the most recent quoting cycle. These are fed to
+    /// `OnlineBayesianGammaCalibrator` at markout resolution time.
+    fn gamma_features_cache(
+        &self,
+        _market_params: &MarketParams,
+        _position: f64,
+        _max_position: f64,
+    ) -> Option<([f64; 15], f64)> {
+        None // Default: no gamma calibration support
+    }
+
+    /// Apply calibrated betas from `OnlineBayesianGammaCalibrator` to the risk model.
+    ///
+    /// Strategies with a `CalibratedRiskModel` implement this to update their beta
+    /// coefficients with learned values from the online calibrator.
+    fn apply_calibrated_gamma_betas(&mut self, _betas: &[f64; 15]) {
+        // Default: no-op for strategies without calibrated risk models
+    }
 }
 
 /// Blanket implementation for Box<dyn QuotingStrategy>.
@@ -240,6 +262,19 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
 
     fn kelly_fraction(&self) -> Option<f64> {
         (**self).kelly_fraction()
+    }
+
+    fn gamma_features_cache(
+        &self,
+        market_params: &MarketParams,
+        position: f64,
+        max_position: f64,
+    ) -> Option<([f64; 15], f64)> {
+        (**self).gamma_features_cache(market_params, position, max_position)
+    }
+
+    fn apply_calibrated_gamma_betas(&mut self, betas: &[f64; 15]) {
+        (**self).apply_calibrated_gamma_betas(betas)
     }
 }
 

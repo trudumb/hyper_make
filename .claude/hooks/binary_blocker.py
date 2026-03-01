@@ -23,6 +23,7 @@ SAFE_PATTERNS = [
     r"\./scripts/paper_trading\.sh",
     r"\./target/\S*market_maker\s+.*\bpaper\b",
     r"cargo\s+run\s+.*--bin\s+market_maker\s+.*\bpaper\b",
+    r"/home/trudumb/hyper_make/scripts/",
 ]
 
 

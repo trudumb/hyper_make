@@ -247,6 +247,17 @@ impl ParameterAggregator {
                     1.0 // Default high uncertainty
                 }
             },
+            // Derive Var[κ] from 95% CI (normal approximation to posterior):
+            // std = (upper - lower) / (2 * 1.96), variance = std²
+            kappa_variance: {
+                let (ci_lower, ci_upper) = est.hierarchical_kappa_ci_95();
+                if ci_upper > ci_lower {
+                    let kappa_std = (ci_upper - ci_lower) / (2.0 * 1.96);
+                    (kappa_std * kappa_std).max(0.0)
+                } else {
+                    0.0
+                }
+            },
 
             // V3: Robust Kappa Orchestrator (outlier-resistant)
             kappa_robust: est.kappa_robust(),
@@ -575,6 +586,7 @@ impl ParameterAggregator {
                 }
             },
             adaptive_uncertainty_factor: sources.adaptive_spreads.warmup_uncertainty_factor(),
+            warmup_size_mult: 1.0, // Overwritten by quote_engine after prior blending
 
             // === Entropy-Based Distribution (always enabled) ===
             entropy_min_entropy: sources.stochastic_config.entropy_min_entropy,

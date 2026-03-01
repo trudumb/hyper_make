@@ -56,6 +56,7 @@ use crate::market_maker::estimator::{
 };
 use crate::market_maker::infra::{BinanceTradeUpdate, LeadLagSignal};
 use std::cell::Cell;
+use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 /// Signal availability state for cross-venue feeds.
@@ -604,6 +605,11 @@ pub struct SignalIntegrator {
     cusum_detector: crate::market_maker::estimator::lag_analysis::CusumDetector,
     /// Last CUSUM-detected divergence (bps), cleared when MI confirms.
     cusum_divergence_bps: f64,
+
+    /// MI-based signal attenuation factors from SignalHealthMonitor.
+    /// Updated each cycle by the orchestrator. Maps EdgeSignalKind → [0, 1].
+    /// 1.0 = healthy, 0.0 = stale. Applied as multiplicative gating on contributions.
+    mi_attenuation: Option<HashMap<crate::market_maker::edge::EdgeSignalKind, f64>>,
 }
 
 impl SignalIntegrator {
@@ -645,6 +651,7 @@ impl SignalIntegrator {
             logged_signal_state: Cell::new(false),
             cusum_detector: crate::market_maker::estimator::lag_analysis::CusumDetector::default(),
             cusum_divergence_bps: 0.0,
+            mi_attenuation: None,
             // A-S reservation price defaults
             as_sigma: 0.0002, // 2 bps/sec default
             as_gamma: 1.0,
@@ -863,6 +870,15 @@ impl SignalIntegrator {
         self.as_tau_s = tau_s;
     }
 
+    /// Set MI-based attenuation factors from SignalHealthMonitor.
+    /// Called each cycle by the orchestrator to keep signal gating current.
+    pub fn set_mi_attenuation(
+        &mut self,
+        factors: HashMap<crate::market_maker::edge::EdgeSignalKind, f64>,
+    ) {
+        self.mi_attenuation = Some(factors);
+    }
+
     /// Update buy pressure tracker with a trade observation.
     ///
     /// Should be called alongside existing trade handlers to maintain
@@ -1054,9 +1070,29 @@ impl SignalIntegrator {
         // This prevents multiplicative compounding: three 1.5x adjustments
         // give 2.5x (additive) instead of 3.375x (multiplicative).
         // Staleness multiplier is applied separately (remains multiplicative for safety).
-        let informed_excess = signals.informed_flow_spread_mult - 1.0;
-        let gating_excess = signals.gating_spread_mult - 1.0;
+        let mut informed_excess = signals.informed_flow_spread_mult - 1.0;
+        let mut gating_excess = signals.gating_spread_mult - 1.0;
         let cross_venue_excess = signals.cross_venue_spread_mult - 1.0;
+
+        // === MI-BASED SIGNAL GATING ===
+        // Attenuate signal contributions based on real-time mutual information health.
+        // Stale signals (MI << baseline) fade toward zero rather than hard-gated.
+        if let Some(ref factors) = self.mi_attenuation {
+            use crate::market_maker::edge::EdgeSignalKind;
+            // Lead-lag MI gates both skew and spread_mult from lead-lag path
+            if let Some(&ll_mi) = factors.get(&EdgeSignalKind::LeadLag) {
+                signals.lead_lag_skew_bps *= ll_mi;
+                signals.drift_signal_bps *= ll_mi;
+            }
+            // Adverse selection MI gates informed flow spread excess
+            if let Some(&as_mi) = factors.get(&EdgeSignalKind::AdverseSelection) {
+                informed_excess *= as_mi;
+            }
+            // Fill probability MI gates model gating excess
+            if let Some(&fp_mi) = factors.get(&EdgeSignalKind::FillProbability) {
+                gating_excess *= fp_mi;
+            }
+        }
 
         let total_excess_uncapped = informed_excess + gating_excess + cross_venue_excess;
         // Cap expressed as multiplier excess: max_spread_adjustment_bps / reference 10 bps

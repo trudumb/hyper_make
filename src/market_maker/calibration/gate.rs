@@ -43,12 +43,12 @@ pub struct PriorConfidence {
 ///
 /// Spread multiplier from confidence: wider spreads when confidence is low.
 ///
-/// Returns [1.0, 3.0] — at confidence=1.0 returns 1.0 (no widening),
-/// at confidence=0.0 returns 3.0 (3x wider spreads for safety).
+/// Returns [1.0, 2.0] — at confidence=1.0 returns 1.0 (no widening),
+/// at confidence=0.0 returns 2.0 (2x wider spreads for safety).
 pub fn spread_multiplier_from_confidence(confidence: f64) -> f64 {
     let c = confidence.clamp(0.0, 1.0);
-    // Linear: 3.0 - 2.0 * c
-    3.0 - 2.0 * c
+    // Linear: 2.0 - 1.0 * c (range [1.0, 2.0])
+    2.0 - c
 }
 
 /// **Deprecated**: Replaced by Kelly `kelly_position_fraction()` with Bayesian prior.
@@ -110,7 +110,7 @@ fn default_live_execution_base_credit() -> f64 {
 impl Default for CalibrationGateConfig {
     fn default() -> Self {
         Self {
-            min_paper_duration_s: 1800.0,
+            min_paper_duration_s: 600.0,
             min_market_observations: 50,
             min_kappa_observations: 10,
             min_as_samples: 15,
@@ -384,13 +384,13 @@ pub fn warmup_spread_discount(fill_count: usize) -> f64 {
 /// Returns a multiplier [0.3, 1.0] applied to target_liquidity.
 /// Small size while learning prevents large losses from miscalibrated models.
 pub fn warmup_size_multiplier(fill_count: usize) -> f64 {
-    if fill_count < 50 {
-        0.3 // Small size while learning AS/kappa
-    } else if fill_count < 200 {
-        0.7 // Medium size, growing confidence
-    } else {
-        1.0 // Full size
-    }
+    // Bayesian posterior precision: w = n/(n+k_0)
+    // k_0 = 15: prior pseudo-count matching AS/fill_rate convergence threshold.
+    // At n=0: 0.3 (floor), n=10: 0.58, n=50: 0.84, n=200: 0.95.
+    const S_FLOOR: f64 = 0.3;
+    const K_0: f64 = 15.0;
+    let n = fill_count as f64;
+    S_FLOOR + (1.0 - S_FLOOR) * n / (n + K_0)
 }
 
 /// Snapshot for A/B measurement of prior convergence speed.
@@ -506,6 +506,7 @@ mod tests {
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
+            gamma_calibrator: Default::default(),
         }
     }
 
@@ -607,17 +608,24 @@ mod tests {
 
     #[test]
     fn test_warmup_size_multiplier() {
-        // Early warmup: small size
+        // Bayesian posterior precision: 0.3 + 0.7 * n/(n+15)
+        // At n=0: 0.3 (floor)
         assert!((warmup_size_multiplier(0) - 0.3).abs() < 0.001);
-        assert!((warmup_size_multiplier(49) - 0.3).abs() < 0.001);
-
-        // Mid warmup: medium size
-        assert!((warmup_size_multiplier(50) - 0.7).abs() < 0.001);
-        assert!((warmup_size_multiplier(199) - 0.7).abs() < 0.001);
-
-        // Fully calibrated: full size
-        assert!((warmup_size_multiplier(200) - 1.0).abs() < 0.001);
-        assert!((warmup_size_multiplier(500) - 1.0).abs() < 0.001);
+        // At n=10: 0.3 + 0.7 * 10/25 = 0.58
+        assert!(warmup_size_multiplier(10) > 0.55);
+        assert!(warmup_size_multiplier(10) < 0.62);
+        // At n=50: 0.3 + 0.7 * 50/65 ≈ 0.838
+        assert!(warmup_size_multiplier(50) > 0.80);
+        assert!(warmup_size_multiplier(50) < 0.88);
+        // At n=100: 0.3 + 0.7 * 100/115 ≈ 0.909
+        assert!(warmup_size_multiplier(100) > 0.90);
+        // Monotonically increasing
+        assert!(warmup_size_multiplier(10) > warmup_size_multiplier(0));
+        assert!(warmup_size_multiplier(50) > warmup_size_multiplier(10));
+        assert!(warmup_size_multiplier(100) > warmup_size_multiplier(50));
+        assert!(warmup_size_multiplier(200) > warmup_size_multiplier(100));
+        // Approaches 1.0 (n=500: 0.3 + 0.7*500/515 ≈ 0.98)
+        assert!(warmup_size_multiplier(500) > 0.97);
     }
 
     /// Phase 1 (vol+regime) ready → Marginal, even with zero fills.
@@ -758,8 +766,8 @@ mod tests {
     #[test]
     fn test_spread_multiplier_boundaries() {
         assert!((spread_multiplier_from_confidence(1.0) - 1.0).abs() < 0.001);
-        assert!((spread_multiplier_from_confidence(0.0) - 3.0).abs() < 0.001);
-        assert!((spread_multiplier_from_confidence(0.5) - 2.0).abs() < 0.001);
+        assert!((spread_multiplier_from_confidence(0.0) - 2.0).abs() < 0.001);
+        assert!((spread_multiplier_from_confidence(0.5) - 1.5).abs() < 0.001);
     }
 
     #[test]

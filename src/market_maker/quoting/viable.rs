@@ -248,13 +248,27 @@ impl ViableQuoteLadder {
         mid_px: f64,
         rules: Option<ExchangeRules>,
     ) -> Self {
+        // Helper: ensure size meets min_notional at THIS level's price.
+        // Quantum's min_viable_size was computed at mark_px, but price grid
+        // snapping or other post-ladder adjustments can shift prices, making
+        // min_viable_size * actual_price < min_notional.
+        let ensure_notional = |size: f64, price: f64| -> f64 {
+            if price > 0.0 && size * price < quantum.min_notional {
+                let raw = quantum.min_notional / price;
+                let steps = (raw / quantum.step).ceil() as u64;
+                (steps as f64 * quantum.step).max(size)
+            } else {
+                size
+            }
+        };
+
         let bid_quotes: Vec<Quote> = ladder
             .bids
             .iter()
             .filter_map(|l| {
                 quantum
                     .clamp_to_viable(l.size, true)
-                    .map(|size| Quote::new(l.price, size))
+                    .map(|size| Quote::new(l.price, ensure_notional(size, l.price)))
             })
             .collect();
         let ask_quotes: Vec<Quote> = ladder
@@ -263,7 +277,7 @@ impl ViableQuoteLadder {
             .filter_map(|l| {
                 quantum
                     .clamp_to_viable(l.size, true)
-                    .map(|size| Quote::new(l.price, size))
+                    .map(|size| Quote::new(l.price, ensure_notional(size, l.price)))
             })
             .collect();
 

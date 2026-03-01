@@ -262,6 +262,23 @@ impl SignalHealthMonitor {
             .map(|(signal_type, health)| (*signal_type, health.relative_strength()))
     }
 
+    /// Returns MI-based attenuation factor for each tracked signal.
+    /// 1.0 = fully active (MI at or above baseline), 0.0 = fully stale (MI collapsed).
+    /// Used by signal_integration to soft-gate signal contributions based on real-time MI.
+    pub fn signal_attenuation_factors(&self) -> HashMap<EdgeSignalKind, f64> {
+        self.signals
+            .iter()
+            .map(|(signal_type, health)| {
+                let ratio = if health.mi_baseline > 1e-10 {
+                    (health.mi_current / health.mi_baseline).clamp(0.0, 1.0)
+                } else {
+                    1.0 // No baseline → trust default weight
+                };
+                (*signal_type, ratio)
+            })
+            .collect()
+    }
+
     /// Generate summary of signal health.
     pub fn summary(&self) -> SignalHealthSummary {
         let total = self.signals.len();

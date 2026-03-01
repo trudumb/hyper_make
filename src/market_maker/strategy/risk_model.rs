@@ -411,6 +411,48 @@ impl CalibratedRiskModel {
         (self.n_samples as f64 / min_samples as f64).min(1.0)
     }
 
+    /// Extract the 15 beta coefficients as an array (same order as RiskFeatures).
+    /// Used by OnlineBayesianGammaCalibrator for learning.
+    pub fn betas_as_array(&self) -> [f64; 15] {
+        [
+            self.beta_volatility,
+            self.beta_toxicity,
+            self.beta_inventory,
+            self.beta_hawkes,
+            self.beta_book_depth,
+            self.beta_uncertainty,
+            self.beta_confidence,
+            self.beta_cascade,
+            self.beta_tail_risk,
+            self.beta_drawdown,
+            self.beta_regime,
+            self.beta_ghost,
+            self.beta_continuation,
+            self.beta_edge_uncertainty,
+            self.beta_calibration,
+        ]
+    }
+
+    /// Apply calibrated betas from OnlineBayesianGammaCalibrator.
+    /// Only updates beta coefficients, preserving gamma_min/max and metadata.
+    pub fn apply_calibrated_betas(&mut self, betas: &[f64; 15]) {
+        self.beta_volatility = betas[0];
+        self.beta_toxicity = betas[1];
+        self.beta_inventory = betas[2];
+        self.beta_hawkes = betas[3];
+        self.beta_book_depth = betas[4];
+        self.beta_uncertainty = betas[5];
+        self.beta_confidence = betas[6];
+        self.beta_cascade = betas[7];
+        self.beta_tail_risk = betas[8];
+        self.beta_drawdown = betas[9];
+        self.beta_regime = betas[10];
+        self.beta_ghost = betas[11];
+        self.beta_continuation = betas[12];
+        self.beta_edge_uncertainty = betas[13];
+        self.beta_calibration = betas[14];
+    }
+
     /// Blend this model with conservative defaults based on staleness.
     ///
     /// Returns a new model with blended coefficients.
@@ -527,6 +569,28 @@ pub struct RiskFeatures {
 }
 
 impl RiskFeatures {
+    /// Extract features as a flat array (same order as CalibratedRiskModel betas).
+    /// Note: inventory uses squared fraction, matching compute_gamma().
+    pub fn as_array(&self) -> [f64; 15] {
+        [
+            self.excess_volatility,
+            self.toxicity_score,
+            self.inventory_fraction.powi(2), // Quadratic, matching compute_gamma
+            self.excess_intensity,
+            self.depth_depletion,
+            self.model_uncertainty,
+            self.position_direction_confidence,
+            self.cascade_intensity,
+            self.tail_risk_intensity,
+            self.drawdown_fraction,
+            self.regime_risk_score,
+            self.ghost_depletion,
+            self.continuation_probability,
+            self.edge_uncertainty,
+            self.calibration_deficit,
+        ]
+    }
+
     /// Build risk features from MarketParams and RiskModelConfig.
     pub fn from_params(
         params: &MarketParams,

@@ -294,7 +294,7 @@ fn default_red_reducing_addon() -> f64 {
 }
 
 fn default_posterior_reduce_only_prob() -> f64 {
-    0.85
+    0.95
 }
 
 impl Default for GovernorConfig {
@@ -307,7 +307,7 @@ impl Default for GovernorConfig {
             kill_addon_bps: 25.0,
             kill_reducing_addon_bps: 25.0,
             red_reducing_addon_bps: 15.0,
-            posterior_reduce_only_prob: 0.85,
+            posterior_reduce_only_prob: 0.95,
         }
     }
 }

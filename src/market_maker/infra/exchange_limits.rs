@@ -311,16 +311,20 @@ impl ExchangePositionLimits {
     /// Update only the local max position (re-computes effective limits).
     ///
     /// Use when local config changes but exchange limits are still valid.
+    /// Uses the same 3-factor formula as `update_from_response`/`update_from_ws`:
+    /// `effective = min(local_max, max_long/short, available_buy/sell)`
     pub fn update_local_max(&self, local_max_position: f64) {
+        let max_long = self.inner.max_long.load();
+        let max_short = self.inner.max_short.load();
         let available_buy = self.inner.available_buy.load();
         let available_sell = self.inner.available_sell.load();
 
         self.inner
             .effective_bid_limit
-            .store(local_max_position.min(available_buy));
+            .store(local_max_position.min(max_long).min(available_buy));
         self.inner
             .effective_ask_limit
-            .store(local_max_position.min(available_sell));
+            .store(local_max_position.min(max_short).min(available_sell));
         self.inner.local_max_position.store(local_max_position);
     }
 
@@ -393,6 +397,15 @@ impl ExchangePositionLimits {
 
     /// Time since last refresh in milliseconds.
     ///
+    /// Whether limits are in paper trading mode.
+    ///
+    /// In paper mode, limits are synthetically initialized and should NOT
+    /// be overwritten by WebSocket `ActiveAssetData` messages (which carry
+    /// real account data that would zero out the synthetic capacity).
+    pub fn is_paper_mode(&self) -> bool {
+        self.inner.paper_mode.load(Ordering::Relaxed)
+    }
+
     /// In paper mode, always returns 0 (never stale) because limits are
     /// synthetically initialized and never refreshed via websocket.
     pub fn age_ms(&self) -> u64 {
@@ -903,18 +916,24 @@ mod tests {
     fn test_update_local_max() {
         let limits = ExchangePositionLimits::new();
         // mark_px = 100000, so 100000 USD = 1.0 BTC
+        // max_long=1.5, max_short=1.5, available_buy=100000 USD (=1.0 BTC), available_sell=100000 USD (=1.0 BTC)
         let response = make_response(1.5, 1.5, 100000.0, 100000.0);
         limits.update_from_response(&response, 2.0);
 
         // min(2.0, 1.5, 1.0) = 1.0
         assert_eq!(limits.effective_bid_limit(), 1.0);
 
-        // Update local max to smaller value
-        // Note: update_local_max uses stored available values, but doesn't re-apply max_long/max_short
-        // So we need to check that it's min(0.3, available)
+        // Update local max to smaller value — should use 3-factor formula:
+        // effective_bid = min(local_max=0.3, max_long=1.5, available_buy=1.0) = 0.3
         limits.update_local_max(0.3);
         assert_eq!(limits.effective_bid_limit(), 0.3);
         assert_eq!(limits.effective_ask_limit(), 0.3);
+
+        // Update local max to larger value — max_long/max_short still constrain:
+        // effective_bid = min(local_max=5.0, max_long=1.5, available_buy=1.0) = 1.0
+        limits.update_local_max(5.0);
+        assert_eq!(limits.effective_bid_limit(), 1.0);
+        assert_eq!(limits.effective_ask_limit(), 1.0);
     }
 
     #[test]

@@ -581,6 +581,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// For HIP-3 DEXs, collateral is in spot balance. For validator perps, in clearinghouse.
     /// Also extracts liquidation price for dynamic reduce-only mode.
     pub(crate) async fn refresh_margin_state(&mut self) -> Result<()> {
+        // In paper mode, margin state is synthetically seeded via with_paper_balance().
+        // Real REST data would overwrite the synthetic paper balance with real account
+        // data (where margin_used >= paper_balance → available_margin collapses to $0).
+        if self.infra.exchange_limits.is_paper_mode() {
+            return Ok(());
+        }
+
         // Phase 2 Optimization:
         // If we are on standard perps (not HIP-3 DEX) and have fresh WebData2,
         // we can skip the REST call entirely because handle_web_data2 updates the state.
@@ -749,6 +756,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// NOTE: This is now a FALLBACK. If WebSocket `ActiveAssetData` is fresh (<30s),
     /// we skip the REST call entirely.
     pub(crate) async fn refresh_exchange_limits(&mut self) -> Result<()> {
+        // In paper mode, exchange limits are synthetically initialized.
+        // REST calls would overwrite them with real account data.
+        if self.infra.exchange_limits.is_paper_mode() {
+            return Ok(());
+        }
+
         // Check if WebSocket data is fresh - skip REST if so
         if let Some(last_ws_time) = self.last_active_asset_data_time {
             let ws_age = last_ws_time.elapsed();

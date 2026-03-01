@@ -471,6 +471,7 @@ BLOCKED_PATTERNS = [
 SAFE_PATTERNS = [
     r"cargo\s+run\s+.*--bin\s+calibration_report",
     r"cargo\s+run\s+.*--bin\s+health_dashboard",
+    r"/home/trudumb/hyper_make/scripts/",
 ]
 
 def main():

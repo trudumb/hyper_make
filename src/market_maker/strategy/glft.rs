@@ -216,6 +216,10 @@ pub struct EPnLParams {
     /// Scales gamma for inventory penalty only (from continuation model).
     /// 1.0 = neutral (standard GLFT), >1.0 = REDUCE pressure, <1.0 = HOLD.
     pub continuation_gamma_mult: f64,
+    /// Posterior variance of kappa: Var[κ] from 95% CI.
+    /// Used for Jensen's correction: concavity of λ(κ) causes systematic
+    /// overestimation of fill rate. Correction reduces λ at deep levels.
+    pub kappa_variance: f64,
 }
 
 /// Enhanced per-level E[PnL] computation absorbing all former multiplicative overlays.
@@ -223,7 +227,20 @@ pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
     let depth_frac = params.depth_bps / 10_000.0;
 
     // Fill intensity at this depth: λ(δ) = κ × exp(-κ × δ)
-    let mut lambda = params.kappa_side * (-params.kappa_side * depth_frac).exp();
+    // Jensen's correction for parameter uncertainty:
+    // E[λ(δ)] ≈ λ(κ̂,δ) × [1 + ½ Var[κ] × (δ² - 2δ/κ̂)]
+    // The fill rate is concave in κ, so E[λ] < λ(E[κ]) — point estimate overestimates.
+    let lambda_point = params.kappa_side * (-params.kappa_side * depth_frac).exp();
+    let jensen_correction = if params.kappa_variance > 0.0 && params.kappa_side > 1.0 {
+        let corr = 1.0
+            + 0.5
+                * params.kappa_variance
+                * (depth_frac * depth_frac - 2.0 * depth_frac / params.kappa_side);
+        corr.clamp(0.1, 1.0) // Never boost above point estimate; floor at 10%
+    } else {
+        1.0
+    };
+    let mut lambda = lambda_point * jensen_correction;
 
     // Circuit breaker → staleness discount on lambda
     if params.circuit_breaker_active {
@@ -382,6 +399,7 @@ pub fn expected_pnl_bps(
         self_impact_bps: 0.0,
         inventory_beta: 0.0,
         continuation_gamma_mult: 1.0,
+        kappa_variance: 0.0,
     };
     expected_pnl_bps_enhanced(&params)
 }
@@ -406,7 +424,18 @@ pub struct EPnLDiagnostics {
 pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagnostics) {
     let depth_frac = params.depth_bps / 10_000.0;
 
-    let mut lambda = params.kappa_side * (-params.kappa_side * depth_frac).exp();
+    // Jensen's correction (same as expected_pnl_bps_enhanced)
+    let lambda_point = params.kappa_side * (-params.kappa_side * depth_frac).exp();
+    let jensen_correction = if params.kappa_variance > 0.0 && params.kappa_side > 1.0 {
+        let corr = 1.0
+            + 0.5
+                * params.kappa_variance
+                * (depth_frac * depth_frac - 2.0 * depth_frac / params.kappa_side);
+        corr.clamp(0.1, 1.0)
+    } else {
+        1.0
+    };
+    let mut lambda = lambda_point * jensen_correction;
 
     if params.circuit_breaker_active {
         lambda *= 0.1;
@@ -2001,6 +2030,30 @@ impl QuotingStrategy for GLFTStrategy {
     fn record_elasticity_observation(&mut self, spread_bps: f64, fill_rate: f64) {
         self.elasticity_estimator.record(spread_bps, fill_rate);
     }
+
+    fn gamma_features_cache(
+        &self,
+        market_params: &MarketParams,
+        position: f64,
+        max_position: f64,
+    ) -> Option<([f64; 15], f64)> {
+        let features = RiskFeatures::from_params(
+            market_params,
+            position,
+            max_position,
+            &self.risk_model_config,
+        );
+        let gamma = self.risk_model.compute_gamma_with_policy(
+            &features,
+            market_params.capital_tier,
+            market_params.capital_policy.warmup_gamma_max_inflation,
+        );
+        Some((features.as_array(), gamma))
+    }
+
+    fn apply_calibrated_gamma_betas(&mut self, betas: &[f64; 15]) {
+        self.risk_model.apply_calibrated_betas(betas);
+    }
 }
 
 #[cfg(test)]
@@ -2857,6 +2910,7 @@ mod tests {
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
             continuation_gamma_mult: 1.0,
+            kappa_variance: 0.0,
         };
         let pnl_clean = expected_pnl_bps_enhanced(&params);
 
@@ -2887,6 +2941,7 @@ mod tests {
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
             continuation_gamma_mult: 1.0,
+            kappa_variance: 0.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
 
@@ -2920,6 +2975,7 @@ mod tests {
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
             continuation_gamma_mult: 1.0,
+            kappa_variance: 0.0,
         };
         let pnl_normal = expected_pnl_bps_enhanced(&params);
 
@@ -2953,6 +3009,7 @@ mod tests {
             self_impact_bps: 0.0,
             inventory_beta: 7.0,
             continuation_gamma_mult: 1.0,
+            kappa_variance: 0.0,
         };
         let pnl_no_impact = expected_pnl_bps_enhanced(&params);
 
@@ -2991,6 +3048,7 @@ mod tests {
             self_impact_bps: 0.0,
             inventory_beta: 0.0,
             continuation_gamma_mult: 1.0,
+            kappa_variance: 0.0,
         };
         let enhanced = expected_pnl_bps_enhanced(&params);
 
@@ -3022,6 +3080,7 @@ mod tests {
             self_impact_bps: 0.1,
             inventory_beta: 1.0,
             continuation_gamma_mult: 1.0,
+            kappa_variance: 0.0,
         };
 
         let scalar = expected_pnl_bps_enhanced(&params);

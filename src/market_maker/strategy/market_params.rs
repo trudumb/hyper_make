@@ -186,6 +186,12 @@ pub struct MarketParams {
     /// Range: ~0.3 (converged) to ~1.0+ (high uncertainty)
     pub kappa_ci_width: f64,
 
+    /// Kappa posterior variance Var[κ] derived from 95% CI.
+    /// Used for Jensen's correction in fill rate estimation:
+    /// E[λ(δ)] ≈ λ(κ̂,δ) × [1 + ½ Var[κ] (δ² - 2δ/κ̂)]
+    /// Reduces estimated fill rate at deep levels when κ is uncertain.
+    pub kappa_variance: f64,
+
     /// Soft toxicity score [0, 1] from mixture model.
     /// Rolling average of P(jump) - smoother than binary is_toxic_regime.
     /// 0.0 = pure diffusion, 0.5+ = significant jump component
@@ -680,6 +686,10 @@ pub struct MarketParams {
     /// Used for uncertainty scaling during warmup.
     pub adaptive_warmup_progress: f64,
 
+    /// Warmup size multiplier [0.3, 1.0] from Bayesian posterior precision.
+    /// Applied to margin allocation to limit exposure while models are learning.
+    pub warmup_size_mult: f64,
+
     /// Uncertainty factor for warmup period.
     /// Multiply spreads by this factor (> 1.0 during warmup, 1.0 when warmed up).
     pub adaptive_uncertainty_factor: f64,
@@ -1140,6 +1150,7 @@ impl Default for MarketParams {
             kappa_95_lower: 100.0,    // Conservative lower bound
             kappa_95_upper: 100.0,    // Conservative upper bound
             kappa_ci_width: 1.0,      // High uncertainty initially (CI width / mean)
+            kappa_variance: 0.0,      // Zero variance until posterior computed
             toxicity_score: 0.0,      // No toxicity initially
             param_correlation: 0.0,   // No correlation initially
             as_factor: 1.0,           // No AS adjustment initially
@@ -1293,6 +1304,7 @@ impl Default for MarketParams {
             adaptive_warmed_up: false, // Not warmed up initially
             adaptive_can_estimate: true, // Can estimate immediately via priors
             adaptive_warmup_progress: 0.0, // Start at 0% progress
+            warmup_size_mult: 1.0,     // No warmup penalty when fully warmed
             adaptive_uncertainty_factor: 1.2, // Start with 20% wider spreads
             // Calibration Fill Rate Controller
             calibration_progress: 0.0,   // Start at 0% calibration

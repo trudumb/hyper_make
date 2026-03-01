@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::market_maker::{
-    adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
+    adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator, OnlineBayesianGammaCalibrator},
     adverse_selection::{
         AdverseSelectionConfig, AdverseSelectionEstimator, BookDynamicsTracker, DepthDecayAS,
         EnhancedASClassifier, PreFillASClassifier, SweepDetector,
@@ -621,6 +621,17 @@ pub struct StochasticComponents {
     /// Hawkes excitation predictor: detects trade clustering for reactive spread widening.
     /// Uses calibrated branching ratio and intensity percentiles from HawkesOrderFlowEstimator.
     pub hawkes_predictor: crate::market_maker::HawkesExcitationPredictor,
+
+    // === Online Bayesian Gamma Calibration ===
+    /// Online RLS calibrator for the 15 risk model beta coefficients.
+    /// Learns from fill outcomes (realized_edge_bps) to adapt gamma computation.
+    /// Uses diagonal RLS with forgetting factor λ=0.999 (~1000-fill half-life).
+    pub gamma_calibrator: OnlineBayesianGammaCalibrator,
+
+    /// Cached risk features and gamma from the most recent quote cycle.
+    /// Used to feed the gamma calibrator at markout resolution time.
+    /// (features_array, gamma_used)
+    pub last_gamma_cache: Option<([f64; 15], f64)>,
 }
 
 impl StochasticComponents {
@@ -745,6 +756,9 @@ impl StochasticComponents {
             regime_state: RegimeState::new(),
             // Hawkes excitation predictor for spread widening
             hawkes_predictor: crate::market_maker::HawkesExcitationPredictor::default(),
+            // Online Bayesian gamma calibration
+            gamma_calibrator: OnlineBayesianGammaCalibrator::default(),
+            last_gamma_cache: None,
         }
     }
 

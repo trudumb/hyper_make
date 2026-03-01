@@ -15,6 +15,7 @@ mod blended_kappa;
 mod calculator;
 mod config;
 mod fill_controller;
+pub mod gamma_calibrator;
 mod learned_floor;
 mod shrinkage_gamma;
 mod standardizer;
@@ -23,6 +24,7 @@ pub use blended_kappa::BlendedKappaEstimator;
 pub use calculator::AdaptiveSpreadCalculator;
 pub use config::AdaptiveBayesianConfig;
 pub use fill_controller::FillRateController;
+pub use gamma_calibrator::OnlineBayesianGammaCalibrator;
 pub use learned_floor::LearnedSpreadFloor;
 pub use shrinkage_gamma::ShrinkageGamma;
 pub use standardizer::{

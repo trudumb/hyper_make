@@ -272,6 +272,9 @@ impl KillSwitchConfig {
             max_absolute_drawdown,
             min_peak_for_drawdown: min_peak,
             max_position_value,
+            // Derived at runtime from margin data — don't use the 1.0 default
+            // which would trigger position runaway at 2 contracts
+            max_position_contracts: f64::MAX,
             ..Default::default()
         }
     }

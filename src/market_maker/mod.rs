@@ -1166,6 +1166,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             prior_confidence: 0.0,
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
+            gamma_calibrator: self.stochastic.gamma_calibrator.clone(),
         }
     }
 
@@ -1203,6 +1204,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             bundle.vol_filter.bias_fill_intervals,
             bundle.vol_filter.bias_nonfill_intervals,
         );
+        // Restore online Bayesian gamma calibrator
+        self.stochastic.gamma_calibrator = bundle.gamma_calibrator.clone();
     }
 
     // =========================================================================
