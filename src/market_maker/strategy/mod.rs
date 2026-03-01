@@ -3,6 +3,7 @@
 //! This module provides different quoting strategies that implement the
 //! `QuotingStrategy` trait.
 
+pub mod directional_conviction;
 pub mod drift_estimator;
 pub mod dynamic_params;
 pub mod echo_estimator;

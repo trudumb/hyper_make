@@ -870,6 +870,18 @@ impl ParameterAggregator {
             // EdgeTracker::edge_uncertainty() and QuoteOutcomeTracker::calibration_error().
             edge_uncertainty: 0.5,    // Maximum ignorance until wired
             calibration_deficit: 0.0, // Assume calibrated until measured
+
+            // === Directional Conviction System ===
+            // Defaults: no conviction. Computed in quote_engine from DirectionalConviction.
+            conviction_score: 0.0,
+            conviction_direction: 0.0,
+            conviction_corroboration: 0,
+            conviction_margin_shift: 0.0,
+            conviction_gamma_mult: 1.0,
+            conviction_ask_tightening: 0.0,
+            conviction_q_target: 0.0,
+            conviction_drift_rate_per_sec: 0.0,
+            conviction_reduce_only: false,
         }
     }
 }

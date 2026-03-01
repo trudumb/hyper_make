@@ -119,6 +119,17 @@ pub struct CentralBeliefConfig {
     /// EWMA smoothing factor for kappa (0.9 = 90% previous, 10% new)
     pub kappa_ewma_alpha: f64,
 
+    // === Hierarchical Changepoint Retention ===
+    /// Medium-timescale retention for variance/confidence on soft reset.
+    /// Drift variance and confidence partially persist through regime changes.
+    /// Default: 0.30 (30% preserved, vs 5% for fast drift mean).
+    pub medium_retention: f64,
+
+    /// Structural retention for slow-changing parameters on soft reset.
+    /// Vol regime, kappa estimates, trend direction survive regime changes at this rate.
+    /// Default: 0.70 (70% preserved).
+    pub structural_retention: f64,
+
     // === Bayesian Fair Value ===
     /// Configuration for the Bayesian fair value model.
     /// Set to None to disable the model entirely.
@@ -150,6 +161,8 @@ impl Default for CentralBeliefConfig {
             changepoint_min_confirmations: 2,
             changepoint_cooldown_ms: 0,
             kappa_ewma_alpha: 0.9,
+            medium_retention: 0.30,
+            structural_retention: 0.70,
             bayesian_fv_config: Some(BayesianFairValueConfig::default()),
         }
     }
@@ -1260,33 +1273,45 @@ impl CentralBeliefState {
     }
 
     fn soft_reset(&self, state: &mut InternalState, retention: f64) {
-        // Decay all posteriors toward prior
-        let r = retention.clamp(0.0, 1.0);
+        // Hierarchical three-timescale retention:
+        // - Fast (retention): drift mean resets aggressively (responds to new regime)
+        // - Medium (medium_retention): variance/confidence partially preserved
+        // - Structural (structural_retention): vol regime, kappa, trend direction persist
+        let r_fast = retention.clamp(0.0, 1.0);
+        let r_medium = self.config.medium_retention.clamp(0.0, 1.0);
+        let r_structural = self.config.structural_retention.clamp(0.0, 1.0);
 
-        // Directional drift posterior: mean decays, variance relaxes toward prior
-        state.dir_mu *= r;
-        state.dir_sigma_sq += (1.0 - r) * (self.config.dir_prior_variance - state.dir_sigma_sq);
-        state.dir_evidence_price *= r;
-        state.dir_evidence_fill *= r;
-        state.dir_evidence_as *= r;
-        state.dir_evidence_flow *= r;
-        state.sigma_sum_sq *= r;
-        state.sigma_n *= r;
+        // Fast: drift mean resets aggressively (new regime may have different drift)
+        state.dir_mu *= r_fast;
 
-        // Kappa
+        // Medium: variance relaxes partially toward prior (uncertainty estimate persists)
+        let prior_var = self.config.dir_prior_variance;
+        state.dir_sigma_sq = r_medium * state.dir_sigma_sq + (1.0 - r_medium) * prior_var;
+
+        // Fast: directional evidence resets (stale in new regime)
+        state.dir_evidence_price *= r_fast;
+        state.dir_evidence_fill *= r_fast;
+        state.dir_evidence_as *= r_fast;
+        state.dir_evidence_flow *= r_fast;
+
+        // Structural: vol estimates persist significantly across regimes
+        state.sigma_sum_sq *= r_structural;
+        state.sigma_n *= r_structural;
+
+        // Structural: kappa persists (changes slowly between regimes)
         let prior_alpha = self.config.kappa_prior_strength;
         let prior_beta = self.config.kappa_prior_strength / self.config.kappa_prior;
-        state.own_kappa_alpha = prior_alpha + (state.own_kappa_alpha - prior_alpha) * r;
-        state.own_kappa_beta = prior_beta + (state.own_kappa_beta - prior_beta) * r;
+        state.own_kappa_alpha = prior_alpha + (state.own_kappa_alpha - prior_alpha) * r_structural;
+        state.own_kappa_beta = prior_beta + (state.own_kappa_beta - prior_beta) * r_structural;
 
-        // Continuation
-        state.continuation_alpha = 2.5 + (state.continuation_alpha - 2.5) * r;
-        state.continuation_beta = 2.5 + (state.continuation_beta - 2.5) * r;
+        // Medium: continuation partially preserved
+        state.continuation_alpha = 2.5 + (state.continuation_alpha - 2.5) * r_medium;
+        state.continuation_beta = 2.5 + (state.continuation_beta - 2.5) * r_medium;
 
-        // Edge
-        state.edge_sum *= r;
-        state.edge_sum_sq *= r;
-        state.edge_n *= r;
+        // Fast: edge resets (stale in new regime)
+        state.edge_sum *= r_fast;
+        state.edge_sum_sq *= r_fast;
+        state.edge_n *= r_fast;
     }
 
     fn apply_decay(&self, state: &mut InternalState) {
@@ -2731,6 +2756,60 @@ mod tests {
             (3.0..=120.0).contains(&tau),
             "tau_ac should be in bounds: {}",
             tau
+        );
+    }
+
+    #[test]
+    fn test_hierarchical_soft_reset_preserves_structural() {
+        let config = CentralBeliefConfig {
+            medium_retention: 0.30,
+            structural_retention: 0.70,
+            ..Default::default()
+        };
+        let beliefs = CentralBeliefState::new(config);
+
+        // Build up strong state with persistent bearish returns
+        for i in 0..200 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.005,
+                dt_secs: 1.0,
+                timestamp_ms: i * 1000,
+            });
+        }
+
+        let before = beliefs.snapshot();
+        let drift_before = before.drift_vol.expected_drift;
+        assert!(
+            drift_before.abs() > 0.0001,
+            "Should have meaningful drift before reset: {}",
+            drift_before
+        );
+
+        // Soft reset with fast retention = 0.05 (typical changepoint)
+        beliefs.update(BeliefUpdate::SoftReset { retention: 0.05 });
+
+        let after = beliefs.snapshot();
+        let drift_after = after.drift_vol.expected_drift;
+
+        // Fast: drift mean should be heavily reduced (5% retention)
+        assert!(
+            drift_after.abs() < drift_before.abs() * 0.50,
+            "Drift mean should decay significantly: before={}, after={}",
+            drift_before,
+            drift_after
+        );
+
+        // Kappa should be largely preserved (structural retention = 0.70)
+        // Both before and after should still be near the prior
+        let kappa_before = before.kappa.kappa_effective;
+        let kappa_after = after.kappa.kappa_effective;
+        let kappa_change_pct = ((kappa_after - kappa_before) / kappa_before).abs();
+        assert!(
+            kappa_change_pct < 0.50,
+            "Kappa should be mostly preserved: before={:.1}, after={:.1}, change={:.1}%",
+            kappa_before,
+            kappa_after,
+            kappa_change_pct * 100.0
         );
     }
 }

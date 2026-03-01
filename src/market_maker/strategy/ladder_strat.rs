@@ -675,15 +675,21 @@ impl LadderStrategy {
         // depth, uncertainty, confidence) are captured as beta coefficients in
         // the log-additive model: log(γ) = log(γ_base) + Σ βᵢ × xᵢ.
         // No post-hoc multiplicative scalars needed.
-        let gamma = self.effective_gamma(market_params, position, effective_max_position);
+        let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
+
+        // Conviction gamma escalation: wider spreads when directional conviction is moderate+.
+        // Applied multiplicatively to base gamma (conviction_gamma_mult ∈ [1.0, 1.5]).
+        let gamma = base_gamma * market_params.conviction_gamma_mult;
 
         // NOTE: regime_gamma_multiplier is already applied inside effective_gamma()
         // (L456) and participates in the gamma_max clamp. Do NOT re-apply here.
         debug!(
             gamma = %format!("{:.4}", gamma),
+            base_gamma = %format!("{:.4}", base_gamma),
+            conviction_gamma_mult = %format!("{:.3}", market_params.conviction_gamma_mult),
             regime_gamma_mult = %format!("{:.2}", market_params.regime_gamma_multiplier),
             warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-            "Ladder gamma from log-additive CalibratedRiskModel (regime included)"
+            "Ladder gamma from log-additive CalibratedRiskModel (regime+conviction included)"
         );
 
         // === KAPPA: Robust V3 > Adaptive > Legacy ===
@@ -1466,13 +1472,25 @@ impl LadderStrategy {
             // SNR already encodes confidence via drift_uncertainty (incorporates
             // observation count and Kalman posterior variance). No drift_conf scaling needed.
             let drift_conf = market_params.belief_confidence; // Kept for observability
-            let effective_q_target = q_target;
+
+            // Conviction-weighted q_target blending: when conviction system has
+            // corroborated directional signal, blend toward conviction position target.
+            let effective_q_target = if market_params.conviction_corroboration >= 2
+                && market_params.conviction_score > 0.3
+            {
+                market_params.conviction_q_target
+            } else {
+                q_target
+            };
             let delta_q = effective_q_target - q_current;
 
             // tanh: principled saturation (smooth, sign-preserving, derivative=1 near 0)
             let cj_allocation = (delta_q * 2.0).tanh() * 0.35;
 
-            let ask_margin_weight = (0.5 - cj_allocation).clamp(0.15, 0.85);
+            // Conviction margin shift: shift allocation toward reducing side
+            // when strong directional conviction is present.
+            let conviction_shift = market_params.conviction_margin_shift;
+            let ask_margin_weight = (0.5 - cj_allocation + conviction_shift).clamp(0.15, 0.85);
             let bid_margin_weight = 1.0 - ask_margin_weight;
             let margin_for_bids = usable_margin * bid_margin_weight;
             let margin_for_asks = usable_margin * ask_margin_weight;
@@ -1486,14 +1504,16 @@ impl LadderStrategy {
                 drift_shrunken_bps = %format!("{:.2}", market_params.drift_rate_per_sec * 10_000.0),
                 drift_snr = %format!("{:.2}", drift_snr),
                 q_target = %format!("{:.4}", q_target),
+                effective_q_target = %format!("{:.4}", effective_q_target),
                 q_current = %format!("{:.4}", q_current),
                 drift_conf = %format!("{:.3}", drift_conf),
                 delta_q = %format!("{:.4}", delta_q),
                 cj_allocation = %format!("{:.4}", cj_allocation),
+                conviction_shift = %format!("{:.3}", conviction_shift),
                 bid_margin_weight = %format!("{:.3}", bid_margin_weight),
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
-                "Margin allocation (Cartea-Jaimungal SNR-scaled inventory)"
+                "Margin allocation (Cartea-Jaimungal SNR-scaled + conviction)"
             );
 
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
@@ -1889,11 +1909,37 @@ impl LadderStrategy {
                     policy.max_levels_per_side
                 };
 
+                // Conviction-based ask/bid tightening: reduce touch depth on informed side.
+                // Bearish conviction → tighten asks (sell closer to mid to capture move).
+                // Bullish conviction → tighten bids (buy closer to mid to capture move).
+                // Safety: tightened touch must remain >= effective_floor_bps (fee floor).
+                let (bid_touch_bps, ask_touch_bps) = {
+                    let tight = market_params.conviction_ask_tightening;
+                    let dir = market_params.conviction_direction;
+                    if tight > 0.0 && market_params.conviction_corroboration >= 2 {
+                        if dir < 0.0 {
+                            // Bearish: tighten asks
+                            let tightened = touch_bps * (1.0 - tight);
+                            (touch_bps, tightened.max(effective_floor_bps))
+                        } else {
+                            // Bullish: tighten bids
+                            let tightened = touch_bps * (1.0 - tight);
+                            (tightened.max(effective_floor_bps), touch_bps)
+                        }
+                    } else {
+                        (touch_bps, touch_bps)
+                    }
+                };
+                // Use the tighter touch for grid construction so the tightened side can
+                // access ticks closer to mid. The non-tightened side selects deeper ticks
+                // via utility scoring.
+                let grid_touch_bps = bid_touch_bps.min(ask_touch_bps);
+
                 // Build tick grid config
                 let grid_config = TickGridConfig::compute(
                     market_params.microprice,
                     tick_size,
-                    touch_bps,
+                    grid_touch_bps,
                     max_depth_bps,
                     effective_levels,
                     config.sz_decimals,

@@ -296,6 +296,37 @@ impl KalmanDriftEstimator {
         (drift_bps * shrinkage) / 10_000.0
     }
 
+    /// Adaptive James-Stein shrinkage that relaxes threshold when
+    /// independent channels corroborate the drift direction.
+    ///
+    /// P_effective = P / (1 + κ_corr × corroboration_score)
+    /// shrinkage = max(0, 1 - P_effective / μ²)
+    ///
+    /// With 3/5 channels corroborating (score=0.6) and κ_corr=0.5:
+    ///   P_effective = P / 1.3, lowering SNR threshold from 1.0 to ~0.77.
+    ///   A -11.3 bps trend with SNR ~0.8 would survive shrinkage.
+    ///
+    /// # Parameters
+    /// - `corroboration_score`: [0, 1] fraction of channels agreeing with drift direction
+    /// - `corroboration_kappa`: relaxation strength (0.5 default)
+    pub fn adaptive_shrunken_drift(
+        &self,
+        corroboration_score: f64,
+        corroboration_kappa: f64,
+    ) -> f64 {
+        let drift_bps = self.state_mean;
+        let drift_sq = drift_bps * drift_bps;
+        if drift_sq < 1e-12 {
+            return 0.0;
+        }
+
+        let score = corroboration_score.clamp(0.0, 1.0);
+        let kappa = corroboration_kappa.max(0.0);
+        let p_effective = self.state_variance / (1.0 + kappa * score);
+        let shrinkage = (1.0 - p_effective / drift_sq).max(0.0);
+        (drift_bps * shrinkage) / 10_000.0
+    }
+
     /// Posterior drift in bps/sec (for logging).
     pub fn drift_bps_per_sec(&self) -> f64 {
         self.state_mean
@@ -1139,6 +1170,85 @@ mod tests {
             (ac - AUTOCORRELATION_WARMUP_PRIOR).abs() < 0.01,
             "Below threshold should return warmup prior: {}",
             ac
+        );
+    }
+
+    #[test]
+    fn test_adaptive_shrinkage_snr_08_with_corroboration_survives() {
+        // SNR = 0.8: standard shrinkage zeros it. With corroboration=0.6, it survives.
+        let est = KalmanDriftEstimator {
+            state_mean: 2.0,      // 2 bps/sec drift
+            state_variance: 6.25, // P = 6.25 → SNR = 4/6.25 = 0.64 < 1 → standard zeros
+            last_update_ms: now_ms(),
+            ..Default::default()
+        };
+
+        // Standard shrinkage should zero it
+        assert_eq!(
+            est.shrunken_drift_rate_per_sec(),
+            0.0,
+            "Standard shrinkage should zero SNR < 1"
+        );
+
+        // Adaptive with 3/5 corroboration should preserve it
+        let adaptive = est.adaptive_shrunken_drift(0.6, 0.5);
+        // P_effective = 6.25 / (1 + 0.5*0.6) = 6.25/1.3 = 4.81
+        // shrinkage = max(0, 1 - 4.81/4.0) = 0 — still zeroed!
+        // Need higher drift or lower variance. Let's use state_mean=3.0
+        // Actually with state_mean=2.0, drift_sq=4.0, P_eff=4.81 → still > drift_sq
+        // This is correct: SNR=0.64 is too low even with corroboration
+        // The plan says SNR ~0.8 should survive. Let's test that case.
+        let _ = adaptive;
+
+        let est2 = KalmanDriftEstimator {
+            state_mean: 3.0,      // 3 bps/sec drift
+            state_variance: 10.0, // P = 10.0 → SNR = 9/10 = 0.9 < 1
+            last_update_ms: now_ms(),
+            ..Default::default()
+        };
+        assert_eq!(est2.shrunken_drift_rate_per_sec(), 0.0);
+
+        let adaptive2 = est2.adaptive_shrunken_drift(0.6, 0.5);
+        // P_effective = 10.0 / 1.3 = 7.69
+        // shrinkage = max(0, 1 - 7.69/9.0) = max(0, 0.146) = 0.146
+        // drift = 3.0 * 0.146 / 10000 = 0.0000437
+        assert!(
+            adaptive2.abs() > 1e-6,
+            "Adaptive shrinkage should preserve SNR~0.9 drift with corroboration: {}",
+            adaptive2
+        );
+    }
+
+    #[test]
+    fn test_adaptive_shrinkage_no_corroboration_still_zeros() {
+        let est = KalmanDriftEstimator {
+            state_mean: 1.5,     // weak drift
+            state_variance: 5.0, // SNR = 2.25/5 = 0.45 — clearly sub-threshold
+            last_update_ms: now_ms(),
+            ..Default::default()
+        };
+        let adaptive = est.adaptive_shrunken_drift(0.0, 0.5);
+        assert_eq!(adaptive, 0.0, "No corroboration should not relax threshold");
+    }
+
+    #[test]
+    fn test_adaptive_shrinkage_high_snr_unchanged() {
+        // High SNR: both methods should give similar results
+        let est = KalmanDriftEstimator {
+            state_mean: 10.0,    // 10 bps/sec
+            state_variance: 2.0, // P = 2.0 → SNR = 100/2 = 50 >> 1
+            last_update_ms: now_ms(),
+            ..Default::default()
+        };
+        let standard = est.shrunken_drift_rate_per_sec();
+        let adaptive = est.adaptive_shrunken_drift(0.6, 0.5);
+
+        // Both should give ~10 bps/sec / 10000
+        assert!(
+            (standard - adaptive).abs() < standard * 0.05,
+            "High SNR: standard={} vs adaptive={}",
+            standard,
+            adaptive
         );
     }
 

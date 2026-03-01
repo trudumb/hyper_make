@@ -1123,6 +1123,43 @@ pub struct MarketParams {
     /// Fair value model confidence [0, 1] based on fill count and posterior tightness.
     /// Used for blending posterior mean into microprice.
     pub fv_confidence: f64,
+
+    // ==================== Directional Conviction System ====================
+    /// Multi-channel conviction strength [0, 1]. 0 = no directional conviction, 1 = maximum.
+    /// From log-odds fusion of Kalman drift, trend, Hawkes, fill toxicity, OI/funding.
+    pub conviction_score: f64,
+
+    /// Conviction direction: -1.0 (bearish) to +1.0 (bullish). 0.0 = neutral.
+    pub conviction_direction: f64,
+
+    /// Number of independent channels corroborating the conviction direction.
+    /// Minimum 2 required for any graduated defense action.
+    pub conviction_corroboration: usize,
+
+    /// Margin shift from conviction [-0.15, 0.15].
+    /// Negative = shift margin away from bids (bearish), positive = away from asks (bullish).
+    pub conviction_margin_shift: f64,
+
+    /// Gamma multiplier from conviction [1.0, 1.5].
+    /// Escalates spreads when directional conviction is moderate+.
+    pub conviction_gamma_mult: f64,
+
+    /// Ask/bid tightening fraction from conviction [0.0, 0.40].
+    /// Bearish → tighten asks (capture the move). Bullish → tighten bids.
+    pub conviction_ask_tightening: f64,
+
+    /// Position target from conviction [-1.0, 1.0] (normalized by max_inventory).
+    /// Blended with CJ q_target: q_new = (1-α)×q_base + α×q_conviction.
+    pub conviction_q_target: f64,
+
+    /// Corroboration-aware adaptive drift rate (fractional per second).
+    /// Replaces shrunken_drift when conviction system provides corroboration.
+    /// Preserves real drift that standard James-Stein would zero at SNR < 1.
+    pub conviction_drift_rate_per_sec: f64,
+
+    /// Whether conviction-based reduce-only is active.
+    /// Replaces the binary 0.95 posterior threshold with graduated escalation.
+    pub conviction_reduce_only: bool,
 }
 
 impl Default for MarketParams {
@@ -1444,6 +1481,17 @@ impl Default for MarketParams {
             // Bayesian Fair Value Model
             fv_cascade_score: 0.0,
             fv_confidence: 0.0,
+
+            // Directional Conviction System
+            conviction_score: 0.0,
+            conviction_direction: 0.0,
+            conviction_corroboration: 0,
+            conviction_margin_shift: 0.0,
+            conviction_gamma_mult: 1.0, // 1.0 = no escalation
+            conviction_ask_tightening: 0.0,
+            conviction_q_target: 0.0,
+            conviction_drift_rate_per_sec: 0.0,
+            conviction_reduce_only: false,
         }
     }
 }

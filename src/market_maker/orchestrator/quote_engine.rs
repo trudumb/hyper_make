@@ -434,7 +434,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This replaces scattered reads from beliefs_builder, regime_hmm, and changepoint.
         let belief_snapshot: BeliefSnapshot = self.central_beliefs.snapshot();
 
-        // Posterior-driven reduce-only: wrong-way position vs strong directional belief
+        // Posterior-driven reduce-only: graduated conviction defense replaces binary 0.95.
+        // The conviction system (computed later in the cycle) populates conviction_reduce_only.
+        // As a fallback, keep the legacy posterior check for extreme cases.
         {
             let posterior_threshold = self.inventory_governor.posterior_reduce_only_prob();
             let pos = self.position.position();
@@ -447,7 +449,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     prob_bullish = %format!("{:.3}", belief_snapshot.drift_vol.prob_bullish),
                     position = %format!("{:.4}", pos),
                     threshold = %format!("{:.2}", posterior_threshold),
-                    "Posterior reduce-only: strong directional belief against position"
+                    "Posterior reduce-only (legacy fallback): strong directional belief against position"
                 );
             }
         }
@@ -3104,6 +3106,133 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         //   informed flow through γ. Higher toxicity → higher γ → wider spreads automatically.
         // Update mid_at_last_quote for latency-aware mid (WS5 uses this)
         self.mid_at_last_quote = self.latest_mid;
+
+        // === Directional Conviction System ===
+        // Fuse 5 independent channels into conviction score via log-odds aggregation.
+        // Output feeds graduated defense, ask tightening, margin shift, and q_target.
+        {
+            use crate::market_maker::strategy::directional_conviction::{
+                compute_conviction, conviction_q_target, corroboration_score, graduated_defense,
+                ChannelInputs, ConvictionConfig,
+            };
+
+            let conviction_config = ConvictionConfig::default();
+
+            // Channel 1: Kalman drift posterior (from belief snapshot)
+            let p_bearish_kalman = belief_snapshot.drift_vol.prob_bearish;
+
+            // Channel 2: Multi-TF trend (from drift estimator trend agreement)
+            // Use trend observation: negative drift_bps → bearish
+            let drift_bps = self.drift_estimator.drift_bps_per_sec();
+            let drift_unc = self.drift_estimator.drift_uncertainty_bps().max(0.1);
+            let trend_z = (-drift_bps / drift_unc).clamp(-4.0, 4.0);
+            let p_bearish_trend = 1.0 / (1.0 + (-trend_z).exp()); // sigmoid
+
+            // Channel 3: Hawkes sell imbalance
+            let hawkes_imb = market_params.hawkes_imbalance;
+            // hawkes_imbalance > 0 → sell pressure → bearish
+            let p_bearish_hawkes = (0.5 + hawkes_imb * 0.4).clamp(0.05, 0.95);
+
+            // Channel 4: Fill toxicity (pre-fill toxicity on bid side → bearish)
+            let bid_tox = market_params.pre_fill_toxicity_bid;
+            let ask_tox = market_params.pre_fill_toxicity_ask;
+            let p_bearish_fill_toxicity = (0.5 + (bid_tox - ask_tox) * 0.3).clamp(0.05, 0.95);
+
+            // Channel 5: OI/funding pressure
+            // OI dropping + positive funding → bearish (longs capitulating)
+            let oi_signal = (-market_params.oi_change_1m * 5.0).clamp(-2.0, 2.0);
+            let funding_signal = (market_params.funding_rate * 100.0).clamp(-2.0, 2.0);
+            let oi_funding_z = ((oi_signal + funding_signal) / 2.0).clamp(-3.0, 3.0);
+            let p_bearish_oi_funding = 1.0 / (1.0 + (-oi_funding_z).exp());
+
+            let inputs = ChannelInputs {
+                p_bearish_kalman,
+                p_bearish_trend,
+                p_bearish_hawkes,
+                p_bearish_fill_toxicity,
+                p_bearish_oi_funding,
+            };
+            let conviction = compute_conviction(&inputs, &conviction_config);
+
+            // Compute graduated defense parameters
+            let (gamma_mult, margin_shift, ask_tightening, reduce_only) =
+                graduated_defense(&conviction, &conviction_config);
+
+            // Adaptive shrinkage: use corroboration to preserve real drift
+            let corr_score = corroboration_score(&conviction);
+            let adaptive_drift = self
+                .drift_estimator
+                .adaptive_shrunken_drift(corr_score, conviction_config.corroboration_kappa);
+
+            // Compute conviction-weighted q_target
+            // CJ q_target from existing drift_snr (normalized)
+            let drift_snr = if drift_unc > 1e-6 {
+                drift_bps / drift_unc
+            } else {
+                0.0
+            };
+            let q_base = 0.5 * (drift_snr / 2.0).tanh();
+            let conv_q = conviction_q_target(
+                q_base,
+                &conviction,
+                &conviction_config,
+                self.effective_max_position,
+            );
+
+            // Wire into market_params
+            market_params.conviction_score = conviction.score;
+            market_params.conviction_direction = conviction.direction;
+            market_params.conviction_corroboration = conviction.corroboration_count;
+            market_params.conviction_gamma_mult = gamma_mult;
+            market_params.conviction_margin_shift = margin_shift;
+            market_params.conviction_ask_tightening = ask_tightening;
+            market_params.conviction_q_target = conv_q;
+            market_params.conviction_drift_rate_per_sec = adaptive_drift;
+            market_params.conviction_reduce_only = reduce_only;
+
+            // Replace standard drift with adaptive when conviction provides corroboration
+            if corr_score > 0.0 && adaptive_drift.abs() > market_params.drift_rate_per_sec.abs() {
+                market_params.drift_rate_per_sec = adaptive_drift;
+            }
+
+            if conviction.score > 0.3 {
+                info!(
+                    conv_score = %format!("{:.3}", conviction.score),
+                    conv_dir = %format!("{:.1}", conviction.direction),
+                    corr_count = conviction.corroboration_count,
+                    gamma_mult = %format!("{:.3}", gamma_mult),
+                    margin_shift = %format!("{:.3}", margin_shift),
+                    ask_tight = %format!("{:.3}", ask_tightening),
+                    reduce_only = reduce_only,
+                    adaptive_drift_bps = %format!("{:.2}", adaptive_drift * 10_000.0),
+                    conv_q = %format!("{:.3}", conv_q),
+                    ch = %format!("[{:.2},{:.2},{:.2},{:.2},{:.2}]",
+                        conviction.channel_contributions[0],
+                        conviction.channel_contributions[1],
+                        conviction.channel_contributions[2],
+                        conviction.channel_contributions[3],
+                        conviction.channel_contributions[4]),
+                    "Directional conviction active"
+                );
+            }
+        }
+
+        // Conviction-based reduce-only (graduated, replaces binary 0.95)
+        if market_params.conviction_reduce_only {
+            let pos = self.position.position();
+            let dir = market_params.conviction_direction;
+            // Bearish conviction + long position → reduce-only
+            // Bullish conviction + short position → reduce-only
+            if (dir < 0.0 && pos > 0.0) || (dir > 0.0 && pos < 0.0) {
+                risk_reduce_only = true;
+                info!(
+                    conv_score = %format!("{:.3}", market_params.conviction_score),
+                    conv_dir = %format!("{:.1}", dir),
+                    position = %format!("{:.4}", pos),
+                    "Conviction reduce-only: graduated defense at Tier 3"
+                );
+            }
+        }
 
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
