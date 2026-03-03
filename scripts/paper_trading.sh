@@ -98,6 +98,11 @@ for i in $(seq 1 $#); do
             SPREAD_PROFILE="${!NEXT}"
             SKIP_NEXT=true
             ;;
+        --metrics-port)
+            NEXT=$((i + 1))
+            METRICS_PORT="${!NEXT}"
+            SKIP_NEXT=true
+            ;;
     esac
 done
 
@@ -148,8 +153,8 @@ mkdir -p "${OUTPUT_DIR}"
 
 # Pre-flight check: verify build
 echo -e "${YELLOW}[1/3] Building market_maker...${NC}"
-if ! cargo build --bin market_maker 2>/dev/null; then
-    echo -e "${RED}Build failed! Run 'cargo build --bin market_maker' to see errors.${NC}"
+if ! cargo build --release --bin market_maker 2>/dev/null; then
+    echo -e "${RED}Build failed! Run 'cargo build --release --bin market_maker' to see errors.${NC}"
     exit 1
 fi
 echo -e "${GREEN}Build OK${NC}"
@@ -234,7 +239,7 @@ if [ "$CAPTURE" = true ]; then
 fi
 
 # Run paper trader with tee to capture output
-./target/debug/market_maker ${CLI_ARGS} paper ${PAPER_ARGS} 2>&1 | tee "${LOG_FILE}" || true
+./target/release/market_maker ${CLI_ARGS} paper ${PAPER_ARGS} 2>&1 | tee "${LOG_FILE}" || true
 
 # Stop capture tool if started
 if [ -n "$CAPTURE_PID" ]; then

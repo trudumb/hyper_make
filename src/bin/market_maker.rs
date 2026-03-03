@@ -2681,10 +2681,9 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         asset: asset.clone(),
         user_address,
         fill_sim_config: FillSimulatorConfig {
-            // Paper orders don't exist in the real L2 book, so queue position
-            // estimation from book depth produces queue_frac=1.0 → P(fill)=0.
-            // Use flat age-based model instead.
-            ignore_book_depth: true,
+            // Deterministic queue-based fill matching: track real L2 depth and
+            // trade volume to determine fills via FIFO queue consumption.
+            deterministic_queue: true,
             ..FillSimulatorConfig::default()
         },
         dex: dex.clone(),

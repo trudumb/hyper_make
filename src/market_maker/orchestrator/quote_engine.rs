@@ -683,9 +683,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .lead_lag_signal()
                 .stability_confidence
                 .max(0.01);
+            // Issue 1: Lead-lag R scales with vol_ratio² and regime noise
+            // (momentum and flow already do this; lead-lag was the only one missing)
+            let regime_noise_mult = 1.0 + 2.0 * regime_probs[3] + 0.5 * regime_probs[2];
             drift_signals.push(SignalObservation {
                 value_bps_per_sec: self.reference_perp_drift_ema * 10_000.0,
-                variance: BASE_LL_VAR / ll_conf,
+                variance: vol_ratio.powi(2) * regime_noise_mult * BASE_LL_VAR / ll_conf,
                 // CALIBRATION TARGET: BASE_LL_VAR=50.0
             });
         }
@@ -2000,6 +2003,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // beta_calibration terms in the log-additive gamma. No new multiplicative layers.
         market_params.edge_uncertainty = self.tier2.edge_tracker.edge_uncertainty();
         market_params.calibration_deficit = self.quote_outcome_tracker.calibration_error();
+
+        // Issue 3: Wire calibration quality to central beliefs for observation noise modulation.
+        // Poor calibration → inflate observation R → posteriors become more diffuse → wider spreads.
+        self.central_beliefs
+            .update(BeliefUpdate::CalibrationUpdate {
+                cal_error: market_params.calibration_deficit,
+            });
 
         // Apply position-based size reduction from risk checker and drawdown tracker
         let risk_size_mult = self

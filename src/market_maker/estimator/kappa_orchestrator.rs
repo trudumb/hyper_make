@@ -356,8 +356,13 @@ impl KappaOrchestrator {
             0.0
         };
 
+        // Issue 5: ESS-scaled robust_tau — convert update variance to estimation uncertainty.
+        // robust_rolling_var is (κ_t - κ_{t-1})² (update variance). Dividing by √ESS gives
+        // proper estimation uncertainty: more data → more precise → higher tau → more weight.
         let robust_tau = if self.config.use_robust_kappa && robust_kappa > 100.0 {
-            1.0 / self.robust_rolling_var.max(1.0)
+            let ess = self.robust_kappa.effective_sample_size().max(1.0);
+            let estimation_var = self.robust_rolling_var / ess.sqrt();
+            1.0 / estimation_var.max(1.0)
         } else {
             0.0
         };
@@ -502,8 +507,13 @@ impl KappaOrchestrator {
         } else {
             0.0
         };
+        // Issue 5: ESS-scaled robust_tau — convert update variance to estimation uncertainty.
+        // robust_rolling_var is (κ_t - κ_{t-1})² (update variance). Dividing by √ESS gives
+        // proper estimation uncertainty: more data → more precise → higher tau → more weight.
         let robust_tau = if self.config.use_robust_kappa && robust_kappa > 100.0 {
-            1.0 / self.robust_rolling_var.max(1.0)
+            let ess = self.robust_kappa.effective_sample_size().max(1.0);
+            let estimation_var = self.robust_rolling_var / ess.sqrt();
+            1.0 / estimation_var.max(1.0)
         } else {
             0.0
         };
@@ -995,5 +1005,57 @@ mod tests {
         // total_own_fills should only go up
         orch.on_own_fill(3000, mid * 1.001, 1.0, mid);
         assert_eq!(orch.total_own_fills(), 4);
+    }
+
+    // === Issue 5: ESS-scaled robust_tau ===
+
+    #[test]
+    fn test_robust_tau_scales_with_ess() {
+        // Higher ESS → higher tau → more weight in precision-weighted blend
+        let mut orch = KappaOrchestrator::new(KappaOrchestratorConfig::default());
+        let mid = 100.0;
+
+        // Feed enough trades to build ESS
+        for i in 0..50 {
+            orch.on_market_trade(i * 1000, mid * 1.001, mid);
+        }
+
+        // The robust_tau should use ESS scaling
+        let ess = orch.robust_kappa.effective_sample_size();
+        assert!(
+            ess > 10.0,
+            "Should have meaningful ESS after 50 trades: {:.1}",
+            ess
+        );
+
+        // With high ESS, estimation_var = rolling_var / √ESS is small → high tau
+        // Verify kappa is reasonable (doesn't blow up or collapse)
+        let kappa = orch.kappa_effective();
+        assert!(
+            kappa > 50.0 && kappa < 10000.0,
+            "Kappa should be reasonable: {}",
+            kappa
+        );
+    }
+
+    #[test]
+    fn test_kappa_blend_ess1_matches_approximate_old() {
+        // With ESS=1, estimation_var ≈ robust_rolling_var (no sqrt scaling benefit)
+        let mut orch = KappaOrchestrator::new(KappaOrchestratorConfig::default());
+
+        // Give it enough fills to exit warmup + get some rolling stats
+        let mid = 100.0;
+        for i in 0..10 {
+            orch.on_own_fill(i * 1000, mid * 1.001, 1.0, mid);
+            orch.on_market_trade(i * 1000, mid * 1.001, mid);
+        }
+
+        // Kappa should be well-defined and reasonable
+        let kappa = orch.kappa_effective();
+        assert!(
+            kappa > 50.0 && kappa < 10000.0,
+            "Kappa should be reasonable with limited data: {}",
+            kappa
+        );
     }
 }

@@ -99,7 +99,9 @@
       "Bash(RUST_LOG=\"market_maker=info\" timeout 45 ./target/debug/market_maker:*)",
       "Bash(env:*)",
       "Bash(pkill:*)",
-      "Bash(./target/debug/market_maker:*)"
+      "Bash(./target/debug/market_maker:*)",
+      "Bash(chmod +x:*)",
+      "Bash(timeout 10 ./scripts/validate_side_by_side.sh HYPE:*)"
     ]
   }
 }

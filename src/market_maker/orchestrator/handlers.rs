@@ -392,6 +392,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .observe_markout(realized_bps, predicted_bps);
             }
 
+            // === Issue 2: BMA sigma feedback from realized variance ===
+            // Teach BMA which sigma model is correct using realized markout variance.
+            // After ~20 fills, BMA transitions from equal weights to data-driven weights.
+            {
+                let mid_change_frac = (self.latest_mid - pending.mid_at_fill) / pending.mid_at_fill;
+                let realized_sigma_sq = mid_change_frac.powi(2) / MARKOUT_SECONDS;
+                if realized_sigma_sq > 0.0 && realized_sigma_sq.is_finite() {
+                    self.sigma_bma.observe_realized_variance(realized_sigma_sq);
+                }
+            }
+
             // Close prediction→correction loop: if classifier overpredicts AS,
             // bias correction reduces effective toxicity in spread_multiplier().
             // predicted_as_bps_val and markout_as_bps computed below in EdgeSnapshot block.

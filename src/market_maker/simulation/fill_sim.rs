@@ -69,6 +69,10 @@ pub struct FillSimulatorConfig {
     /// Higher alpha = back-of-queue gets filled much less often.
     /// Default 1.5: front-of-queue ~100%, back-of-queue ~15%.
     pub queue_alpha: f64,
+    /// Use deterministic queue-based fill matching instead of probabilistic model.
+    /// When true, tracks real L2 depth and trade volume to determine fills via
+    /// FIFO queue consumption. When false, uses the legacy probabilistic model.
+    pub deterministic_queue: bool,
 }
 
 impl Default for FillSimulatorConfig {
@@ -82,6 +86,7 @@ impl Default for FillSimulatorConfig {
             cancel_latency_ms: 50,
             ignore_book_depth: false,
             queue_alpha: 1.5,
+            deterministic_queue: true,
         }
     }
 }
@@ -101,6 +106,10 @@ pub struct QueuePositionEstimator {
     our_size: f64,
     /// Order ID for correlation
     oid: u64,
+    /// Absolute volume ahead of us in FIFO queue (deterministic mode).
+    /// Initialized to `size_at_level` (we join at the back).
+    /// Decremented by trades consuming depth and by L2 depth shrinkage.
+    queue_ahead: f64,
 }
 
 impl QueuePositionEstimator {
@@ -112,12 +121,35 @@ impl QueuePositionEstimator {
             current_size_at_level: size_at_level,
             our_size,
             oid,
+            queue_ahead: size_at_level, // join at the back of the queue
         }
     }
 
     /// Update the current observed depth at this price level from an L2 snapshot.
+    /// If depth decreased, cancelled/removed orders improve our queue position.
     pub fn update_level_size(&mut self, current_size: f64) {
+        let prev_size = self.current_size_at_level;
         self.current_size_at_level = current_size;
+
+        // If depth shrank, some orders ahead were cancelled — improve our position
+        if current_size < prev_size {
+            let depth_removed = prev_size - current_size;
+            self.queue_ahead = (self.queue_ahead - depth_removed).max(0.0);
+        }
+    }
+
+    /// Consume volume from a trade at this price level (deterministic mode).
+    ///
+    /// Decrements `queue_ahead` by the trade volume. Returns `true` if the order
+    /// should be filled (all depth ahead has been consumed).
+    pub fn consume_volume(&mut self, trade_volume: f64) -> bool {
+        self.queue_ahead -= trade_volume;
+        self.queue_ahead <= 0.0
+    }
+
+    /// Get current queue_ahead value (for diagnostics).
+    pub fn queue_ahead(&self) -> f64 {
+        self.queue_ahead
     }
 
     /// Estimate the fraction of the queue ahead of us (0.0 = front, 1.0 = back).
@@ -330,71 +362,79 @@ impl FillSimulator {
             );
         }
 
-        for order in orders {
-            // Check if this trade could fill the order
-            if let Some(fill) = self.check_fill(&order, trade) {
-                // Don't call simulate_fill() here — that would mutate order state
-                // before apply_fill() in paper.rs gets a chance, causing a
-                // double-decrement where apply_fill() sees Filled status and
-                // returns None, silently dropping the fill event.
-                // Instead, just record bookkeeping; apply_fill() handles mutation.
-                info!(
-                    oid = fill.oid,
-                    side = ?fill.side,
-                    price = fill.fill_price,
-                    size = fill.fill_size,
-                    "[SIM] Fill decided"
-                );
+        if self.config.deterministic_queue {
+            // Deterministic queue-based matching.
+            //
+            // First pass: identify fills from trade-throughs and collect
+            // at-level orders that need queue consumption.
+            let mut at_level_oids: Vec<u64> = Vec::new();
 
-                self.total_fills += 1;
-                self.total_size_filled += fill.fill_size;
-
-                // Remove queue estimator for filled order
-                self.queue_estimators.remove(&fill.oid);
-
-                // Add to recent fills
-                self.recent_fills.push_back(fill.clone());
-                while self.recent_fills.len() > self.max_recent_fills {
-                    self.recent_fills.pop_front();
+            for order in &orders {
+                if !self.check_fill_preconditions(order, trade) {
+                    continue;
                 }
 
-                fills.push(fill);
+                let (fill_opt, needs_consume) = self.check_fill_deterministic(order, trade);
+
+                if let Some(fill) = fill_opt {
+                    // Trade-through fill
+                    self.record_fill(&mut fills, fill);
+                } else if needs_consume {
+                    at_level_oids.push(order.oid);
+                }
+            }
+
+            // Second pass: consume volume for at-level orders.
+            // A single trade decrements queue_ahead for ALL orders at that level
+            // (the trade consumed real-book depth ahead of all our orders).
+            for oid in at_level_oids {
+                let filled = if let Some(estimator) = self.queue_estimators.get_mut(&oid) {
+                    estimator.consume_volume(trade.size)
+                } else {
+                    // No estimator yet — create one from current L2 depth.
+                    // The order just arrived before any L2 update.
+                    let order = orders.iter().find(|o| o.oid == oid);
+                    if let Some(order) = order {
+                        let depth = self.book_depth_at_price(order.price, order.is_buy);
+                        let mut est = QueuePositionEstimator::new(oid, order.size, depth);
+                        let result = est.consume_volume(trade.size);
+                        self.queue_estimators.insert(oid, est);
+                        result
+                    } else {
+                        false
+                    }
+                };
+
+                if filled {
+                    if let Some(order) = orders.iter().find(|o| o.oid == oid) {
+                        let fill_size = order.size.min(trade.size);
+                        if let Some(fill) = self.make_fill(order, trade, fill_size) {
+                            self.record_fill(&mut fills, fill);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Legacy probabilistic path
+            for order in &orders {
+                if !self.check_fill_preconditions(order, trade) {
+                    continue;
+                }
+                if let Some(fill) = self.check_fill_probabilistic(order, trade) {
+                    self.record_fill(&mut fills, fill);
+                }
             }
         }
 
         fills
     }
 
-    /// Check if a trade would fill an order
-    fn check_fill(&self, order: &SimulatedOrder, trade: &MarketTrade) -> Option<SimulatedFill> {
-        if order.status != SimulatedOrderStatus::Resting {
-            return None;
-        }
-
-        // Latency simulation: skip orders that haven't been resting long enough
-        let effective_resting_at = order.created_at_ns + self.placement_latency_ns;
-        if trade.timestamp_ns < effective_resting_at {
-            return None;
-        }
-
-        // Check trade size threshold
-        if trade.size < self.config.min_triggering_trade_size {
-            return None;
-        }
-
-        // Check price condition:
-        // - Buy order: filled when trade price <= order price
-        // - Sell order: filled when trade price >= order price
-        let price_condition = if order.is_buy {
-            trade.price <= order.price
-        } else {
-            trade.price >= order.price
-        };
-
-        if !price_condition {
-            return None;
-        }
-
+    /// Check if a trade would fill an order (probabilistic path).
+    fn check_fill_probabilistic(
+        &self,
+        order: &SimulatedOrder,
+        trade: &MarketTrade,
+    ) -> Option<SimulatedFill> {
         // Check aggressor direction:
         // - Our buy order gets filled by aggressive sell (trade.side == Sell)
         // - Our sell order gets filled by aggressive buy (trade.side == Buy)
@@ -428,6 +468,112 @@ impl FillSimulator {
             return None;
         }
 
+        self.make_fill(order, trade, fill_size)
+    }
+
+    /// Check if a trade would fill an order (deterministic queue path).
+    ///
+    /// Returns `(Option<fill>, should_consume_volume)`:
+    /// - Trade-through: immediate fill, no volume consumption needed (all depth cleared)
+    /// - At-level with correct aggressor: consume volume via estimator
+    /// - Wrong aggressor: no fill, no consumption
+    fn check_fill_deterministic(
+        &self,
+        order: &SimulatedOrder,
+        trade: &MarketTrade,
+    ) -> (Option<SimulatedFill>, bool) {
+        // Check aggressor direction
+        let aggressor_matches = if order.is_buy {
+            trade.side == Side::Sell
+        } else {
+            trade.side == Side::Buy
+        };
+
+        if !aggressor_matches {
+            // Wrong aggressor → no fill, no volume consumption
+            return (None, false);
+        }
+
+        // Trade-through check: trade price strictly better than our order price
+        let is_trade_through = if order.is_buy {
+            trade.price < order.price
+        } else {
+            trade.price > order.price
+        };
+
+        if is_trade_through {
+            // Trade went through our level → all depth consumed → immediate fill
+            let fill_size = order.size.min(trade.size);
+            return (self.make_fill(order, trade, fill_size), false);
+        }
+
+        // At-level trade: need to consume queue volume via estimator
+        // The actual consumption happens in on_trade() after this check
+        (None, true)
+    }
+
+    /// Common pre-checks for fill eligibility (both paths).
+    fn check_fill_preconditions(&self, order: &SimulatedOrder, trade: &MarketTrade) -> bool {
+        if order.status != SimulatedOrderStatus::Resting {
+            return false;
+        }
+
+        // Latency simulation: skip orders that haven't been resting long enough
+        let effective_resting_at = order.created_at_ns + self.placement_latency_ns;
+        if trade.timestamp_ns < effective_resting_at {
+            return false;
+        }
+
+        // Check trade size threshold
+        if trade.size < self.config.min_triggering_trade_size {
+            return false;
+        }
+
+        // Check price condition:
+        // - Buy order: filled when trade price <= order price
+        // - Sell order: filled when trade price >= order price
+        if order.is_buy {
+            trade.price <= order.price
+        } else {
+            trade.price >= order.price
+        }
+    }
+
+    /// Record a fill: bookkeeping, logging, cleanup.
+    fn record_fill(&mut self, fills: &mut Vec<SimulatedFill>, fill: SimulatedFill) {
+        info!(
+            oid = fill.oid,
+            side = ?fill.side,
+            price = fill.fill_price,
+            size = fill.fill_size,
+            "[SIM] Fill decided"
+        );
+
+        self.total_fills += 1;
+        self.total_size_filled += fill.fill_size;
+
+        // Remove queue estimator for filled order
+        self.queue_estimators.remove(&fill.oid);
+
+        // Add to recent fills
+        self.recent_fills.push_back(fill.clone());
+        while self.recent_fills.len() > self.max_recent_fills {
+            self.recent_fills.pop_front();
+        }
+
+        fills.push(fill);
+    }
+
+    /// Construct a `SimulatedFill` from an order, trade, and fill size.
+    fn make_fill(
+        &self,
+        order: &SimulatedOrder,
+        trade: &MarketTrade,
+        fill_size: f64,
+    ) -> Option<SimulatedFill> {
+        if fill_size <= 0.0 {
+            return None;
+        }
         let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -436,7 +582,7 @@ impl FillSimulator {
         Some(SimulatedFill {
             oid: order.oid,
             timestamp_ns: now_ns,
-            fill_price: order.price, // Fill at limit price
+            fill_price: order.price,
             fill_size,
             side: if order.is_buy { Side::Buy } else { Side::Sell },
             triggering_trade_price: trade.price,
@@ -710,7 +856,7 @@ mod tests {
         };
 
         let trade = MarketTrade {
-            timestamp_ns: 1_000_000_000,
+            timestamp_ns: future_trade_ts(),
             price: 99.0, // Trade through our level
             size: 0.5,
             side: Side::Sell,
@@ -726,7 +872,7 @@ mod tests {
         let mut sim = FillSimulator::new(
             executor.clone(),
             FillSimulatorConfig {
-                touch_fill_probability: 1.0, // Always fill for test
+                deterministic_queue: true,
                 ..Default::default()
             },
         );
@@ -739,17 +885,21 @@ mod tests {
                 .await;
         });
 
-        // Trade at 99 should potentially fill
+        // Trade at 99 (trade-through) should fill deterministically
         let trade = MarketTrade {
-            timestamp_ns: 1_000_000_000,
+            timestamp_ns: future_trade_ts(),
             price: 99.0,
             size: 1.0,
             side: Side::Sell,
         };
 
         let fills = sim.on_trade(&trade);
-        // May or may not fill depending on probability
-        assert!(fills.len() <= 1);
+        assert_eq!(
+            fills.len(),
+            1,
+            "Trade-through should fill deterministically"
+        );
+        assert!((fills[0].fill_price - 100.0).abs() < 1e-10);
     }
 
     #[test]
@@ -877,10 +1027,7 @@ mod tests {
         let mut sim = FillSimulator::new(
             executor.clone(),
             FillSimulatorConfig {
-                touch_fill_probability: 1.0,
-                queue_position_factor: 1.0,
-                queue_alpha: 1.0,
-                ignore_book_depth: true,
+                deterministic_queue: true,
                 ..Default::default()
             },
         );
@@ -895,30 +1042,27 @@ mod tests {
 
         // Add a queue estimator for it
         let orders = executor.get_active_orders();
-        if let Some(order) = orders.first() {
-            sim.queue_estimators
-                .insert(order.oid, QueuePositionEstimator::new(order.oid, 1.0, 5.0));
-            let oid = order.oid;
+        let order = orders.first().expect("should have an order");
+        sim.queue_estimators
+            .insert(order.oid, QueuePositionEstimator::new(order.oid, 1.0, 5.0));
+        let oid = order.oid;
 
-            assert!(sim.queue_estimators.contains_key(&oid));
+        assert!(sim.queue_estimators.contains_key(&oid));
 
-            // Trigger a fill
-            let trade = MarketTrade {
-                timestamp_ns: 1_000_000_000,
-                price: 99.0,
-                size: 10.0,
-                side: Side::Sell,
-            };
-            let fills = sim.on_trade(&trade);
+        // Trade-through at 99 < 100 → deterministic fill
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 99.0,
+            size: 10.0,
+            side: Side::Sell,
+        };
+        let fills = sim.on_trade(&trade);
 
-            // If filled, queue estimator should be removed
-            if !fills.is_empty() {
-                assert!(
-                    !sim.queue_estimators.contains_key(&oid),
-                    "Queue estimator should be removed after fill"
-                );
-            }
-        }
+        assert_eq!(fills.len(), 1, "Trade-through should fill");
+        assert!(
+            !sim.queue_estimators.contains_key(&oid),
+            "Queue estimator should be removed after fill"
+        );
     }
 
     #[test]
@@ -928,6 +1072,10 @@ mod tests {
         assert!((config.touch_fill_probability - 0.3).abs() < 1e-10);
         assert!((config.queue_position_factor - 0.4).abs() < 1e-10);
         assert!((config.queue_alpha - 1.5).abs() < 1e-10);
+        assert!(
+            config.deterministic_queue,
+            "deterministic_queue should default to true"
+        );
     }
 
     #[test]
@@ -1025,6 +1173,298 @@ mod tests {
             "Scale should be >= min_fraction {}, got {}",
             min_frac,
             scale
+        );
+    }
+
+    // --- Deterministic queue-based fill tests ---
+
+    /// Get a trade timestamp safely in the future of any order placement.
+    fn future_trade_ts() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+            + 500_000_000 // 500ms in the future (well past placement latency)
+    }
+
+    /// Helper: create a deterministic-mode FillSimulator with an order placed.
+    /// Returns (simulator, executor, oid).
+    fn setup_deterministic_sim(
+        order_price: f64,
+        order_size: f64,
+        is_buy: bool,
+        depth_at_level: f64,
+    ) -> (FillSimulator, Arc<SimulationExecutor>, u64) {
+        let executor = Arc::new(SimulationExecutor::new(false));
+        let mut sim = FillSimulator::new(
+            executor.clone(),
+            FillSimulatorConfig {
+                deterministic_queue: true,
+                ..Default::default()
+            },
+        );
+
+        // Place order
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mid = if is_buy {
+                order_price + 1.0
+            } else {
+                order_price - 1.0
+            };
+            executor.update_mid(mid);
+            executor
+                .place_order("BTC", order_price, order_size, is_buy, None, true)
+                .await;
+        });
+
+        let orders = executor.get_active_orders();
+        let oid = orders.first().expect("should have order").oid;
+
+        // Seed queue estimator with known depth
+        sim.queue_estimators.insert(
+            oid,
+            QueuePositionEstimator::new(oid, order_size, depth_at_level),
+        );
+
+        (sim, executor, oid)
+    }
+
+    #[test]
+    fn test_deterministic_fill_queue_consumed() {
+        // Place buy order behind 10 units of depth. Feed 10+ units of trades → fill.
+        let (mut sim, _exec, oid) = setup_deterministic_sim(100.0, 1.0, true, 10.0);
+
+        // Feed trades that sum to > 10 units at our level
+        let trade1 = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 100.0, // at our level (not through)
+            size: 6.0,
+            side: Side::Sell, // correct aggressor for our buy
+        };
+        let fills = sim.on_trade(&trade1);
+        assert!(fills.is_empty(), "6 < 10 depth ahead, should not fill yet");
+
+        // Queue ahead should be 10 - 6 = 4
+        let est = sim.get_queue_estimator(oid).expect("estimator exists");
+        assert!((est.queue_ahead() - 4.0).abs() < 1e-10);
+
+        let trade2 = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 100.0,
+            size: 5.0,
+            side: Side::Sell,
+        };
+        let fills = sim.on_trade(&trade2);
+        assert_eq!(fills.len(), 1, "4 remaining - 5 = -1, should fill");
+        assert_eq!(fills[0].oid, oid);
+        assert!((fills[0].fill_price - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_deterministic_no_fill_insufficient_volume() {
+        // Feed 5 units of trades against 10 units depth → no fill
+        let (mut sim, _exec, oid) = setup_deterministic_sim(100.0, 1.0, true, 10.0);
+
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 100.0,
+            size: 5.0,
+            side: Side::Sell,
+        };
+        let fills = sim.on_trade(&trade);
+        assert!(fills.is_empty(), "5 < 10 depth, should not fill");
+
+        // Estimator should still exist with queue_ahead = 5
+        let est = sim.get_queue_estimator(oid).expect("estimator exists");
+        assert!((est.queue_ahead() - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_deterministic_trade_through() {
+        // Trade at price strictly better than order → immediate fill regardless of depth
+        let (mut sim, _exec, _oid) = setup_deterministic_sim(100.0, 1.0, true, 50.0);
+
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 99.0, // strictly below our buy at 100 → trade-through
+            size: 2.0,
+            side: Side::Sell,
+        };
+        let fills = sim.on_trade(&trade);
+        assert_eq!(fills.len(), 1, "Trade-through should fill immediately");
+        assert!(
+            (fills[0].fill_size - 1.0).abs() < 1e-10,
+            "Fill size = min(order=1, trade=2)"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_l2_shrink_improves_position() {
+        // L2 depth decreases → queue_ahead shrinks → fewer trades needed to fill
+        let (mut sim, _exec, oid) = setup_deterministic_sim(100.0, 1.0, true, 20.0);
+
+        // Simulate L2 update: depth at our level drops from 20 to 8
+        // (12 orders cancelled ahead of us)
+        if let Some(est) = sim.queue_estimators.get_mut(&oid) {
+            est.update_level_size(8.0);
+        }
+
+        // queue_ahead should be 20 - 12 = 8
+        let est = sim.get_queue_estimator(oid).expect("estimator exists");
+        assert!((est.queue_ahead() - 8.0).abs() < 1e-10);
+
+        // Now a trade of 9 units should fill us (8 ahead consumed)
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 100.0,
+            size: 9.0,
+            side: Side::Sell,
+        };
+        let fills = sim.on_trade(&trade);
+        assert_eq!(fills.len(), 1, "8 ahead - 9 trade = -1, should fill");
+    }
+
+    #[test]
+    fn test_deterministic_wrong_aggressor_no_fill() {
+        // Buy trade at our buy level → no fill (not consuming our side)
+        let (mut sim, _exec, _oid) = setup_deterministic_sim(100.0, 1.0, true, 5.0);
+
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 100.0,
+            size: 100.0,     // huge trade but wrong direction
+            side: Side::Buy, // wrong aggressor for our buy order
+        };
+        let fills = sim.on_trade(&trade);
+        assert!(fills.is_empty(), "Wrong aggressor should never fill");
+    }
+
+    #[test]
+    fn test_deterministic_partial_fill() {
+        // Trade has less volume than our order but exhausts remaining queue
+        let (mut sim, _exec, _oid) = setup_deterministic_sim(100.0, 5.0, true, 3.0);
+
+        // 3 depth ahead, trade of 4 → fills, but fill_size = min(order=5, trade=4) = 4
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 100.0,
+            size: 4.0,
+            side: Side::Sell,
+        };
+        let fills = sim.on_trade(&trade);
+        assert_eq!(
+            fills.len(),
+            1,
+            "Should fill after consuming all depth ahead"
+        );
+        assert!(
+            (fills[0].fill_size - 4.0).abs() < 1e-10,
+            "Fill size should be min(order=5, trade=4) = 4, got {}",
+            fills[0].fill_size
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_fallback_still_works() {
+        // deterministic_queue: false preserves the old probabilistic behavior
+        let executor = Arc::new(SimulationExecutor::new(false));
+        let mut sim = FillSimulator::new(
+            executor.clone(),
+            FillSimulatorConfig {
+                deterministic_queue: false,
+                touch_fill_probability: 1.0, // guarantee fill in probabilistic mode
+                queue_position_factor: 1.0,
+                ignore_book_depth: true,
+                ..Default::default()
+            },
+        );
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            executor.update_mid(101.0);
+            executor
+                .place_order("BTC", 100.0, 1.0, true, None, true)
+                .await;
+        });
+
+        // Trade-through with high probability config → should fill
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 99.0,
+            size: 1.0,
+            side: Side::Sell,
+        };
+        let fills = sim.on_trade(&trade);
+        assert_eq!(
+            fills.len(),
+            1,
+            "Probabilistic mode with prob=1.0 should fill"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_sell_order_fill() {
+        // Verify deterministic fills work for sell orders too
+        let (mut sim, _exec, oid) = setup_deterministic_sim(100.0, 1.0, false, 5.0);
+
+        // Aggressive buy at our sell level
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 100.0,
+            size: 6.0, // > 5 depth ahead
+            side: Side::Buy,
+        };
+        let fills = sim.on_trade(&trade);
+        assert_eq!(fills.len(), 1, "Sell order should fill when queue consumed");
+        assert_eq!(fills[0].oid, oid);
+    }
+
+    #[test]
+    fn test_deterministic_sell_trade_through() {
+        // Trade through sell order (trade price > order price)
+        let (mut sim, _exec, _oid) = setup_deterministic_sim(100.0, 1.0, false, 50.0);
+
+        let trade = MarketTrade {
+            timestamp_ns: future_trade_ts(),
+            price: 101.0, // strictly above our sell at 100 → trade-through
+            size: 0.5,
+            side: Side::Buy,
+        };
+        let fills = sim.on_trade(&trade);
+        assert_eq!(fills.len(), 1, "Trade-through sell should fill immediately");
+        assert!(
+            (fills[0].fill_size - 0.5).abs() < 1e-10,
+            "Fill size = min(order=1, trade=0.5) = 0.5"
+        );
+    }
+
+    #[test]
+    fn test_queue_ahead_initialized_to_depth() {
+        let est = QueuePositionEstimator::new(1, 1.0, 15.0);
+        assert!((est.queue_ahead() - 15.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_consume_volume_returns_true_when_exhausted() {
+        let mut est = QueuePositionEstimator::new(1, 1.0, 10.0);
+        assert!(!est.consume_volume(5.0)); // 10 - 5 = 5, not filled
+        assert!(!est.consume_volume(4.0)); // 5 - 4 = 1, not filled
+        assert!(est.consume_volume(2.0)); // 1 - 2 = -1, filled
+    }
+
+    #[test]
+    fn test_update_level_size_adjusts_queue_ahead() {
+        let mut est = QueuePositionEstimator::new(1, 1.0, 20.0);
+        assert!((est.queue_ahead() - 20.0).abs() < 1e-10);
+
+        // Depth shrinks from 20 to 12 → 8 cancelled ahead of us
+        est.update_level_size(12.0);
+        assert!((est.queue_ahead() - 12.0).abs() < 1e-10);
+
+        // Depth grows from 12 to 15 → new orders behind us, no queue_ahead change
+        est.update_level_size(15.0);
+        assert!(
+            (est.queue_ahead() - 12.0).abs() < 1e-10,
+            "Growth should not change queue_ahead"
         );
     }
 }

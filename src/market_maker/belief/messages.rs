@@ -248,6 +248,18 @@ pub enum BeliefUpdate {
     },
 
     // =========================================================================
+    // Calibration Feedback
+    // =========================================================================
+    /// Calibration quality update for observation noise modulation.
+    ///
+    /// Published by: Quote engine (each cycle from QuoteOutcomeTracker).
+    /// Poor calibration → inflate observation R → posteriors become more diffuse.
+    CalibrationUpdate {
+        /// Calibration error from quote outcome tracker [0, ∞)
+        cal_error: f64,
+    },
+
+    // =========================================================================
     // Control
     // =========================================================================
     /// Soft reset: decay beliefs while retaining some information.

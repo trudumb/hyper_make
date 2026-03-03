@@ -56,7 +56,7 @@ pub struct LevelStats {
 /// Configuration for P&L attribution.
 #[derive(Debug, Clone)]
 pub struct PnLConfig {
-    /// Fee rate (as fraction, e.g., 0.0002 = 2 bps)
+    /// Fee rate (as fraction, e.g., 0.00015 = 1.5 bps)
     pub fee_rate: f64,
     /// Maximum history entries to keep
     pub max_history: usize,
@@ -65,7 +65,7 @@ pub struct PnLConfig {
 impl Default for PnLConfig {
     fn default() -> Self {
         Self {
-            fee_rate: 0.0002, // 2 bps maker fee
+            fee_rate: 0.00015, // 1.5 bps maker fee (Hyperliquid)
             max_history: 1000,
         }
     }
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = PnLConfig::default();
-        assert_eq!(config.fee_rate, 0.0002);
+        assert_eq!(config.fee_rate, 0.00015);
     }
 
     #[test]

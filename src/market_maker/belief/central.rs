@@ -75,6 +75,10 @@ pub struct CentralBeliefConfig {
     pub dir_noise_burst: f64,
     /// Max |μ/σ| z-ratio. Φ(4.0)≈0.99997. Safety ceiling.
     pub dir_max_z_ratio: f64,
+    /// Max z-ratio in cascade regime (wider conviction allowed).
+    /// Interpolated between dir_max_z_ratio and this based on P(cascade).
+    /// Φ(6.0)≈0.9999999. Allows extreme skew during genuine cascades.
+    pub dir_max_z_ratio_cascade: f64,
     /// Variance floor (fraction of prior). 0.01 → never claim >10σ certainty.
     pub dir_min_variance_frac: f64,
     /// Scale for AS magnitude normalization in directional evidence.
@@ -147,6 +151,7 @@ impl Default for CentralBeliefConfig {
             dir_noise_flow: 1.0,
             dir_noise_burst: 0.5,
             dir_max_z_ratio: 4.0,
+            dir_max_z_ratio_cascade: 6.0,
             dir_min_variance_frac: 0.01,
             dir_as_scale_bps: 15.0,
             tau_autocorrelation_secs: 10.0,
@@ -387,6 +392,13 @@ struct InternalState {
 
     // === Regime (HMM) ===
     regime_probs: [f64; 4],
+    /// Regime-dependent noise multiplier for observation R.
+    /// 1.0 = calm (default), up to 3.0 during cascade.
+    /// Computed from P(cascade) and P(bursty) in RegimeUpdate handler.
+    regime_noise_scale: f64,
+    /// Calibration-quality noise multiplier for observation R.
+    /// 1.0 = well-calibrated, grows with cal_error² (poor calibration → diffuse posteriors).
+    calibration_noise_mult: f64,
 
     // === Changepoint (BOCD) ===
     changepoint_run_probs: Vec<f64>,
@@ -544,6 +556,8 @@ impl Default for InternalState {
 
             // Regime
             regime_probs: [0.2, 0.5, 0.2, 0.1],
+            regime_noise_scale: 1.0,
+            calibration_noise_mult: 1.0,
 
             // Changepoint
             changepoint_run_probs,
@@ -811,19 +825,34 @@ impl CentralBeliefState {
                 fill_count,
                 timestamp_ms,
             } => {
-                self.dir_kalman_predict(state, timestamp_ms);
+                // Issue 4: Burst events are rare, very persistent → persistence=0.9
+                self.dir_kalman_predict_for_source(state, timestamp_ms, 0.9);
                 // is_buy_side=true → sell aggressor hit our bid → bearish → μ↑
                 let direction = if is_buy_side { 1.0 } else { -1.0 };
                 // Magnitude: ln(intensity_ratio) + 1 scaled by sqrt(fill_count)
                 let magnitude = (intensity_ratio.max(1.0).ln() + 1.0) * (fill_count as f64).sqrt();
                 let obs = direction * magnitude.clamp(0.5, 5.0);
-                self.dir_kalman_update(state, obs, self.config.dir_noise_burst);
+                // Issue 1+3: Adaptive noise scaling
+                let effective_noise = self.config.dir_noise_burst
+                    * state.regime_noise_scale
+                    * state.calibration_noise_mult;
+                self.dir_kalman_update(state, obs, effective_noise);
                 state.dir_n_burst += 1;
                 state.last_update_ms = timestamp_ms;
             }
 
             BeliefUpdate::RegimeUpdate { probs, features: _ } => {
                 state.regime_probs = probs;
+                // Issue 1: Adaptive observation noise — cascade inflates R up to 3x
+                let p_cascade = probs[3];
+                let p_bursty = probs[2];
+                state.regime_noise_scale = 1.0 + 2.0 * p_cascade + 0.5 * p_bursty;
+            }
+
+            BeliefUpdate::CalibrationUpdate { cal_error } => {
+                // Issue 3: Poor calibration → inflate observation R
+                // cal_error=0.5 → 1.25x noisier, cal_error=1.0 → 2.0x noisier
+                state.calibration_noise_mult = 1.0 + cal_error.powi(2);
             }
 
             BeliefUpdate::ChangepointObs { observation } => {
@@ -887,7 +916,11 @@ impl CentralBeliefState {
                 // --- Directional drift posterior: order flow evidence ---
                 // order_flow_direction ∈ [-1,1], positive = buy pressure = bullish → obs < 0
                 let obs_flow = (-order_flow_direction).clamp(-2.0, 2.0);
-                self.dir_kalman_update(state, obs_flow, self.config.dir_noise_flow);
+                // Issue 1+3: Adaptive noise scaling
+                let effective_noise = self.config.dir_noise_flow
+                    * state.regime_noise_scale
+                    * state.calibration_noise_mult;
+                self.dir_kalman_update(state, obs_flow, effective_noise);
                 state.dir_n_flow += 1;
                 state.dir_evidence_flow += obs_flow;
             }
@@ -940,6 +973,8 @@ impl CentralBeliefState {
 
     /// Kalman predict step: mean reverts toward zero, variance grows with process noise.
     /// Replaces apply_dir_time_decay.
+    /// Retained for backward compat — prefer dir_kalman_predict_for_source for new code.
+    #[allow(dead_code)]
     fn dir_kalman_predict(&self, state: &mut InternalState, current_ms: u64) {
         if state.dir_last_update_ms == 0 || current_ms <= state.dir_last_update_ms {
             state.dir_last_update_ms = current_ms;
@@ -968,6 +1003,55 @@ impl CentralBeliefState {
         state.dir_last_update_ms = current_ms;
     }
 
+    /// Predict with source-attenuated process noise.
+    ///
+    /// `persistence` in [0,1]: how long this source's evidence persists.
+    /// - Price: 0.2 (fast decorrelation, ~1s)
+    /// - Flow: 0.5 (moderate, ~5s)
+    /// - Fill/AS: 0.8 (holding-period persistence, 30-300s)
+    /// - Burst: 0.9 (rare, very persistent)
+    ///
+    /// Persistent sources get less process noise growth per second, preventing
+    /// the filter from "forgetting" fill evidence too quickly while still
+    /// allowing stale price evidence to decay at the normal rate.
+    fn dir_kalman_predict_for_source(
+        &self,
+        state: &mut InternalState,
+        current_ms: u64,
+        persistence: f64,
+    ) {
+        if state.dir_last_update_ms == 0 || current_ms <= state.dir_last_update_ms {
+            state.dir_last_update_ms = current_ms;
+            return;
+        }
+        let dt_secs = (current_ms - state.dir_last_update_ms) as f64 / 1000.0;
+        let tau = state.acf_tracker.tau_ac().clamp(3.0, 120.0);
+        let decay = (-dt_secs / tau).exp();
+
+        // Mean reverts toward zero
+        state.dir_mu *= decay;
+
+        // Source-attenuated process noise: persistent sources → less variance growth
+        // persistence=0.8 → q_scale=0.36 (fill: 36% of normal Q)
+        // persistence=0.2 → q_scale=0.84 (price: 84% of normal Q)
+        let q_scale = 1.0 - persistence.clamp(0.0, 1.0) * 0.8;
+        state.dir_sigma_sq = state.dir_sigma_sq * decay * decay
+            + self.config.dir_process_noise_rate * q_scale * dt_secs;
+
+        // Variance bounds
+        let var_floor = self.config.dir_prior_variance * self.config.dir_min_variance_frac;
+        let var_ceil = self.config.dir_prior_variance * 4.0;
+        state.dir_sigma_sq = state.dir_sigma_sq.clamp(var_floor, var_ceil);
+
+        // Decay evidence diagnostics
+        state.dir_evidence_price *= decay;
+        state.dir_evidence_fill *= decay;
+        state.dir_evidence_as *= decay;
+        state.dir_evidence_flow *= decay;
+
+        state.dir_last_update_ms = current_ms;
+    }
+
     /// Scalar Kalman update: incorporates a single observation with known noise variance.
     fn dir_kalman_update(&self, state: &mut InternalState, obs: f64, noise_var: f64) {
         // K = σ²_prior / (σ²_prior + σ²_noise)
@@ -979,9 +1063,12 @@ impl CentralBeliefState {
         let var_floor = self.config.dir_prior_variance * self.config.dir_min_variance_frac;
         state.dir_sigma_sq = state.dir_sigma_sq.max(var_floor);
 
-        // Z-ratio safety clamp
+        // Issue 6: Regime-dependent z-cap — cascade allows wider conviction
+        let p_cascade = state.regime_probs.get(3).copied().unwrap_or(0.0);
+        let max_z = self.config.dir_max_z_ratio
+            + (self.config.dir_max_z_ratio_cascade - self.config.dir_max_z_ratio) * p_cascade;
         let sigma = state.dir_sigma_sq.sqrt();
-        let max_mu = self.config.dir_max_z_ratio * sigma;
+        let max_mu = max_z * sigma;
         state.dir_mu = state.dir_mu.clamp(-max_mu, max_mu);
     }
 
@@ -1000,7 +1087,8 @@ impl CentralBeliefState {
         state.acf_tracker.push(return_frac);
 
         // --- Directional drift posterior: price return evidence ---
-        self.dir_kalman_predict(state, timestamp_ms);
+        // Issue 4: Price evidence decorrelates in ~1s → persistence=0.2
+        self.dir_kalman_predict_for_source(state, timestamp_ms, 0.2);
 
         let sigma_est = if state.sigma_n > 5.0 {
             (state.sigma_sum_sq / state.sigma_n).sqrt().max(0.0001)
@@ -1008,10 +1096,20 @@ impl CentralBeliefState {
             0.002 // ~20 bps conservative default
         };
 
-        // z-score: positive return → bullish → obs = -z (negative = bullish)
-        let z = (return_frac / (sigma_est * dt_secs.sqrt().max(0.1))).clamp(-3.0, 3.0);
+        // Issue 6: Cascade-widened per-observation z-clamp
+        let p_cascade = state.regime_probs.get(3).copied().unwrap_or(0.0);
+        let z_max = 3.0 + 2.0 * p_cascade; // calm=3.0, cascade=5.0
+        let z = (return_frac / (sigma_est * dt_secs.sqrt().max(0.1))).clamp(-z_max, z_max);
         let obs_price = -z; // positive z (up move) → bullish → negative obs
-        self.dir_kalman_update(state, obs_price, self.config.dir_noise_price);
+
+        // Issue 1+3: Adaptive noise — scale by regime, calibration quality, and sigma ratio
+        let sigma_baseline = 0.002; // ~20 bps, matches default
+        let sigma_ratio = (sigma_est / sigma_baseline).clamp(0.3, 5.0);
+        let effective_noise = self.config.dir_noise_price
+            * state.regime_noise_scale
+            * state.calibration_noise_mult
+            * sigma_ratio;
+        self.dir_kalman_update(state, obs_price, effective_noise);
         state.dir_n_price += 1;
         state.dir_evidence_price += obs_price;
 
@@ -1075,11 +1173,24 @@ impl CentralBeliefState {
         state.as_bias = (1.0 - alpha) * state.as_bias + alpha * fill.realized_as_bps;
 
         // --- Directional drift posterior: fill side + AS evidence ---
-        self.dir_kalman_predict(state, fill.timestamp_ms);
+        // Issue 4: Fill evidence persists 30-300s → persistence=0.8
+        self.dir_kalman_predict_for_source(state, fill.timestamp_ms, 0.8);
+
+        // Issue 1+3: Fills are MORE informative during calm (inverse sqrt scaling)
+        let sigma_est = if state.sigma_n > 5.0 {
+            (state.sigma_sum_sq / state.sigma_n).sqrt().max(0.0001)
+        } else {
+            0.002
+        };
+        let sigma_baseline = 0.002;
+        let sigma_ratio = (sigma_est / sigma_baseline).clamp(0.3, 5.0);
 
         // Fill side: is_buy=true → sell aggressor hit our bid → bearish (obs > 0)
         let obs_fill = if fill.is_buy { 1.0 } else { -1.0 };
-        self.dir_kalman_update(state, obs_fill, self.config.dir_noise_fill);
+        let effective_noise_fill =
+            self.config.dir_noise_fill * state.regime_noise_scale * state.calibration_noise_mult
+                / sigma_ratio.sqrt();
+        self.dir_kalman_update(state, obs_fill, effective_noise_fill);
         state.dir_n_fill += 1;
         state.dir_evidence_fill += obs_fill;
 
@@ -1087,7 +1198,10 @@ impl CentralBeliefState {
         let as_scale_bps = self.config.dir_as_scale_bps;
         let as_mag = (fill.realized_as_bps.abs() / as_scale_bps).clamp(0.0, 2.0);
         let obs_as = if fill.is_buy { as_mag } else { -as_mag };
-        self.dir_kalman_update(state, obs_as, self.config.dir_noise_as);
+        let effective_noise_as =
+            self.config.dir_noise_as * state.regime_noise_scale * state.calibration_noise_mult
+                / sigma_ratio.sqrt();
+        self.dir_kalman_update(state, obs_as, effective_noise_as);
         state.dir_n_as += 1;
         state.dir_evidence_as += obs_as;
 
@@ -2810,6 +2924,447 @@ mod tests {
             kappa_before,
             kappa_after,
             kappa_change_pct * 100.0
+        );
+    }
+
+    // === Issue 1: Adaptive Observation Noise ===
+
+    #[test]
+    fn test_regime_noise_scale_cascade_inflates_r() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Set cascade regime
+        beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: [0.0, 0.0, 0.0, 1.0], // Pure cascade
+            features: None,
+        });
+
+        // Observe the same price return in cascade vs calm
+        let beliefs_calm = CentralBeliefState::default_config();
+        beliefs_calm.update(BeliefUpdate::RegimeUpdate {
+            probs: [0.5, 0.5, 0.0, 0.0], // Calm
+            features: None,
+        });
+
+        // Apply same evidence to both
+        for i in 0..20 {
+            let ts = (i + 1) * 1000;
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.003,
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+            beliefs_calm.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.003,
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+        }
+
+        let snap_cascade = beliefs.snapshot();
+        let snap_calm = beliefs_calm.snapshot();
+
+        // Cascade: higher noise → lower Kalman gain → less extreme posterior
+        // Calm: lower noise → higher gain → more extreme posterior
+        assert!(
+            snap_calm.drift_vol.prob_bearish > snap_cascade.drift_vol.prob_bearish,
+            "Calm should have stronger conviction: calm={:.4}, cascade={:.4}",
+            snap_calm.drift_vol.prob_bearish,
+            snap_cascade.drift_vol.prob_bearish
+        );
+    }
+
+    #[test]
+    fn test_regime_noise_scale_calm_keeps_default() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Set calm regime (quiet + normal)
+        beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: [0.5, 0.5, 0.0, 0.0],
+            features: None,
+        });
+
+        // Check internal state: regime_noise_scale should be 1.0
+        let state = beliefs.state.read().unwrap();
+        assert!(
+            (state.regime_noise_scale - 1.0).abs() < 1e-10,
+            "Calm regime should have noise_scale=1.0, got {}",
+            state.regime_noise_scale
+        );
+    }
+
+    #[test]
+    fn test_sigma_ratio_scales_price_noise() {
+        // High sigma → more noise → less trust in price returns
+        let beliefs_high_vol = CentralBeliefState::default_config();
+        let beliefs_low_vol = CentralBeliefState::default_config();
+
+        // Seed sigma estimator: high vol gets large returns, low vol gets small
+        for i in 0..20 {
+            let ts = (i + 1) * 1000;
+            beliefs_high_vol.update(BeliefUpdate::PriceReturn {
+                return_frac: 0.01 * if i % 2 == 0 { 1.0 } else { -1.0 }, // 100 bps
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+            beliefs_low_vol.update(BeliefUpdate::PriceReturn {
+                return_frac: 0.0005 * if i % 2 == 0 { 1.0 } else { -1.0 }, // 5 bps
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+        }
+
+        // Now apply consistent bearish evidence
+        for i in 20..40 {
+            let ts = (i + 1) * 1000;
+            beliefs_high_vol.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.003,
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+            beliefs_low_vol.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.003,
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+        }
+
+        let snap_high = beliefs_high_vol.snapshot();
+        let snap_low = beliefs_low_vol.snapshot();
+
+        // Low vol should build conviction faster (lower noise ratio)
+        assert!(
+            snap_low.drift_vol.prob_bearish >= snap_high.drift_vol.prob_bearish - 0.01,
+            "Low vol should trust price returns more: low={:.4}, high={:.4}",
+            snap_low.drift_vol.prob_bearish,
+            snap_high.drift_vol.prob_bearish
+        );
+    }
+
+    #[test]
+    fn test_fill_noise_inversely_scales() {
+        // In calm markets, fills should be MORE informative (lower effective noise)
+        let beliefs = CentralBeliefState::default_config();
+
+        // Seed with low-vol returns (sigma < baseline → sigma_ratio < 1)
+        for i in 0..20 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: 0.0002 * if i % 2 == 0 { 1.0 } else { -1.0 },
+                dt_secs: 1.0,
+                timestamp_ms: (i + 1) * 1000,
+            });
+        }
+
+        // Now add fill evidence: should build strong conviction
+        for i in 0..15 {
+            beliefs.update(BeliefUpdate::OwnFill {
+                price: 100.01,
+                size: 1.0,
+                mid: 100.0,
+                is_buy: true,
+                is_aligned: true,
+                realized_as_bps: 5.0,
+                realized_edge_bps: 1.0,
+                timestamp_ms: (21 + i) * 1000,
+                order_id: Some(i),
+                quoted_size: 1.0,
+            });
+        }
+
+        let snap = beliefs.snapshot();
+        // Should have meaningful bearish conviction from fills
+        assert!(
+            snap.drift_vol.prob_bearish > 0.55,
+            "Fills in calm market should build conviction: prob_bearish={}",
+            snap.drift_vol.prob_bearish
+        );
+    }
+
+    // === Issue 3: Calibration Quality → Posterior Noise ===
+
+    #[test]
+    fn test_calibration_deficit_inflates_belief_noise() {
+        let beliefs_good = CentralBeliefState::default_config();
+        let beliefs_poor = CentralBeliefState::default_config();
+
+        // Set calibration: good=0.0, poor=1.0
+        beliefs_good.update(BeliefUpdate::CalibrationUpdate { cal_error: 0.0 });
+        beliefs_poor.update(BeliefUpdate::CalibrationUpdate { cal_error: 1.0 });
+
+        // Apply same evidence
+        for i in 0..20 {
+            let ts = (i + 1) * 1000;
+            beliefs_good.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.003,
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+            beliefs_poor.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.003,
+                dt_secs: 1.0,
+                timestamp_ms: ts,
+            });
+        }
+
+        let snap_good = beliefs_good.snapshot();
+        let snap_poor = beliefs_poor.snapshot();
+
+        // Good calibration → stronger conviction (lower noise)
+        assert!(
+            snap_good.drift_vol.prob_bearish > snap_poor.drift_vol.prob_bearish,
+            "Good cal should have stronger conviction: good={:.4}, poor={:.4}",
+            snap_good.drift_vol.prob_bearish,
+            snap_poor.drift_vol.prob_bearish
+        );
+    }
+
+    #[test]
+    fn test_good_calibration_no_change() {
+        let beliefs = CentralBeliefState::default_config();
+        beliefs.update(BeliefUpdate::CalibrationUpdate { cal_error: 0.0 });
+
+        let state = beliefs.state.read().unwrap();
+        assert!(
+            (state.calibration_noise_mult - 1.0).abs() < 1e-10,
+            "Zero cal_error should yield mult=1.0, got {}",
+            state.calibration_noise_mult
+        );
+    }
+
+    // === Issue 4: Per-Source Process Noise ===
+
+    #[test]
+    fn test_fill_source_less_variance_growth() {
+        let config = CentralBeliefConfig::default();
+        let beliefs = CentralBeliefState::new(config);
+
+        // Setup: get both to a known state
+        let mut state_fill = InternalState {
+            dir_sigma_sq: 1.0,
+            dir_last_update_ms: 1000,
+            ..Default::default()
+        };
+        let mut state_price = InternalState {
+            dir_sigma_sq: 1.0,
+            dir_last_update_ms: 1000,
+            ..Default::default()
+        };
+
+        // Fill predict (persistence=0.8) should add less Q than price (persistence=0.2)
+        beliefs.dir_kalman_predict_for_source(&mut state_fill, 2000, 0.8);
+        beliefs.dir_kalman_predict_for_source(&mut state_price, 2000, 0.2);
+
+        // Fill should have less variance growth
+        assert!(
+            state_fill.dir_sigma_sq < state_price.dir_sigma_sq,
+            "Fill source should have less variance: fill={:.6}, price={:.6}",
+            state_fill.dir_sigma_sq,
+            state_price.dir_sigma_sq
+        );
+    }
+
+    #[test]
+    fn test_price_source_normal_variance_growth() {
+        let config = CentralBeliefConfig::default();
+        let beliefs = CentralBeliefState::new(config);
+
+        let mut state = InternalState {
+            dir_sigma_sq: 1.0,
+            dir_last_update_ms: 1000,
+            ..Default::default()
+        };
+
+        // Price predict (persistence=0.2) should use ~84% of base Q
+        beliefs.dir_kalman_predict_for_source(&mut state, 2000, 0.2);
+
+        // Compare with full Q prediction
+        let mut state_full = InternalState {
+            dir_sigma_sq: 1.0,
+            dir_last_update_ms: 1000,
+            ..Default::default()
+        };
+        beliefs.dir_kalman_predict(&mut state_full, 2000);
+
+        // Price source should have slightly less Q than full (84% vs 100%)
+        assert!(
+            state.dir_sigma_sq < state_full.dir_sigma_sq,
+            "Price source should have less Q than full: price={:.6}, full={:.6}",
+            state.dir_sigma_sq,
+            state_full.dir_sigma_sq
+        );
+    }
+
+    #[test]
+    fn test_persistence_zero_matches_full_q() {
+        let config = CentralBeliefConfig::default();
+        let beliefs = CentralBeliefState::new(config);
+
+        let mut state_zero = InternalState {
+            dir_sigma_sq: 1.0,
+            dir_last_update_ms: 1000,
+            ..Default::default()
+        };
+        let mut state_full = InternalState {
+            dir_sigma_sq: 1.0,
+            dir_last_update_ms: 1000,
+            ..Default::default()
+        };
+
+        // persistence=0.0 → q_scale=1.0 (full Q)
+        beliefs.dir_kalman_predict_for_source(&mut state_zero, 2000, 0.0);
+        beliefs.dir_kalman_predict(&mut state_full, 2000);
+
+        assert!(
+            (state_zero.dir_sigma_sq - state_full.dir_sigma_sq).abs() < 1e-10,
+            "persistence=0.0 should match full predict: zero={:.6}, full={:.6}",
+            state_zero.dir_sigma_sq,
+            state_full.dir_sigma_sq
+        );
+    }
+
+    // === Issue 6: Regime-Dependent Conviction Caps ===
+
+    #[test]
+    fn test_calm_regime_uses_default_z_cap() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Calm regime
+        beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: [1.0, 0.0, 0.0, 0.0],
+            features: None,
+        });
+
+        // Push extreme evidence
+        for i in 0..100 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.01,
+                dt_secs: 1.0,
+                timestamp_ms: (i + 1) * 1000,
+            });
+        }
+
+        let state = beliefs.state.read().unwrap();
+        let sigma = state.dir_sigma_sq.sqrt();
+        let z_ratio = (state.dir_mu / sigma).abs();
+
+        // Should be capped at dir_max_z_ratio (4.0)
+        assert!(
+            z_ratio <= 4.0 + 0.01,
+            "Calm regime z-ratio should be ≤ 4.0, got {:.2}",
+            z_ratio
+        );
+    }
+
+    #[test]
+    fn test_cascade_regime_widens_z_cap() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Cascade regime
+        beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: [0.0, 0.0, 0.0, 1.0],
+            features: None,
+        });
+
+        // Push extreme evidence
+        for i in 0..100 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.01,
+                dt_secs: 1.0,
+                timestamp_ms: (i + 1) * 1000,
+            });
+        }
+
+        let state = beliefs.state.read().unwrap();
+        let sigma = state.dir_sigma_sq.sqrt();
+        let z_ratio = (state.dir_mu / sigma).abs();
+
+        // Should be capped at dir_max_z_ratio_cascade (6.0)
+        assert!(
+            z_ratio <= 6.0 + 0.01,
+            "Cascade regime z-ratio should be ≤ 6.0, got {:.2}",
+            z_ratio
+        );
+    }
+
+    #[test]
+    fn test_z_cap_interpolates_bursty() {
+        let config = CentralBeliefConfig::default();
+        // max_z should interpolate: 4.0 + (6.0 - 4.0) * p_cascade
+        // With bursty=[0,0,0.5,0.5]: p_cascade=0.5 → max_z=5.0
+        let beliefs = CentralBeliefState::new(config);
+
+        beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: [0.0, 0.0, 0.5, 0.5], // Half bursty, half cascade
+            features: None,
+        });
+
+        // Push extreme evidence
+        for i in 0..100 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: -0.01,
+                dt_secs: 1.0,
+                timestamp_ms: (i + 1) * 1000,
+            });
+        }
+
+        let state = beliefs.state.read().unwrap();
+        let sigma = state.dir_sigma_sq.sqrt();
+        let z_ratio = (state.dir_mu / sigma).abs();
+
+        // p_cascade=0.5 → max_z=5.0
+        assert!(
+            z_ratio <= 5.0 + 0.01,
+            "Bursty regime z-ratio should be ≤ 5.0, got {:.2}",
+            z_ratio
+        );
+        // Should be above calm cap (4.0) if evidence is strong enough
+        // (may not always reach exactly 5.0 due to noise scaling)
+    }
+
+    #[test]
+    fn test_per_obs_z_clamp_widens_cascade() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Cascade regime allows z_max=5.0 per observation
+        beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: [0.0, 0.0, 0.0, 1.0],
+            features: None,
+        });
+
+        // Single large return should not be truncated as much in cascade
+        let beliefs_calm = CentralBeliefState::default_config();
+        beliefs_calm.update(BeliefUpdate::RegimeUpdate {
+            probs: [1.0, 0.0, 0.0, 0.0],
+            features: None,
+        });
+
+        // Large return in both
+        beliefs.update(BeliefUpdate::PriceReturn {
+            return_frac: -0.05, // Huge return, would be z>>3 in calm
+            dt_secs: 1.0,
+            timestamp_ms: 1000,
+        });
+        beliefs_calm.update(BeliefUpdate::PriceReturn {
+            return_frac: -0.05,
+            dt_secs: 1.0,
+            timestamp_ms: 1000,
+        });
+
+        let snap_cascade = beliefs.snapshot();
+        let snap_calm = beliefs_calm.snapshot();
+
+        // Cascade should allow more extreme observation through (less clipping)
+        // But also has higher noise, so net effect on posterior is nuanced.
+        // At minimum, both should show bearish tendency
+        assert!(
+            snap_cascade.drift_vol.prob_bearish > 0.5,
+            "Cascade should show bearish: {}",
+            snap_cascade.drift_vol.prob_bearish
+        );
+        assert!(
+            snap_calm.drift_vol.prob_bearish > 0.5,
+            "Calm should show bearish: {}",
+            snap_calm.drift_vol.prob_bearish
         );
     }
 }

@@ -679,7 +679,7 @@ impl LadderStrategy {
 
         // Conviction gamma escalation: wider spreads when directional conviction is moderate+.
         // Applied multiplicatively to base gamma (conviction_gamma_mult ∈ [1.0, 1.5]).
-        let gamma = base_gamma * market_params.conviction_gamma_mult;
+        let mut gamma = base_gamma * market_params.conviction_gamma_mult;
 
         // NOTE: regime_gamma_multiplier is already applied inside effective_gamma()
         // (L456) and participates in the gamma_max clamp. Do NOT re-apply here.
@@ -771,7 +771,7 @@ impl LadderStrategy {
         // affects us regardless of how kappa was estimated.
         // Note: legacy branch already discounts by alpha, so skip double-counting.
         let alpha_for_kappa = market_params.predicted_alpha;
-        const ALPHA_KAPPA_THRESHOLD: f64 = 0.3;
+        const ALPHA_KAPPA_THRESHOLD: f64 = 0.15; // Lowered: p_informed=0.235 was below old 0.3
         const ALPHA_KAPPA_SENSITIVITY: f64 = 0.5;
         if alpha_for_kappa > ALPHA_KAPPA_THRESHOLD
             && market_params.as_warmed_up
@@ -816,11 +816,39 @@ impl LadderStrategy {
         // through size is economically incorrect.
 
         // Convert AS spread adjustment to bps for ladder generation
-        let as_at_touch_bps = if market_params.as_warmed_up {
-            market_params.as_spread_adjustment * 10000.0
-        } else {
-            0.0 // Use zero AS until warmed up
-        };
+        let as_at_touch_bps = market_params.as_spread_adjustment * 10000.0;
+
+        // === REALIZED AS → GAMMA FLOOR ===
+        // If realized AS exceeds our half-spread, gamma must increase to widen spreads.
+        // This ensures the spread covers AS costs, not just the E[PnL] filter.
+        if as_at_touch_bps > 0.0 {
+            let glft_half_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
+            let fee_bps = self.risk_config.maker_fee_rate * 10_000.0;
+            let net_capture_bps = glft_half_bps - fee_bps;
+
+            // If AS > 1.2× net capture, we're losing on every fill. Increase gamma until
+            // GLFT spread covers AS + fee + 1 bps margin.
+            if as_at_touch_bps > net_capture_bps * 1.2 {
+                let target_half_spread_frac = (as_at_touch_bps + fee_bps + 1.0) / 10_000.0;
+                let gamma_floor = super::glft::solve_min_gamma(
+                    target_half_spread_frac,
+                    kappa,
+                    market_params.sigma,
+                    time_horizon,
+                    self.risk_config.maker_fee_rate,
+                );
+                if gamma_floor > gamma {
+                    info!(
+                        as_bps = %format!("{:.1}", as_at_touch_bps),
+                        capture_bps = %format!("{:.1}", net_capture_bps),
+                        gamma_before = %format!("{:.3}", gamma),
+                        gamma_floor = %format!("{:.3}", gamma_floor),
+                        "AS defense: raising gamma floor to cover realized AS"
+                    );
+                    gamma = gamma_floor;
+                }
+            }
+        }
 
         // Cascade size reduction removed (B2): cascade exposure reduction is now
         // handled by beta_cascade in CalibratedRiskModel (wider spreads) and

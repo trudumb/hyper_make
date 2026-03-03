@@ -477,10 +477,25 @@ impl AdverseSelectionEstimator {
     /// This replaces the old `realized_as × 2.0` heuristic with a principled
     /// conditional expectation from the Glosten-Milgrom model.
     ///
-    /// Returns 0.0 if not warmed up.
+    /// During warmup (before min_fills_warmup), returns a confidence-discounted
+    /// raw EWMA instead of hard zero — defense-first against AS during cold start.
     pub fn spread_adjustment(&self) -> f64 {
         if !self.is_warmed_up() {
-            return 0.0;
+            if self.fills_measured == 0 {
+                // No data at all — use checkpoint floor if available, else 0
+                return self
+                    .checkpoint_as_floor_bps
+                    .map(|f| (f / 10_000.0).min(self.config.max_spread_adjustment))
+                    .unwrap_or(0.0);
+            }
+            // Have some fills but not enough for full warmup — use discounted EWMA.
+            // Confidence ramps linearly: 0 at 0 fills → 1.0 at min_fills_warmup
+            let confidence =
+                self.fills_measured as f64 / self.config.min_fills_warmup.max(1) as f64;
+            let raw_as = self.realized_as_total;
+            return (confidence * raw_as)
+                .max(self.config.min_spread_adjustment)
+                .min(self.config.max_spread_adjustment);
         }
 
         // P(informed | fill): empirical when available, predicted (with GMM blend) as fallback
@@ -511,9 +526,20 @@ impl AdverseSelectionEstimator {
 
     /// Per-side Glosten-Milgrom spread adjustment for bids (buy-side AS).
     /// Uses buy-side P(informed) and buy-side E[ΔP|informed].
+    /// During warmup, returns confidence-discounted raw buy-side AS.
     pub fn spread_adjustment_bid(&self) -> f64 {
         if !self.is_warmed_up() {
-            return 0.0;
+            if self.fills_measured == 0 {
+                return self
+                    .checkpoint_as_floor_bps
+                    .map(|f| (f / 10_000.0).min(self.config.max_spread_adjustment))
+                    .unwrap_or(0.0);
+            }
+            let confidence =
+                self.fills_measured as f64 / self.config.min_fills_warmup.max(1) as f64;
+            return (confidence * self.realized_as_buy.abs())
+                .max(self.config.min_spread_adjustment)
+                .min(self.config.max_spread_adjustment);
         }
         let total_buy = self.informed_buy_count + self.uninformed_buy_count;
         let p_informed_buy = if total_buy > 0 {
@@ -534,9 +560,20 @@ impl AdverseSelectionEstimator {
 
     /// Per-side Glosten-Milgrom spread adjustment for asks (sell-side AS).
     /// Uses sell-side P(informed) and sell-side E[ΔP|informed].
+    /// During warmup, returns confidence-discounted raw sell-side AS.
     pub fn spread_adjustment_ask(&self) -> f64 {
         if !self.is_warmed_up() {
-            return 0.0;
+            if self.fills_measured == 0 {
+                return self
+                    .checkpoint_as_floor_bps
+                    .map(|f| (f / 10_000.0).min(self.config.max_spread_adjustment))
+                    .unwrap_or(0.0);
+            }
+            let confidence =
+                self.fills_measured as f64 / self.config.min_fills_warmup.max(1) as f64;
+            return (confidence * self.realized_as_sell.abs())
+                .max(self.config.min_spread_adjustment)
+                .min(self.config.max_spread_adjustment);
         }
         let total_sell = self.informed_sell_count + self.uninformed_sell_count;
         let p_informed_sell = if total_sell > 0 {

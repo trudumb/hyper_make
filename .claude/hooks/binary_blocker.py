@@ -21,6 +21,7 @@ SAFE_PATTERNS = [
     r"cargo\s+run\s+.*--bin\s+calibration_report",
     r"cargo\s+run\s+.*--bin\s+health_dashboard",
     r"\./scripts/paper_trading\.sh",
+    r"\./scripts/validate_side_by_side\.sh",
     r"\./target/\S*market_maker\s+.*\bpaper\b",
     r"cargo\s+run\s+.*--bin\s+market_maker\s+.*\bpaper\b",
     r"/home/trudumb/hyper_make/scripts/",
