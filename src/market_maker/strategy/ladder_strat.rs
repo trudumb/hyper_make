@@ -105,7 +105,7 @@ pub fn dynamic_margin_utilization(
 /// - **Depth buckets**: 2bp buckets for stable estimation
 ///
 /// Call `record_fill_observation()` when orders fill or cancel to update the model.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LadderStrategy {
     /// Risk configuration (same as GLFTStrategy)
     pub risk_config: RiskConfig,
@@ -121,6 +121,31 @@ pub struct LadderStrategy {
     pub risk_model_config: RiskModelConfig,
     /// Kelly criterion position sizer
     pub kelly_sizer: KellySizer,
+    /// Epoch millis of last gamma decomposition log (0 = never logged). Atomic for Sync.
+    last_gamma_decomp_log_ms: std::sync::atomic::AtomicU64,
+    /// Last logged gamma value (f64 bits) for change-based throttle. Atomic for Sync.
+    last_gamma_decomp_value_bits: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for LadderStrategy {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            risk_config: self.risk_config.clone(),
+            ladder_config: self.ladder_config.clone(),
+            depth_generator: self.depth_generator.clone(),
+            fill_model: self.fill_model.clone(),
+            risk_model: self.risk_model.clone(),
+            risk_model_config: self.risk_model_config.clone(),
+            kelly_sizer: self.kelly_sizer.clone(),
+            last_gamma_decomp_log_ms: std::sync::atomic::AtomicU64::new(
+                self.last_gamma_decomp_log_ms.load(Relaxed),
+            ),
+            last_gamma_decomp_value_bits: std::sync::atomic::AtomicU64::new(
+                self.last_gamma_decomp_value_bits.load(Relaxed),
+            ),
+        }
+    }
 }
 
 impl LadderStrategy {
@@ -138,6 +163,8 @@ impl LadderStrategy {
             risk_model: CalibratedRiskModel::with_gamma_base(gamma_base),
             risk_model_config: RiskModelConfig::default(),
             kelly_sizer: KellySizer::default(),
+            last_gamma_decomp_log_ms: std::sync::atomic::AtomicU64::new(0),
+            last_gamma_decomp_value_bits: std::sync::atomic::AtomicU64::new(0u64),
         }
     }
 
@@ -151,6 +178,8 @@ impl LadderStrategy {
             risk_config,
             ladder_config,
             fill_model: BayesianFillModel::default(),
+            last_gamma_decomp_log_ms: std::sync::atomic::AtomicU64::new(0),
+            last_gamma_decomp_value_bits: std::sync::atomic::AtomicU64::new(0u64),
         }
     }
 
@@ -177,6 +206,8 @@ impl LadderStrategy {
             risk_config,
             ladder_config,
             fill_model: BayesianFillModel::new(prior_alpha, prior_beta, sigma, tau),
+            last_gamma_decomp_log_ms: std::sync::atomic::AtomicU64::new(0),
+            last_gamma_decomp_value_bits: std::sync::atomic::AtomicU64::new(0u64),
         }
     }
 
@@ -195,6 +226,8 @@ impl LadderStrategy {
             risk_config,
             ladder_config,
             fill_model: BayesianFillModel::default(),
+            last_gamma_decomp_log_ms: std::sync::atomic::AtomicU64::new(0),
+            last_gamma_decomp_value_bits: std::sync::atomic::AtomicU64::new(0u64),
         }
     }
 
@@ -736,6 +769,52 @@ impl LadderStrategy {
             warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
             "Ladder gamma from log-additive CalibratedRiskModel (regime+conviction included)"
         );
+
+        // Throttled gamma decomposition: every 30s or on 20% gamma change
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last_log_ms = self.last_gamma_decomp_log_ms.load(Relaxed);
+            let last_val = f64::from_bits(self.last_gamma_decomp_value_bits.load(Relaxed));
+            let time_elapsed = last_log_ms == 0 || now_ms.saturating_sub(last_log_ms) >= 30_000;
+            let value_changed = last_val > 0.0 && ((gamma - last_val).abs() / last_val) > 0.20;
+            if time_elapsed || value_changed {
+                let features = RiskFeatures::from_params(
+                    market_params,
+                    position,
+                    effective_max_position,
+                    &self.risk_model_config,
+                );
+                let (_gamma_check, decomp) =
+                    self.risk_model.compute_gamma_with_decomposition(&features);
+                // Sort contributions by absolute magnitude, descending
+                let mut sorted = decomp.contributions.clone();
+                sorted.sort_by(|a, b| {
+                    b.1.abs()
+                        .partial_cmp(&a.1.abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top: Vec<String> = sorted
+                    .iter()
+                    .take(5)
+                    .map(|(name, val)| format!("{}={:.4}", name, val))
+                    .collect();
+                info!(
+                    final_gamma = %format!("{:.4}", decomp.final_gamma),
+                    base_gamma = %format!("{:.4}", decomp.base_gamma),
+                    raw_sum = %format!("{:.4}", decomp.raw_sum),
+                    regulated_sum = %format!("{:.4}", decomp.regulated_sum),
+                    top_contributions = %top.join(" "),
+                    "GAMMA_DECOMP"
+                );
+                self.last_gamma_decomp_log_ms.store(now_ms, Relaxed);
+                self.last_gamma_decomp_value_bits
+                    .store(gamma.to_bits(), Relaxed);
+            }
+        }
 
         // === KAPPA: Robust V3 > Adaptive > Legacy ===
         // Priority: 1. Robust kappa (outlier-resistant), 2. Adaptive, 3. Legacy

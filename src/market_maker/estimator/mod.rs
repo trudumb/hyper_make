@@ -113,7 +113,7 @@ pub use jump::{JumpEstimator, JumpEstimatorConfig};
 pub use kalman::{KalmanPriceFilter, NoiseFilter};
 pub use mock::MockEstimator;
 pub use momentum::MomentumModel;
-pub use parameter_estimator::{KappaStagnationAlert, ParameterEstimator};
+pub use parameter_estimator::{KappaStagnationAlert, ParameterEstimator, StartupPhase};
 pub use trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
 pub use volatility::{
     BlendedParameters, RegimeBeliefState, RegimeParameterBlender, RegimeParameterConfig,
@@ -434,6 +434,22 @@ pub struct EstimatorConfig {
     /// Prevents pathological spread widening during extreme cascades.
     /// E.g. 10.0 means sigma is capped at 10x the configured default.
     pub max_sigma_multiplier: f64,
+
+    // === WS2: Calibration-Aware Startup ===
+    /// Duration (seconds) of the initial observation phase. No orders placed.
+    /// Capital-tier-aware: overridden by `CapitalAwarePolicy` startup methods.
+    pub observation_phase_secs: u64,
+    /// Sigma coefficient of variation threshold for calibration gate readiness.
+    /// Lower = stricter quality requirement (fast/slow sigma must agree).
+    pub sigma_cv_threshold: f64,
+    /// Kappa relative CI width threshold for calibration gate readiness.
+    /// Lower = stricter quality requirement (kappa uncertainty must be small).
+    pub kappa_ci_threshold: f64,
+    /// Minimum L2 book snapshots before calibration gate can pass.
+    pub min_l2_snapshots: usize,
+    /// Maximum duration (seconds) of the calibration gate phase.
+    /// After observation_phase_secs + calibration_gate_timeout_secs, force Quoting.
+    pub calibration_gate_timeout_secs: u64,
 }
 
 impl Default for EstimatorConfig {
@@ -494,6 +510,13 @@ impl Default for EstimatorConfig {
 
             // Sigma cap - 10x default prevents pathological widening
             max_sigma_multiplier: 10.0,
+
+            // WS2: Calibration-Aware Startup defaults (Medium/Large tier)
+            observation_phase_secs: 60,
+            sigma_cv_threshold: 0.30,
+            kappa_ci_threshold: 0.50,
+            min_l2_snapshots: 10,
+            calibration_gate_timeout_secs: 120,
         }
     }
 }

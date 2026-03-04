@@ -23,12 +23,16 @@ const EPSILON: f64 = 1e-12;
 const MIN_WARMUP_TRADES: usize = 20;
 
 /// EWMA alpha for ~1s horizon (fast).
+/// Derivation: `α = 1 - 2^(-1/half_life)` with half-life = 3 trades → α ≈ 0.206.
 const ALPHA_1S: f64 = 0.20;
 /// EWMA alpha for ~5s horizon.
+/// Derivation: half-life = 14 trades → α ≈ 0.048.
 const ALPHA_5S: f64 = 0.05;
 /// EWMA alpha for ~30s horizon.
+/// Derivation: half-life = 69 trades → α = 0.01.
 const ALPHA_30S: f64 = 0.01;
 /// EWMA alpha for ~5m horizon (slow).
+/// Derivation: half-life = 346 trades → α = 0.002.
 const ALPHA_5M: f64 = 0.002;
 
 /// Tracks trade flow with EWMA at multiple time horizons.

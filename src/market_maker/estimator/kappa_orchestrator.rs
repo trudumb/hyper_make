@@ -139,8 +139,10 @@ impl KappaOrchestratorConfig {
 /// - half_life ≈ 100 observations → α ≈ 0.007
 /// - For practical purposes, α = 0.1 (10% new, 90% old) works well
 ///
-/// The value 0.9 means 90% weight on previous estimate, providing
-/// stability while still adapting to changing market conditions.
+/// The value 0.9 is the RETENTION factor (1 - smoothing_α).
+/// Smoothing α = 0.1 → half-life ≈ 7 observations (ln(2)/ln(1/0.9) ≈ 6.6).
+/// Note: could be regime-dependent (calm=0.95/hl≈14, volatile=0.8/hl≈3),
+/// but keeping fixed for now until regime-dependent adaptation is wired.
 const KAPPA_EWMA_ALPHA: f64 = 0.9;
 
 /// Orchestrates multiple kappa estimators with confidence-weighted blending.

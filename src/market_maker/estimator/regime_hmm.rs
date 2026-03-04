@@ -411,6 +411,22 @@ pub struct RegimeHMM {
     observations_since_recalibration: usize,
     /// Total recalibrations performed (for diagnostics).
     recalibration_count: usize,
+
+    // === Online soft EM state ===
+    /// Previous belief state (for soft transition count updates).
+    prev_belief: [f64; NUM_REGIMES],
+
+    /// Soft emission sufficient statistics: per-regime running mean of volatility.
+    /// Updated via EWMA weighted by regime responsibility (soft assignment).
+    emission_vol_sum: [f64; NUM_REGIMES],
+    /// Soft emission sufficient statistics: per-regime running mean of spread.
+    emission_spread_sum: [f64; NUM_REGIMES],
+    /// Soft emission sufficient statistics: per-regime running variance of volatility.
+    emission_vol_sq_sum: [f64; NUM_REGIMES],
+    /// Soft emission sufficient statistics: per-regime running variance of spread.
+    emission_spread_sq_sum: [f64; NUM_REGIMES],
+    /// Effective sample count per regime (sum of soft assignments).
+    emission_effective_n: [f64; NUM_REGIMES],
 }
 
 impl Default for RegimeHMM {
@@ -443,6 +459,12 @@ impl RegimeHMM {
             recalibration_interval: 500,
             observations_since_recalibration: 0,
             recalibration_count: 0,
+            prev_belief: [0.1, 0.6, 0.25, 0.05],
+            emission_vol_sum: [0.0; NUM_REGIMES],
+            emission_spread_sum: [0.0; NUM_REGIMES],
+            emission_vol_sq_sum: [0.0; NUM_REGIMES],
+            emission_spread_sq_sum: [0.0; NUM_REGIMES],
+            emission_effective_n: [0.0; NUM_REGIMES],
         }
     }
 
@@ -496,6 +518,7 @@ impl RegimeHMM {
 
         // Mark as pre-calibrated so auto-calibration doesn't override
         self.initial_calibration_done = true;
+        self.seed_em_sums_from_emissions();
 
         self
     }
@@ -534,6 +557,22 @@ impl RegimeHMM {
         }
 
         self.initial_calibration_done = true;
+
+        // Seed soft EM running sums from emission params so EWMA starts correctly
+        self.seed_em_sums_from_emissions();
+    }
+
+    /// Seed soft EM running statistics from current emission parameters.
+    /// Called after any emission initialization to avoid cold-start EWMA drift.
+    fn seed_em_sums_from_emissions(&mut self) {
+        for k in 0..NUM_REGIMES {
+            self.emission_vol_sum[k] = self.emission_params[k].mean_volatility;
+            self.emission_spread_sum[k] = self.emission_params[k].mean_spread;
+            self.emission_vol_sq_sum[k] = self.emission_params[k].std_volatility.powi(2);
+            self.emission_spread_sq_sum[k] = self.emission_params[k].std_spread.powi(2);
+            // Start effective_n at 0 — prior dominates until enough soft counts
+            self.emission_effective_n[k] = 0.0;
+        }
     }
 
     /// Set the calibration buffer size (number of observations before auto-calibration).
@@ -645,10 +684,136 @@ impl RegimeHMM {
         // Normalize to ensure probabilities sum to 1
         self.normalize_belief();
 
+        // === Online Soft EM ===
+        // Update emission sufficient statistics using soft assignments (responsibilities).
+        // This is the E-step + partial M-step of online EM: each observation contributes
+        // to all regimes proportional to its posterior responsibility γ(t,k).
+        if self.initial_calibration_done && self.observation_count > 0 {
+            let alpha = self.emission_learning_rate;
+
+            for k in 0..NUM_REGIMES {
+                let responsibility = self.belief[k];
+                if responsibility < 1e-9 {
+                    continue;
+                }
+
+                // Accumulate effective sample count per regime
+                self.emission_effective_n[k] += responsibility;
+
+                // EWMA update of emission means weighted by responsibility.
+                // Effective learning rate = alpha * responsibility ensures rarely-visited
+                // regimes update slowly (preventing collapse from noise).
+                let eff_alpha = alpha * responsibility;
+
+                // Update running means
+                self.emission_vol_sum[k] = (1.0 - eff_alpha) * self.emission_vol_sum[k]
+                    + eff_alpha * observation.volatility;
+                self.emission_spread_sum[k] = (1.0 - eff_alpha) * self.emission_spread_sum[k]
+                    + eff_alpha * observation.spread_bps;
+
+                // Update running squared deviations (for variance estimation)
+                let vol_dev = observation.volatility - self.emission_params[k].mean_volatility;
+                self.emission_vol_sq_sum[k] =
+                    (1.0 - eff_alpha) * self.emission_vol_sq_sum[k] + eff_alpha * vol_dev * vol_dev;
+
+                let spread_dev = observation.spread_bps - self.emission_params[k].mean_spread;
+                self.emission_spread_sq_sum[k] = (1.0 - eff_alpha) * self.emission_spread_sq_sum[k]
+                    + eff_alpha * spread_dev * spread_dev;
+            }
+
+            // Soft transition counts: P(z_{t-1}=i, z_t=j | y_{1:t})
+            // Approximated by prev_belief[i] * transition[i][j] * emission_likelihood(j) / normalizer
+            // Simplified: use prev_belief[i] * belief[j] (already normalized)
+            for i in 0..NUM_REGIMES {
+                for j in 0..NUM_REGIMES {
+                    let soft_count = self.prev_belief[i] * self.belief[j];
+                    self.transition_counts[i][j] += soft_count;
+                }
+            }
+
+            // Update transition matrix from Dirichlet posterior mean
+            for i in 0..NUM_REGIMES {
+                let row_sum: f64 = (0..NUM_REGIMES)
+                    .map(|j| self.prior_counts[i][j] + self.transition_counts[i][j])
+                    .sum();
+                if row_sum > 1e-9 {
+                    for j in 0..NUM_REGIMES {
+                        self.transition_matrix[i][j] =
+                            (self.prior_counts[i][j] + self.transition_counts[i][j]) / row_sum;
+                    }
+                }
+            }
+
+            // Periodic M-step: apply accumulated sufficient statistics to emission params.
+            // Only every 50 observations to avoid excessive updates.
+            if self.observation_count.is_multiple_of(50) {
+                self.apply_soft_em_emissions();
+            }
+        }
+
+        // Store current belief for next soft transition update
+        self.prev_belief = self.belief;
+
         // Update observation count
         self.observation_count += 1;
 
         self.belief
+    }
+
+    /// Apply accumulated soft EM sufficient statistics to emission parameters.
+    ///
+    /// Uses Normal-InverseGamma prior structure to prevent emission collapse:
+    /// - Minimum effective sample count of 5.0 before updating (prior dominates)
+    /// - Variance floor at 30% of mean (prevents degenerate point distributions)
+    /// - Regime separation enforced: HIGH ≥ 1.5× NORMAL, EXTREME ≥ 2× HIGH
+    fn apply_soft_em_emissions(&mut self) {
+        /// Minimum effective observations before soft EM updates emission params.
+        const MIN_EFFECTIVE_N: f64 = 5.0;
+
+        for k in 0..NUM_REGIMES {
+            if self.emission_effective_n[k] < MIN_EFFECTIVE_N {
+                continue; // Prior dominates — don't update
+            }
+
+            let params = &mut self.emission_params[k];
+
+            // Blend factor: increases with effective sample count
+            // At n=5: blend=0.5, at n=50: blend=0.91, at n=500: blend=0.99
+            let blend =
+                self.emission_effective_n[k] / (self.emission_effective_n[k] + MIN_EFFECTIVE_N);
+
+            // Update means with blend toward soft EM estimate
+            let new_vol_mean =
+                blend * self.emission_vol_sum[k] + (1.0 - blend) * params.mean_volatility;
+            let new_spread_mean =
+                blend * self.emission_spread_sum[k] + (1.0 - blend) * params.mean_spread;
+
+            params.mean_volatility = new_vol_mean.max(1e-9);
+            params.mean_spread = new_spread_mean.max(0.1);
+
+            // Update standard deviations with variance floor (Normal-InverseGamma prior).
+            // Floor = 30% of mean prevents collapse when regime rarely visited.
+            let vol_std_floor = params.mean_volatility * 0.3;
+            let spread_std_floor = params.mean_spread * 0.3;
+
+            let new_vol_std =
+                blend * self.emission_vol_sq_sum[k].sqrt() + (1.0 - blend) * params.std_volatility;
+            let new_spread_std =
+                blend * self.emission_spread_sq_sum[k].sqrt() + (1.0 - blend) * params.std_spread;
+
+            params.std_volatility = new_vol_std.max(vol_std_floor).max(1e-9);
+            params.std_spread = new_spread_std.max(spread_std_floor).max(0.1);
+        }
+
+        // Enforce minimum regime separation after EM update
+        let normal_vol = self.emission_params[regime_idx::NORMAL].mean_volatility;
+        if self.emission_params[regime_idx::HIGH].mean_volatility < normal_vol * 1.5 {
+            self.emission_params[regime_idx::HIGH].mean_volatility = normal_vol * 1.5;
+        }
+        let high_vol = self.emission_params[regime_idx::HIGH].mean_volatility;
+        if self.emission_params[regime_idx::EXTREME].mean_volatility < high_vol * 2.0 {
+            self.emission_params[regime_idx::EXTREME].mean_volatility = high_vol * 2.0;
+        }
     }
 
     /// Compute emission likelihood P(observation | regime).
@@ -778,6 +943,12 @@ impl RegimeHMM {
         self.observation_count
     }
 
+    /// Get effective sample counts per regime from soft EM.
+    /// Useful for diagnostics — shows which regimes have enough data.
+    pub fn emission_effective_n(&self) -> &[f64; NUM_REGIMES] {
+        &self.emission_effective_n
+    }
+
     /// Authority ramp: regime has no power early in session.
     /// At 200 obs (old threshold), authority = 0.067 -- regime only reduces by ~5%.
     /// Full authority at 3000 obs.
@@ -803,10 +974,12 @@ impl RegimeHMM {
     }
 
     /// Check if belief is confident (low entropy).
+    ///
+    /// Threshold derived from information theory: `ln(K)/2` where K = num_regimes.
+    /// For K=4: `ln(4)/2 ≈ 0.693`. Below this, one regime dominates.
+    /// Max entropy is `ln(4) ≈ 1.386` (uniform).
     pub fn is_confident(&self) -> bool {
-        // Max entropy for 4 states is ln(4) ~= 1.386
-        // Consider confident if entropy < 0.5
-        self.belief_entropy() < 0.5
+        self.belief_entropy() < (NUM_REGIMES as f64).ln() / 2.0
     }
 
     /// Reset belief to default (Normal-dominated).
@@ -827,6 +1000,12 @@ impl RegimeHMM {
         self.initial_calibration_done = false;
         self.observations_since_recalibration = 0;
         self.recalibration_count = 0;
+        self.prev_belief = [0.1, 0.6, 0.25, 0.05];
+        self.emission_vol_sum = [0.0; NUM_REGIMES];
+        self.emission_spread_sum = [0.0; NUM_REGIMES];
+        self.emission_vol_sq_sum = [0.0; NUM_REGIMES];
+        self.emission_spread_sq_sum = [0.0; NUM_REGIMES];
+        self.emission_effective_n = [0.0; NUM_REGIMES];
     }
 
     /// Check if auto-calibration has been performed.
@@ -931,6 +1110,9 @@ impl RegimeHMM {
             extreme_spread,
             (spread_iqr * 1.0).max(min_spread_std),
         );
+
+        // Re-seed soft EM sums after recalibration
+        self.seed_em_sums_from_emissions();
     }
 
     /// Get calibration statistics for diagnostics.
@@ -984,6 +1166,9 @@ impl RegimeHMM {
             transition_counts: self.transition_counts,
             observation_count: self.observation_count,
             recalibration_count: self.recalibration_count,
+            emission_effective_n: self.emission_effective_n,
+            emission_vol_sum: self.emission_vol_sum,
+            emission_spread_sum: self.emission_spread_sum,
         }
     }
 
@@ -996,6 +1181,10 @@ impl RegimeHMM {
         self.transition_counts = cp.transition_counts;
         self.observation_count = cp.observation_count;
         self.recalibration_count = cp.recalibration_count;
+        self.emission_effective_n = cp.emission_effective_n;
+        self.emission_vol_sum = cp.emission_vol_sum;
+        self.emission_spread_sum = cp.emission_spread_sum;
+        self.prev_belief = self.belief;
     }
 }
 
@@ -1523,5 +1712,172 @@ mod tests {
             low_vol,
             normal_vol
         );
+    }
+
+    // =========================================================================
+    // P5: Online Soft EM Tests
+    // =========================================================================
+
+    #[test]
+    fn test_soft_em_accumulates_effective_n() {
+        // Soft EM should accumulate effective sample counts per regime
+        let mut hmm = RegimeHMM::new().with_baseline_volatility(0.001, 5.0);
+
+        // Feed normal observations — Normal regime should accumulate most
+        for _ in 0..100 {
+            hmm.forward_update(&obs_vol_spread(0.001, 5.0));
+        }
+
+        let eff_n = hmm.emission_effective_n();
+        let normal_n = eff_n[regime_idx::NORMAL];
+
+        // Normal regime should have highest effective N
+        assert!(
+            normal_n > eff_n[regime_idx::LOW],
+            "Normal effective_n ({:.1}) should exceed Low ({:.1})",
+            normal_n,
+            eff_n[regime_idx::LOW]
+        );
+        assert!(
+            normal_n > eff_n[regime_idx::EXTREME],
+            "Normal effective_n ({:.1}) should exceed Extreme ({:.1})",
+            normal_n,
+            eff_n[regime_idx::EXTREME]
+        );
+    }
+
+    #[test]
+    fn test_soft_em_prevents_emission_collapse() {
+        // Even with only Normal observations, HIGH/EXTREME emission std
+        // should not collapse to zero (floor at 30% of mean)
+        let mut hmm = RegimeHMM::new().with_baseline_volatility(0.001, 5.0);
+
+        for _ in 0..200 {
+            hmm.forward_update(&obs_vol_spread(0.001, 5.0));
+        }
+
+        for k in 0..NUM_REGIMES {
+            let params = &hmm.emission_params()[k];
+            let vol_floor = params.mean_volatility * 0.3;
+            assert!(
+                params.std_volatility >= vol_floor * 0.99, // 1% tolerance
+                "Regime {} vol std ({:.6}) should be >= floor ({:.6})",
+                k,
+                params.std_volatility,
+                vol_floor
+            );
+        }
+    }
+
+    #[test]
+    fn test_soft_em_transition_learning() {
+        // Soft transition counts should update the transition matrix
+        let mut hmm = RegimeHMM::new().with_baseline_volatility(0.001, 5.0);
+
+        let pre_nn = hmm.transition_matrix()[regime_idx::NORMAL][regime_idx::NORMAL];
+
+        // Feed 200 normal observations — should reinforce Normal→Normal
+        for _ in 0..200 {
+            hmm.forward_update(&obs_vol_spread(0.001, 5.0));
+        }
+
+        let post_nn = hmm.transition_matrix()[regime_idx::NORMAL][regime_idx::NORMAL];
+
+        // Normal→Normal should stay high or increase
+        assert!(
+            post_nn >= pre_nn * 0.95,
+            "Normal→Normal ({:.4}) should stay high (was {:.4})",
+            post_nn,
+            pre_nn
+        );
+    }
+
+    #[test]
+    fn test_soft_em_regime_separation_maintained() {
+        // After soft EM updates, regime separation should be maintained
+        let mut hmm = RegimeHMM::new().with_baseline_volatility(0.001, 5.0);
+
+        // Feed mixed observations to trigger EM updates
+        for _ in 0..100 {
+            hmm.forward_update(&obs_vol_spread(0.001, 5.0));
+        }
+        for _ in 0..50 {
+            hmm.forward_update(&obs_vol_spread(0.005, 15.0));
+        }
+
+        let normal_vol = hmm.emission_params()[regime_idx::NORMAL].mean_volatility;
+        let high_vol = hmm.emission_params()[regime_idx::HIGH].mean_volatility;
+        let extreme_vol = hmm.emission_params()[regime_idx::EXTREME].mean_volatility;
+
+        // HIGH >= 1.5x NORMAL (enforced by apply_soft_em_emissions)
+        assert!(
+            high_vol >= normal_vol * 1.49, // slight tolerance
+            "HIGH vol ({:.6}) should be >= 1.5x NORMAL vol ({:.6})",
+            high_vol,
+            normal_vol
+        );
+        // EXTREME >= 2x HIGH
+        assert!(
+            extreme_vol >= high_vol * 1.99, // slight tolerance
+            "EXTREME vol ({:.6}) should be >= 2x HIGH vol ({:.6})",
+            extreme_vol,
+            high_vol
+        );
+    }
+
+    #[test]
+    fn test_entropy_threshold_information_theoretic() {
+        // is_confident() threshold should be ln(K)/2 = ln(4)/2 ≈ 0.693
+        let mut hmm = RegimeHMM::new();
+
+        // Uniform belief: entropy = ln(4) ≈ 1.386 > 0.693 → not confident
+        hmm.belief = [0.25, 0.25, 0.25, 0.25];
+        assert!(
+            !hmm.is_confident(),
+            "Uniform belief should not be confident"
+        );
+
+        // Strong belief in one regime: entropy ≈ 0.24 < 0.693 → confident
+        hmm.belief = [0.01, 0.95, 0.03, 0.01];
+        assert!(hmm.is_confident(), "Strong belief should be confident");
+
+        // Moderate belief: entropy ≈ 0.8 > 0.693 → not confident
+        hmm.belief = [0.15, 0.4, 0.3, 0.15];
+        let _entropy = hmm.belief_entropy();
+        let threshold = (NUM_REGIMES as f64).ln() / 2.0;
+        // This should be borderline — just verify the threshold is ln(4)/2
+        assert!(
+            (threshold - 0.693).abs() < 0.01,
+            "Threshold should be ln(4)/2 ≈ 0.693, got {:.3}",
+            threshold
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_roundtrip_with_soft_em() {
+        let mut hmm = RegimeHMM::new().with_baseline_volatility(0.001, 5.0);
+
+        // Feed observations to accumulate soft EM state
+        for _ in 0..100 {
+            hmm.forward_update(&obs_vol_spread(0.001, 5.0));
+        }
+
+        let cp = hmm.to_checkpoint();
+
+        // Restore into fresh HMM
+        let mut hmm2 = RegimeHMM::new();
+        hmm2.restore_checkpoint(&cp);
+
+        // Verify soft EM state preserved
+        for k in 0..NUM_REGIMES {
+            assert!(
+                (hmm.emission_effective_n[k] - hmm2.emission_effective_n[k]).abs() < 1e-9,
+                "emission_effective_n[{}] mismatch: {} vs {}",
+                k,
+                hmm.emission_effective_n[k],
+                hmm2.emission_effective_n[k]
+            );
+        }
+        assert_eq!(hmm.observation_count, hmm2.observation_count);
     }
 }

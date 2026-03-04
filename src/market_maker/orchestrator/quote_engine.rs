@@ -13,7 +13,7 @@ use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
 // QuoteGate removed (A4) — replaced by ExecutionMode state machine + E[PnL] filter
 use crate::market_maker::analytics::ToxicityInput;
 use crate::market_maker::config::{CapacityBudget, Viability};
-use crate::market_maker::estimator::{EnhancedFlowContext, MarketEstimator};
+use crate::market_maker::estimator::{EnhancedFlowContext, MarketEstimator, StartupPhase};
 use crate::market_maker::infra::metrics::dashboard::{
     classify_regime, compute_regime_probabilities, ChangepointDiagnostics, KappaDiagnostics,
     PnLAttribution, QuoteDecisionRecord, RegimeState, SignalSnapshot,
@@ -59,80 +59,140 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             return Ok(());
         }
 
-        // Track when first valid market data arrives (for warmup timeout).
+        // Track when first valid market data arrives (for startup phase timing).
         // Using session_start_time includes WS connection time (~40s for HYPE),
-        // which defeats the 30s warmup timeout.
+        // which defeats the warmup timeout.
         if self.first_data_time.is_none() {
             info!(
                 session_age_s = self.session_start_time.elapsed().as_secs(),
-                "First market data received — warmup timeout starts now"
+                "First market data received — startup phase timing starts now"
             );
             self.first_data_time = Some(std::time::Instant::now());
         }
 
-        // Don't place orders until estimator is warmed up (or timeout reached)
-        if !self.estimator.is_warmed_up() {
-            // Check warmup timeout: with informative Bayesian priors, we can safely
-            // quote before all data thresholds are met. Spread floors and kill switches
-            // provide protection. The estimator continues refining as data arrives.
-            //
-            // Capital-tier-aware timeout: small accounts need shorter warmup to avoid
-            // the death spiral (no fills → no progress → wider spreads → no fills).
-            let base_warmup = self.estimator.max_warmup_secs();
-            let max_warmup = if self.effective_max_position > 0.0 && self.latest_mid > 0.0 {
-                // Quick tier estimate from position limits
-                let min_order_size = (MIN_ORDER_NOTIONAL / self.latest_mid).max(0.01);
-                let approx_levels =
-                    (self.effective_max_position / min_order_size).floor() as usize / 2;
-                match approx_levels {
-                    0..=2 => base_warmup.min(10), // Micro: 10s max
-                    3..=5 => base_warmup.min(15), // Small: 15s max
-                    _ => base_warmup,
-                }
-            } else {
-                base_warmup
+        // === WS2: Configure startup timing from capital tier (once) ===
+        // Must happen after first_data_time is set and we have price data for tier estimation.
+        if !self.startup_timing_configured
+            && self.effective_max_position > 0.0
+            && self.latest_mid > 0.0
+        {
+            let min_order_size = (MIN_ORDER_NOTIONAL / self.latest_mid).max(0.01);
+            let approx_levels = (self.effective_max_position / min_order_size).floor() as usize / 2;
+            let tier = match approx_levels {
+                0..=2 => crate::market_maker::CapitalTier::Micro,
+                3..=5 => crate::market_maker::CapitalTier::Small,
+                6..=15 => crate::market_maker::CapitalTier::Medium,
+                _ => crate::market_maker::CapitalTier::Large,
             };
-            let warmup_base = self.first_data_time.unwrap_or(self.session_start_time);
-            let elapsed = warmup_base.elapsed();
-            if max_warmup > 0 && elapsed >= std::time::Duration::from_secs(max_warmup) {
-                let (vol_ticks, min_vol, trade_obs, min_trades) = self.estimator.warmup_progress();
-                warn!(
-                    elapsed_secs = elapsed.as_secs(),
-                    max_warmup_secs = max_warmup,
-                    volume_ticks = vol_ticks,
-                    volume_ticks_required = min_vol,
-                    trade_observations = trade_obs,
-                    trade_observations_required = min_trades,
-                    "Warmup timeout reached, starting with Bayesian prior parameters \
-                     (kappa prior, config sigma). Estimation continues in background."
-                );
-                self.estimator.force_warmup_complete();
-                // Fall through to normal quoting
-            } else {
-                // Log warmup status every 10 seconds to help diagnose why orders aren't placed
-                let should_log = match self.last_warmup_block_log {
-                    None => true,
-                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(10),
-                };
-                if should_log {
-                    let (vol_ticks, min_vol, trade_obs, min_trades) =
-                        self.estimator.warmup_progress();
-                    let remaining = if max_warmup > 0 {
-                        max_warmup.saturating_sub(elapsed.as_secs())
-                    } else {
-                        0
+            let policy = crate::market_maker::CapitalAwarePolicy::from_tier(tier);
+            let obs_secs = policy.startup_observation_secs();
+            let gate_secs = policy.startup_gate_timeout_secs();
+            self.estimator.set_startup_timing(obs_secs, gate_secs);
+            self.startup_timing_configured = true;
+            info!(
+                capital_tier = ?tier,
+                observation_phase_secs = obs_secs,
+                gate_timeout_secs = gate_secs,
+                "Startup timing configured from capital tier"
+            );
+        }
+
+        // === WS2: Three-Phase Calibration-Aware Startup ===
+        // Replaces the old flat warmup timeout with quality-gated phases:
+        //   OBSERVATION → CALIBRATION_GATE → QUOTING
+        {
+            let elapsed_secs = self
+                .first_data_time
+                .unwrap_or(self.session_start_time)
+                .elapsed()
+                .as_secs_f64();
+            let phase = self.estimator.startup_phase(elapsed_secs);
+
+            match phase {
+                StartupPhase::Observation => {
+                    // Pure data collection — no orders placed.
+                    let should_log = match self.last_warmup_block_log {
+                        None => true,
+                        Some(last) => last.elapsed() >= std::time::Duration::from_secs(10),
                     };
-                    warn!(
-                        volume_ticks = vol_ticks,
-                        volume_ticks_required = min_vol,
-                        trade_observations = trade_obs,
-                        trade_observations_required = min_trades,
-                        timeout_remaining_secs = remaining,
-                        "Warmup incomplete - no orders placed (waiting for market data)"
-                    );
-                    self.last_warmup_block_log = Some(std::time::Instant::now());
+                    if should_log {
+                        let (vol_ticks, min_vol, trade_obs, min_trades) =
+                            self.estimator.warmup_progress();
+                        info!(
+                            phase = %phase,
+                            elapsed_secs = elapsed_secs as u64,
+                            volume_ticks = vol_ticks,
+                            volume_ticks_required = min_vol,
+                            trade_observations = trade_obs,
+                            trade_observations_required = min_trades,
+                            "Observation phase — collecting market data, no orders placed"
+                        );
+                        self.last_warmup_block_log = Some(std::time::Instant::now());
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                StartupPhase::CalibrationGate => {
+                    // Waiting for calibration quality — no orders placed yet.
+                    let should_log = match self.last_warmup_block_log {
+                        None => true,
+                        Some(last) => last.elapsed() >= std::time::Duration::from_secs(10),
+                    };
+                    if should_log {
+                        let (sigma_cv, sigma_samples) = self.estimator.sigma_quality();
+                        let (kappa_rel, kappa_samples) = self.estimator.kappa_quality();
+                        let gate_ready = self.estimator.calibration_gate_ready();
+                        info!(
+                            phase = %phase,
+                            elapsed_secs = elapsed_secs as u64,
+                            sigma_cv = format!("{:.3}", sigma_cv),
+                            sigma_cv_threshold = format!("{:.3}", self.estimator.sigma_cv_threshold()),
+                            sigma_samples = sigma_samples,
+                            kappa_rel_ci = format!("{:.3}", kappa_rel),
+                            kappa_ci_threshold = format!("{:.3}", self.estimator.kappa_ci_threshold()),
+                            kappa_samples = kappa_samples,
+                            gate_ready = gate_ready,
+                            "CalibrationGate — waiting for estimation quality"
+                        );
+                        self.last_warmup_block_log = Some(std::time::Instant::now());
+                    }
+                    return Ok(());
+                }
+                StartupPhase::Quoting => {
+                    // Transition to quoting — log once whether quality-passed or timeout-forced.
+                    if !self.startup_quoting_logged {
+                        let gate_ready = self.estimator.calibration_gate_ready();
+                        let (sigma_cv, sigma_samples) = self.estimator.sigma_quality();
+                        let (kappa_rel, kappa_samples) = self.estimator.kappa_quality();
+                        if gate_ready {
+                            info!(
+                                phase = %phase,
+                                elapsed_secs = elapsed_secs as u64,
+                                sigma_cv = format!("{:.3}", sigma_cv),
+                                sigma_samples = sigma_samples,
+                                kappa_rel_ci = format!("{:.3}", kappa_rel),
+                                kappa_samples = kappa_samples,
+                                "Startup → Quoting: calibration quality MET"
+                            );
+                        } else {
+                            warn!(
+                                phase = %phase,
+                                elapsed_secs = elapsed_secs as u64,
+                                sigma_cv = format!("{:.3}", sigma_cv),
+                                sigma_samples = sigma_samples,
+                                kappa_rel_ci = format!("{:.3}", kappa_rel),
+                                kappa_samples = kappa_samples,
+                                "Startup → Quoting: TIMEOUT forced (quality not met), \
+                                 using Bayesian prior parameters"
+                            );
+                        }
+                        // Ensure estimator warmup override is set (for downstream checks)
+                        if !self.estimator.is_warmed_up() {
+                            self.estimator.force_warmup_complete();
+                        }
+                        self.startup_quoting_logged = true;
+                    }
+                    // Fall through to normal quoting
+                }
             }
         }
 
@@ -2032,6 +2092,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // These are routed through CalibratedRiskModel as beta_edge_uncertainty and
         // beta_calibration terms in the log-additive gamma. No new multiplicative layers.
         market_params.edge_uncertainty = self.tier2.edge_tracker.edge_uncertainty();
+
+        // WS2: Quality-based edge_uncertainty during cold start (< 5 fills).
+        // Instead of relying on the edge_tracker's 0.5 "maximum ignorance" default,
+        // use sigma/kappa calibration quality to set a more informative prior.
+        // Better calibration → lower edge_uncertainty → tighter gamma → tighter spreads.
+        {
+            let fill_count = self.tier1.adverse_selection.fills_measured();
+            if fill_count < 5 {
+                let (sigma_cv, _) = self.estimator.sigma_quality();
+                let (kappa_rel, _) = self.estimator.kappa_quality();
+                let sigma_thresh = self.estimator.sigma_cv_threshold();
+                let kappa_thresh = self.estimator.kappa_ci_threshold();
+                // Scale by how far from threshold: at (0,0) → 0.1, at (threshold,threshold) → 0.5
+                let quality_ratio =
+                    (sigma_cv / sigma_thresh.max(1e-6)).max(kappa_rel / kappa_thresh.max(1e-6));
+                let quality_edge_unc = (0.1 + 0.4 * quality_ratio).clamp(0.1, 0.5);
+                market_params.edge_uncertainty = quality_edge_unc;
+            }
+        }
+
         market_params.calibration_deficit = self.quote_outcome_tracker.calibration_error();
 
         // Issue 3: Wire calibration quality to central beliefs for observation noise modulation.
@@ -2086,11 +2166,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // - fill_rate: from observed fills (MEASURED)
         // - latency: from WS ping (MEASURED)
         // Note: num_levels is used for per-level cap calculation (defensive bound)
-        // Default ladder has 25 levels - this constant is used for sizing only
-        const DEFAULT_NUM_LEVELS: usize = 25;
+        // Use actual capital-tier level count instead of hardcoded 25.
+        // Micro=2, Small=4, Medium=8, Large=15. Floor at 5 to prevent per-level explosion.
+        let actual_num_levels = market_params.capital_policy.max_levels_per_side.max(5);
         market_params.compute_derived_target_liquidity(
             self.config.risk_aversion,    // User preference (γ)
-            DEFAULT_NUM_LEVELS,           // Ladder config (default 25 levels)
+            actual_num_levels,            // From capital tier (was hardcoded 25)
             MIN_ORDER_NOTIONAL,           // Exchange minimum ($10)
             self.config.target_liquidity, // Fix 6: config target for geometric blend
         );

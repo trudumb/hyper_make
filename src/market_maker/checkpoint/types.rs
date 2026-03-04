@@ -185,6 +185,15 @@ pub struct CheckpointBundle {
     /// Directional Kalman drift belief state for warm-starting.
     #[serde(default)]
     pub directional_belief: DirectionalBeliefCheckpoint,
+
+    /// Adverse selection fill count for warmup persistence across sessions.
+    /// Decayed on restore so stale fill counts don't prevent re-calibration.
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
+    pub as_fills_measured: usize,
+
+    /// Empirical Bayes parameter registry — all learnable parameters.
+    #[serde(default)]
+    pub parameter_registry: crate::market_maker::calibration::ParameterRegistry,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -434,6 +443,15 @@ pub struct RegimeHMMCheckpoint {
     /// Number of recalibrations performed
     #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub recalibration_count: usize,
+    /// Effective sample counts per regime from soft EM
+    #[serde(default)]
+    pub emission_effective_n: [f64; 4],
+    /// Soft EM running mean of volatility per regime
+    #[serde(default)]
+    pub emission_vol_sum: [f64; 4],
+    /// Soft EM running mean of spread per regime
+    #[serde(default)]
+    pub emission_spread_sum: [f64; 4],
 }
 
 impl Default for RegimeHMMCheckpoint {
@@ -443,6 +461,9 @@ impl Default for RegimeHMMCheckpoint {
             transition_counts: [[0.0; 4]; 4],
             observation_count: 0,
             recalibration_count: 0,
+            emission_effective_n: [0.0; 4],
+            emission_vol_sum: [0.0; 4],
+            emission_spread_sum: [0.0; 4],
         }
     }
 }
@@ -1026,6 +1047,8 @@ mod tests {
             gamma_calibrator: Default::default(),
             particle_filter: ParticleFilterCheckpoint::default(),
             directional_belief: DirectionalBeliefCheckpoint::default(),
+            as_fills_measured: 0,
+            parameter_registry: Default::default(),
         };
 
         // Serialize to JSON
@@ -1130,6 +1153,8 @@ mod tests {
             gamma_calibrator: Default::default(),
             particle_filter: ParticleFilterCheckpoint::default(),
             directional_belief: DirectionalBeliefCheckpoint::default(),
+            as_fills_measured: 0,
+            parameter_registry: Default::default(),
         };
 
         // Serialize to JSON
@@ -1188,6 +1213,8 @@ mod tests {
             gamma_calibrator: Default::default(),
             particle_filter: ParticleFilterCheckpoint::default(),
             directional_belief: DirectionalBeliefCheckpoint::default(),
+            as_fills_measured: 0,
+            parameter_registry: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -1235,6 +1262,8 @@ mod tests {
             gamma_calibrator: Default::default(),
             particle_filter: ParticleFilterCheckpoint::default(),
             directional_belief: DirectionalBeliefCheckpoint::default(),
+            as_fills_measured: 0,
+            parameter_registry: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");

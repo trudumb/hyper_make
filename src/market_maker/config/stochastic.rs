@@ -712,4 +712,117 @@ impl StochasticConfig {
         self.kelly_tau_fixed = tau;
         self
     }
+
+    /// Validate invariants for stochastic config parameters.
+    ///
+    /// Checks critical constraints that, if violated, cause GLFT formula blowups
+    /// or nonsensical risk behavior. All probabilities in [0,1], all rates positive.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.sigma_baseline <= 0.0 {
+            return Err(format!(
+                "sigma_baseline must be > 0.0, got {}",
+                self.sigma_baseline
+            ));
+        }
+        if self.kappa_baseline <= 0.0 {
+            return Err(format!(
+                "kappa_baseline must be > 0.0 (GLFT blows up at zero), got {}",
+                self.kappa_baseline
+            ));
+        }
+        if self.kalman_q <= 0.0 {
+            return Err(format!("kalman_q must be > 0.0, got {}", self.kalman_q));
+        }
+        if self.kalman_r <= 0.0 {
+            return Err(format!("kalman_r must be > 0.0, got {}", self.kalman_r));
+        }
+        if self.kelly_fraction <= 0.0 || self.kelly_fraction > 1.0 {
+            return Err(format!(
+                "kelly_fraction must be in (0.0, 1.0], got {}",
+                self.kelly_fraction
+            ));
+        }
+        if self.kelly_min_p_win <= 0.0 || self.kelly_min_p_win >= 1.0 {
+            return Err(format!(
+                "kelly_min_p_win must be in (0.0, 1.0), got {}",
+                self.kelly_min_p_win
+            ));
+        }
+        if self.book_depth_baseline_usd <= 0.0 {
+            return Err(format!(
+                "book_depth_baseline_usd must be > 0.0, got {}",
+                self.book_depth_baseline_usd
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.risk_model_blend) {
+            return Err(format!(
+                "risk_model_blend must be in [0.0, 1.0], got {}",
+                self.risk_model_blend
+            ));
+        }
+        if self.cascade_cancel_threshold <= 0.0 || self.cascade_cancel_threshold > 1.0 {
+            return Err(format!(
+                "cascade_cancel_threshold must be in (0.0, 1.0], got {}",
+                self.cascade_cancel_threshold
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stochastic_config_validates_defaults() {
+        let cfg = StochasticConfig::default();
+        assert!(cfg.validate().is_ok(), "Default config should be valid");
+    }
+
+    #[test]
+    fn test_stochastic_config_rejects_zero_kappa() {
+        let cfg = StochasticConfig {
+            kappa_baseline: 0.0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("kappa_baseline"), "Error: {err}");
+    }
+
+    #[test]
+    fn test_stochastic_config_rejects_zero_sigma() {
+        let cfg = StochasticConfig {
+            sigma_baseline: 0.0,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("sigma_baseline"), "Error: {err}");
+    }
+
+    #[test]
+    fn test_stochastic_config_rejects_invalid_kelly() {
+        let cfg = StochasticConfig {
+            kelly_fraction: 1.5,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("kelly_fraction"), "Error: {err}");
+    }
+
+    #[test]
+    fn test_stochastic_config_rejects_invalid_blend() {
+        let cfg = StochasticConfig {
+            risk_model_blend: -0.1,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("risk_model_blend"), "Error: {err}");
+    }
+
+    #[test]
+    fn test_all_enabled_config_validates() {
+        let cfg = StochasticConfig::all_enabled();
+        assert!(cfg.validate().is_ok(), "all_enabled config should be valid");
+    }
 }

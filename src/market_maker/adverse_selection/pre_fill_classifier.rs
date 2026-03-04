@@ -979,7 +979,8 @@ impl PreFillASClassifier {
     /// * `realized_as_bps` - The actual adverse selection observed (in bps)
     pub fn observe_as_outcome(&mut self, predicted_as_bps: f64, realized_as_bps: f64) {
         let error = predicted_as_bps - realized_as_bps;
-        // EWMA alpha = 0.95 → slow adaptation, ~14 fill half-life
+        // Retention factor 0.95 → smoothing α = 0.05 → half-life ≈ 14 fills.
+        // Derivation: ln(2)/ln(1/0.95) ≈ 13.5 fills.
         const BIAS_EWMA_ALPHA: f64 = 0.95;
 
         if self.bias_observation_count == 0 {

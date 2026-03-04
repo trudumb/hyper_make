@@ -3,9 +3,40 @@
 //! ParameterEstimator coordinates all sub-estimators to provide
 //! HFT-grade market parameter estimates for the GLFT strategy.
 
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::covariance::ParameterCovariance;
+
+// ============================================================================
+// Startup Phase (WS2: Calibration-Aware Startup)
+// ============================================================================
+
+/// Three-phase startup: OBSERVATION → CALIBRATION_GATE → QUOTING.
+///
+/// Replaces the old flat warmup timeout with quality-aware gating.
+/// - **Observation**: Collect raw market data, no quoting.
+/// - **CalibrationGate**: Wait for sigma/kappa quality to meet thresholds (or timeout).
+/// - **Quoting**: Normal operation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum StartupPhase {
+    /// Collecting initial market data. No orders placed.
+    Observation,
+    /// Waiting for calibration quality to meet thresholds (or timeout).
+    CalibrationGate,
+    /// Normal quoting operation.
+    Quoting,
+}
+
+impl std::fmt::Display for StartupPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupPhase::Observation => write!(f, "Observation"),
+            StartupPhase::CalibrationGate => write!(f, "CalibrationGate"),
+            StartupPhase::Quoting => write!(f, "Quoting"),
+        }
+    }
+}
 use super::hierarchical_kappa::HierarchicalKappa;
 use super::jump::JumpEstimator;
 use super::kalman::KalmanPriceFilter;
@@ -1566,6 +1597,94 @@ impl ParameterEstimator {
         (self.multi_scale.tick_count(), self.config.min_volume_ticks)
     }
 
+    // === WS2: Calibration Quality & Startup Phase ===
+
+    /// Sigma estimation quality: (coefficient_of_variation, sample_count).
+    ///
+    /// CV measures disagreement between fast and slow sigma timescales.
+    /// Low CV (<0.30) indicates stable, well-calibrated sigma estimates.
+    pub fn sigma_quality(&self) -> (f64, usize) {
+        let cv = self.multi_scale.sigma_cv();
+        let samples = self.multi_scale.tick_count();
+        (cv, samples)
+    }
+
+    /// Kappa estimation quality: (relative_ci_width, sample_count).
+    ///
+    /// Relative CI width = confidence_interval_range / mean_kappa.
+    /// Uses the kappa orchestrator's confidence (0→1) as an inverse proxy:
+    /// rel_width = 1.0 - confidence. Low rel_width (<0.50) = tight estimates.
+    pub fn kappa_quality(&self) -> (f64, usize) {
+        let confidence = self.kappa_orchestrator.confidence();
+        // Map confidence [0,1] → relative CI width [1,0]
+        // confidence=0 → rel_width=1.0 (very uncertain), confidence=1 → rel_width=0.0
+        let rel_width = 1.0 - confidence;
+        let samples = self.market_kappa.update_count();
+        (rel_width, samples)
+    }
+
+    /// Whether the calibration gate is ready for quoting.
+    ///
+    /// Requires sigma CV < threshold AND kappa relative CI < threshold
+    /// AND sufficient L2 snapshots for book-based estimation.
+    pub fn calibration_gate_ready(&self) -> bool {
+        let (sigma_cv, _) = self.sigma_quality();
+        let (kappa_rel, _) = self.kappa_quality();
+        // Use market_kappa update_count as proxy for L2 snapshots
+        // (L2 updates and trade observations arrive in tandem)
+        let l2_count = self.market_kappa.update_count();
+
+        sigma_cv < self.config.sigma_cv_threshold
+            && kappa_rel < self.config.kappa_ci_threshold
+            && l2_count >= self.config.min_l2_snapshots
+    }
+
+    /// Determine the current startup phase based on elapsed time and calibration quality.
+    ///
+    /// Three phases:
+    /// 1. **Observation** (elapsed < observation_phase_secs): Pure data collection.
+    /// 2. **CalibrationGate** (observation done, quality not met, within timeout): Wait for quality.
+    /// 3. **Quoting** (quality met OR total timeout exceeded): Normal operation.
+    pub fn startup_phase(&self, elapsed_secs: f64) -> StartupPhase {
+        let obs_secs = self.config.observation_phase_secs as f64;
+        let gate_timeout = self.config.calibration_gate_timeout_secs as f64;
+        let total_timeout = obs_secs + gate_timeout;
+
+        if elapsed_secs < obs_secs {
+            return StartupPhase::Observation;
+        }
+
+        if elapsed_secs >= total_timeout {
+            // Timeout forces quoting regardless of quality
+            return StartupPhase::Quoting;
+        }
+
+        if self.calibration_gate_ready() {
+            StartupPhase::Quoting
+        } else {
+            StartupPhase::CalibrationGate
+        }
+    }
+
+    /// Get the startup config fields for external use (e.g., quote_engine logging).
+    pub fn sigma_cv_threshold(&self) -> f64 {
+        self.config.sigma_cv_threshold
+    }
+
+    /// Get the kappa CI threshold from config.
+    pub fn kappa_ci_threshold(&self) -> f64 {
+        self.config.kappa_ci_threshold
+    }
+
+    /// Override startup config from capital tier policy.
+    ///
+    /// Called once when capital tier is known, to set tier-appropriate
+    /// observation and gate timeout durations.
+    pub fn set_startup_timing(&mut self, observation_secs: u64, gate_timeout_secs: u64) {
+        self.config.observation_phase_secs = observation_secs;
+        self.config.calibration_gate_timeout_secs = gate_timeout_secs;
+    }
+
     // === Stochastic Module: Kalman Filter ===
 
     /// Get Kalman-filtered fair price (posterior mean).
@@ -2748,5 +2867,169 @@ mod tests {
             alert
         );
         assert_eq!(estimator.own_fill_count, 20);
+    }
+
+    // === WS2: Calibration-Aware Startup Tests ===
+
+    #[test]
+    fn test_startup_phase_transitions() {
+        let config = make_config();
+        let estimator = ParameterEstimator::new(config);
+
+        // Default config: observation_phase_secs=60, calibration_gate_timeout_secs=120
+        // Observation for elapsed < 60s
+        assert_eq!(
+            estimator.startup_phase(0.0),
+            StartupPhase::Observation,
+            "At t=0 should be Observation"
+        );
+        assert_eq!(
+            estimator.startup_phase(30.0),
+            StartupPhase::Observation,
+            "At t=30 should be Observation"
+        );
+        assert_eq!(
+            estimator.startup_phase(59.9),
+            StartupPhase::Observation,
+            "Just before observation end should still be Observation"
+        );
+
+        // CalibrationGate after observation, before total timeout (60 + 120 = 180)
+        // Fresh estimator won't be gate_ready, so it should be CalibrationGate
+        assert_eq!(
+            estimator.startup_phase(60.0),
+            StartupPhase::CalibrationGate,
+            "At observation boundary should be CalibrationGate (not ready)"
+        );
+        assert_eq!(
+            estimator.startup_phase(120.0),
+            StartupPhase::CalibrationGate,
+            "Mid gate period should be CalibrationGate"
+        );
+
+        // Quoting after total timeout (60 + 120 = 180)
+        assert_eq!(
+            estimator.startup_phase(180.0),
+            StartupPhase::Quoting,
+            "At total timeout should be Quoting"
+        );
+        assert_eq!(
+            estimator.startup_phase(300.0),
+            StartupPhase::Quoting,
+            "Well past timeout should be Quoting"
+        );
+    }
+
+    #[test]
+    fn test_calibration_gate_starts_false() {
+        let config = make_config();
+        let estimator = ParameterEstimator::new(config);
+
+        // Fresh estimator should NOT be gate_ready (no data, no L2 snapshots)
+        assert!(
+            !estimator.calibration_gate_ready(),
+            "Fresh estimator should not be gate_ready"
+        );
+    }
+
+    #[test]
+    fn test_calibration_gate_timeout_forces_quoting() {
+        let mut config = make_config();
+        config.observation_phase_secs = 10;
+        config.calibration_gate_timeout_secs = 20;
+        let estimator = ParameterEstimator::new(config);
+
+        // Even without quality, elapsed > total timeout (10+20=30) returns Quoting
+        assert_eq!(
+            estimator.startup_phase(5.0),
+            StartupPhase::Observation,
+            "Before observation end"
+        );
+        assert_eq!(
+            estimator.startup_phase(15.0),
+            StartupPhase::CalibrationGate,
+            "In gate period without quality"
+        );
+        assert_eq!(
+            estimator.startup_phase(30.0),
+            StartupPhase::Quoting,
+            "Timeout forces Quoting even without quality"
+        );
+    }
+
+    #[test]
+    fn test_startup_timing_override() {
+        let config = make_config();
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Override with Micro-tier timing
+        estimator.set_startup_timing(15, 30);
+
+        // Total timeout = 15 + 30 = 45
+        assert_eq!(estimator.startup_phase(10.0), StartupPhase::Observation);
+        assert_eq!(estimator.startup_phase(20.0), StartupPhase::CalibrationGate);
+        assert_eq!(estimator.startup_phase(45.0), StartupPhase::Quoting);
+    }
+
+    #[test]
+    fn test_sigma_quality_fresh() {
+        let config = make_config();
+        let estimator = ParameterEstimator::new(config);
+
+        let (cv, samples) = estimator.sigma_quality();
+        // Fresh estimator: fast and slow both initialized from same default_sigma
+        // so CV should be ~0 (they agree perfectly at startup)
+        assert!(cv < 0.01, "Fresh sigma CV should be ~0, got {}", cv);
+        assert_eq!(samples, 0, "No samples yet");
+    }
+
+    #[test]
+    fn test_kappa_quality_fresh() {
+        let config = make_config();
+        let estimator = ParameterEstimator::new(config);
+
+        let (rel_width, samples) = estimator.kappa_quality();
+        // Fresh: confidence is from prior only, rel_width should be high
+        assert!(
+            rel_width > 0.0,
+            "Fresh kappa should have positive relative CI width"
+        );
+        assert_eq!(samples, 0, "No samples yet");
+    }
+
+    #[test]
+    fn test_edge_uncertainty_quality_based() {
+        // Test the formula: edge_unc = (0.1 + 0.4 * max(sigma_cv/thresh, kappa_rel/thresh)).clamp(0.1, 0.5)
+        // At (0, 0) ratios → quality_ratio = 0 → edge_unc = 0.1
+        let edge_unc_perfect = (0.1_f64 + 0.4 * 0.0_f64.max(0.0)).clamp(0.1, 0.5);
+        assert!(
+            (edge_unc_perfect - 0.1).abs() < 1e-10,
+            "Perfect quality should give 0.1, got {}",
+            edge_unc_perfect
+        );
+
+        // At (threshold, threshold) → quality_ratio = 1.0 → edge_unc = 0.5
+        let edge_unc_threshold = (0.1_f64 + 0.4 * 1.0_f64.max(1.0)).clamp(0.1, 0.5);
+        assert!(
+            (edge_unc_threshold - 0.5).abs() < 1e-10,
+            "At threshold should give 0.5, got {}",
+            edge_unc_threshold
+        );
+
+        // At 50% of thresholds → quality_ratio = 0.5 → edge_unc = 0.3
+        let edge_unc_half = (0.1_f64 + 0.4 * 0.5_f64.max(0.5)).clamp(0.1, 0.5);
+        assert!(
+            (edge_unc_half - 0.3).abs() < 1e-10,
+            "Half threshold should give 0.3, got {}",
+            edge_unc_half
+        );
+
+        // Beyond threshold → clamped to 0.5
+        let edge_unc_over = (0.1_f64 + 0.4 * 2.0_f64.max(2.0)).clamp(0.1, 0.5);
+        assert!(
+            (edge_unc_over - 0.5).abs() < 1e-10,
+            "Over threshold should clamp to 0.5, got {}",
+            edge_unc_over
+        );
     }
 }

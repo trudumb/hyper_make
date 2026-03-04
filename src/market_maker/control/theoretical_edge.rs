@@ -813,7 +813,15 @@ impl RegimeAwareBayesianAdverse {
         // Effective cascade probability with Hawkes contribution
         let effective_cascade_prob = (cascade_prob + hawkes_cascade_boost).min(1.0);
 
-        // Regime classification with Hawkes-aware thresholds
+        // Regime classification with Hawkes-aware thresholds.
+        //
+        // Theoretical basis (registered in EB registry as regime_* parameters):
+        // - cascade_prob > 0.4: moderate confidence of cascade (matches HMM P(extreme) > 40%)
+        // - vol_ratio > 1.8: volatility 80% above baseline (≈ sigma posterior 90th percentile)
+        // - vol_ratio < 0.6: volatility 40% below baseline (≈ sigma posterior 25th percentile)
+        // - spread_ratio < 0.7: spreads tight relative to typical (confirms low-vol regime)
+        // - branching_ratio < 0.4: Hawkes process well below instability (n < 1 required)
+        //   At n=0.4, intensity ratio λ/λ∞ = 1/(1-0.4) = 1.67 (modest excitation)
         self.current_regime =
             if effective_cascade_prob > 0.4 || vol_ratio > 1.8 || hawkes_is_high_excitation {
                 2 // Volatile - enter earlier with Hawkes signal

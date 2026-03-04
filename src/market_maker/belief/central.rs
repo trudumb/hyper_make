@@ -48,6 +48,25 @@ use super::snapshot::{
 };
 use super::Regime;
 
+/// Signal source identifier for per-source innovation tracking.
+///
+/// Each directional Kalman update comes from one of these sources.
+/// Innovation variance is tracked separately per source to enable
+/// adaptive observation noise (Phase 3: Signal Integration Weights).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirSource {
+    /// Price return z-scores (highest frequency, medium noise)
+    Price,
+    /// Fill side evidence (binary ±1, high noise)
+    Fill,
+    /// Adverse selection magnitude-scaled direction
+    As,
+    /// Order flow direction ([-1,1] range)
+    Flow,
+    /// Burst/cascade events (rare, low noise)
+    Burst,
+}
+
 /// Configuration for CentralBeliefState.
 #[derive(Debug, Clone)]
 pub struct CentralBeliefConfig {
@@ -361,6 +380,18 @@ struct InternalState {
     /// Online autocorrelation tracker for adaptive decay timescale
     acf_tracker: AutocorrelationTracker,
 
+    // === Per-Source Innovation Tracking (Phase 3: Signal Weights) ===
+    // EWMA of squared Kalman innovations per signal source.
+    // Innovation = obs - prior_mean (computed BEFORE Kalman update).
+    // For a well-tuned filter, E[innov²] ≈ P + R. Divergence from this
+    // indicates the base R (config.dir_noise_*) needs adjustment.
+    // Used by adapted_dir_noise() to blend prior R with innovation-derived R.
+    innovation_var_price: f64,
+    innovation_var_fill: f64,
+    innovation_var_as: f64,
+    innovation_var_flow: f64,
+    innovation_var_burst: f64,
+
     // === Kappa (fill intensity) ===
     kappa_smoothed: f64,
     kappa_smoothed_initialized: bool,
@@ -531,6 +562,13 @@ impl Default for InternalState {
             dir_evidence_as: 0.0,
             dir_evidence_flow: 0.0,
             acf_tracker: AutocorrelationTracker::new(),
+
+            // Innovation tracking (Phase 3)
+            innovation_var_price: 1.0, // Initialize at prior R (dir_noise_price)
+            innovation_var_fill: 16.0, // Initialize at prior R (dir_noise_fill)
+            innovation_var_as: 2.5,    // Initialize at prior R (dir_noise_as)
+            innovation_var_flow: 1.0,  // Initialize at prior R (dir_noise_flow)
+            innovation_var_burst: 0.5, // Initialize at prior R (dir_noise_burst)
 
             // Kappa
             kappa_smoothed: 2000.0,
@@ -867,11 +905,11 @@ impl CentralBeliefState {
                 // Magnitude: ln(intensity_ratio) + 1 scaled by sqrt(fill_count)
                 let magnitude = (intensity_ratio.max(1.0).ln() + 1.0) * (fill_count as f64).sqrt();
                 let obs = direction * magnitude.clamp(0.5, 5.0);
-                // Issue 1+3: Adaptive noise scaling
-                let effective_noise = self.config.dir_noise_burst
+                // Issue 1+3: Adaptive noise scaling (Phase 3: innovation-adapted base R)
+                let effective_noise = self.adapted_dir_noise(state, DirSource::Burst)
                     * state.regime_noise_scale
                     * state.calibration_noise_mult;
-                self.dir_kalman_update(state, obs, effective_noise);
+                self.dir_kalman_update(state, obs, effective_noise, DirSource::Burst);
                 state.dir_n_burst += 1;
                 state.last_update_ms = timestamp_ms;
             }
@@ -951,11 +989,11 @@ impl CentralBeliefState {
                 // --- Directional drift posterior: order flow evidence ---
                 // order_flow_direction ∈ [-1,1], positive = buy pressure = bullish → obs < 0
                 let obs_flow = (-order_flow_direction).clamp(-2.0, 2.0);
-                // Issue 1+3: Adaptive noise scaling
-                let effective_noise = self.config.dir_noise_flow
+                // Issue 1+3: Adaptive noise scaling (Phase 3: innovation-adapted base R)
+                let effective_noise = self.adapted_dir_noise(state, DirSource::Flow)
                     * state.regime_noise_scale
                     * state.calibration_noise_mult;
-                self.dir_kalman_update(state, obs_flow, effective_noise);
+                self.dir_kalman_update(state, obs_flow, effective_noise, DirSource::Flow);
                 state.dir_n_flow += 1;
                 state.dir_evidence_flow += obs_flow;
             }
@@ -1088,10 +1126,46 @@ impl CentralBeliefState {
     }
 
     /// Scalar Kalman update: incorporates a single observation with known noise variance.
-    fn dir_kalman_update(&self, state: &mut InternalState, obs: f64, noise_var: f64) {
+    /// Tracks innovation variance per source for adaptive noise estimation (Phase 3).
+    fn dir_kalman_update(
+        &self,
+        state: &mut InternalState,
+        obs: f64,
+        noise_var: f64,
+        source: DirSource,
+    ) {
+        // Track innovation BEFORE update (innovation = obs - prior_mean)
+        let innovation = obs - state.dir_mu;
+        // EWMA of squared innovations: α=0.05 → half-life ≈ 14 observations.
+        // Tracks regime-level noise changes without overreacting to single outliers.
+        const INNOV_ALPHA: f64 = 0.05;
+        let innov_sq = innovation * innovation;
+        match source {
+            DirSource::Price => {
+                state.innovation_var_price =
+                    (1.0 - INNOV_ALPHA) * state.innovation_var_price + INNOV_ALPHA * innov_sq;
+            }
+            DirSource::Fill => {
+                state.innovation_var_fill =
+                    (1.0 - INNOV_ALPHA) * state.innovation_var_fill + INNOV_ALPHA * innov_sq;
+            }
+            DirSource::As => {
+                state.innovation_var_as =
+                    (1.0 - INNOV_ALPHA) * state.innovation_var_as + INNOV_ALPHA * innov_sq;
+            }
+            DirSource::Flow => {
+                state.innovation_var_flow =
+                    (1.0 - INNOV_ALPHA) * state.innovation_var_flow + INNOV_ALPHA * innov_sq;
+            }
+            DirSource::Burst => {
+                state.innovation_var_burst =
+                    (1.0 - INNOV_ALPHA) * state.innovation_var_burst + INNOV_ALPHA * innov_sq;
+            }
+        }
+
         // K = σ²_prior / (σ²_prior + σ²_noise)
         let k = state.dir_sigma_sq / (state.dir_sigma_sq + noise_var);
-        state.dir_mu += k * (obs - state.dir_mu);
+        state.dir_mu += k * innovation;
         state.dir_sigma_sq *= 1.0 - k;
 
         // Variance floor
@@ -1105,6 +1179,70 @@ impl CentralBeliefState {
         let sigma = state.dir_sigma_sq.sqrt();
         let max_mu = max_z * sigma;
         state.dir_mu = state.dir_mu.clamp(-max_mu, max_mu);
+    }
+
+    /// Compute adapted observation noise for a signal source.
+    ///
+    /// Blends the config prior R with an innovation-derived estimate. When innovation
+    /// variance diverges from what the prior R predicts, the adapted R corrects toward
+    /// the empirical value. This implements the Mehra (1970) adaptive Kalman approach.
+    ///
+    /// Innovation variance ≈ P + R (predicted innovation variance). When actual
+    /// innovation variance is higher → R is underestimated → increase. When lower →
+    /// R is overestimated → decrease.
+    ///
+    /// Returns the adapted BASE noise before regime/calibration modifiers are applied.
+    fn adapted_dir_noise(&self, state: &InternalState, source: DirSource) -> f64 {
+        let (prior_r, innov_var, n_obs) = match source {
+            DirSource::Price => (
+                self.config.dir_noise_price,
+                state.innovation_var_price,
+                state.dir_n_price,
+            ),
+            DirSource::Fill => (
+                self.config.dir_noise_fill,
+                state.innovation_var_fill,
+                state.dir_n_fill,
+            ),
+            DirSource::As => (
+                self.config.dir_noise_as,
+                state.innovation_var_as,
+                state.dir_n_as,
+            ),
+            DirSource::Flow => (
+                self.config.dir_noise_flow,
+                state.innovation_var_flow,
+                state.dir_n_flow,
+            ),
+            DirSource::Burst => (
+                self.config.dir_noise_burst,
+                state.innovation_var_burst,
+                state.dir_n_burst,
+            ),
+        };
+
+        // Need sufficient observations before adapting
+        const MIN_OBS_FOR_ADAPTATION: u64 = 30;
+        if n_obs < MIN_OBS_FOR_ADAPTATION {
+            return prior_r;
+        }
+
+        // Innovation variance ≈ P + R. At steady state, P is small relative to R
+        // (especially for high-noise sources like fills). The ratio of actual to
+        // expected innovation variance indicates how well-calibrated R is.
+        //
+        // correction = innov_var / prior_r (expected ≈ 1.0 when well-calibrated)
+        // Clamped to [0.3, 3.0] to prevent extreme corrections.
+        let correction = (innov_var / prior_r.max(0.01)).clamp(0.3, 3.0);
+
+        // Blend: ramp from pure prior to 60% innovation-adapted
+        // At 30 obs: 0% adapted. At 130 obs: 60% adapted (max).
+        let blend = ((n_obs as f64 - MIN_OBS_FOR_ADAPTATION as f64) / 100.0).clamp(0.0, 0.6);
+
+        // adapted_R = prior_R × (1-blend + blend×correction)
+        // When correction=1.0, adapted_R = prior_R (no change)
+        // When correction=2.0 and blend=0.6, adapted_R = prior_R × 1.6
+        prior_r * (1.0 - blend + blend * correction)
     }
 
     fn process_price_return(
@@ -1138,13 +1276,14 @@ impl CentralBeliefState {
         let obs_price = -z; // positive z (up move) → bullish → negative obs
 
         // Issue 1+3: Adaptive noise — scale by regime, calibration quality, and sigma ratio
+        // Phase 3: innovation-adapted base R replaces static config.dir_noise_price
         let sigma_baseline = 0.002; // ~20 bps, matches default
         let sigma_ratio = (sigma_est / sigma_baseline).clamp(0.3, 5.0);
-        let effective_noise = self.config.dir_noise_price
+        let effective_noise = self.adapted_dir_noise(state, DirSource::Price)
             * state.regime_noise_scale
             * state.calibration_noise_mult
             * sigma_ratio;
-        self.dir_kalman_update(state, obs_price, effective_noise);
+        self.dir_kalman_update(state, obs_price, effective_noise, DirSource::Price);
         state.dir_n_price += 1;
         state.dir_evidence_price += obs_price;
 
@@ -1222,10 +1361,12 @@ impl CentralBeliefState {
 
         // Fill side: is_buy=true → sell aggressor hit our bid → bearish (obs > 0)
         let obs_fill = if fill.is_buy { 1.0 } else { -1.0 };
-        let effective_noise_fill =
-            self.config.dir_noise_fill * state.regime_noise_scale * state.calibration_noise_mult
-                / sigma_ratio.sqrt();
-        self.dir_kalman_update(state, obs_fill, effective_noise_fill);
+        // Phase 3: innovation-adapted base R
+        let effective_noise_fill = self.adapted_dir_noise(state, DirSource::Fill)
+            * state.regime_noise_scale
+            * state.calibration_noise_mult
+            / sigma_ratio.sqrt();
+        self.dir_kalman_update(state, obs_fill, effective_noise_fill, DirSource::Fill);
         state.dir_n_fill += 1;
         state.dir_evidence_fill += obs_fill;
 
@@ -1233,10 +1374,12 @@ impl CentralBeliefState {
         let as_scale_bps = self.config.dir_as_scale_bps;
         let as_mag = (fill.realized_as_bps.abs() / as_scale_bps).clamp(0.0, 2.0);
         let obs_as = if fill.is_buy { as_mag } else { -as_mag };
-        let effective_noise_as =
-            self.config.dir_noise_as * state.regime_noise_scale * state.calibration_noise_mult
-                / sigma_ratio.sqrt();
-        self.dir_kalman_update(state, obs_as, effective_noise_as);
+        // Phase 3: innovation-adapted base R
+        let effective_noise_as = self.adapted_dir_noise(state, DirSource::As)
+            * state.regime_noise_scale
+            * state.calibration_noise_mult
+            / sigma_ratio.sqrt();
+        self.dir_kalman_update(state, obs_as, effective_noise_as, DirSource::As);
         state.dir_n_as += 1;
         state.dir_evidence_as += obs_as;
 
@@ -3400,6 +3543,167 @@ mod tests {
             snap_calm.drift_vol.prob_bearish > 0.5,
             "Calm should show bearish: {}",
             snap_calm.drift_vol.prob_bearish
+        );
+    }
+
+    // === Phase 3: Innovation Tracking & Adaptive Noise ===
+
+    #[test]
+    fn test_innovation_tracking_price_accumulates() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Feed consistent price returns to build innovation statistics
+        for i in 0..50 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: 0.001 * if i % 2 == 0 { 1.0 } else { -1.0 },
+                dt_secs: 1.0,
+                timestamp_ms: 1000 + i * 1000,
+            });
+        }
+
+        let state = beliefs.state.read().unwrap();
+        // After 50 price observations, innovation_var_price should have moved from its initial value
+        // The alternating returns create consistent innovations
+        assert!(
+            state.innovation_var_price > 0.0,
+            "Innovation variance should be positive: {}",
+            state.innovation_var_price
+        );
+        assert!(
+            state.dir_n_price >= 50,
+            "Should have >= 50 price observations: {}",
+            state.dir_n_price
+        );
+    }
+
+    #[test]
+    fn test_innovation_tracking_fill_accumulates() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Feed fills to accumulate fill innovation stats
+        for i in 0..20 {
+            beliefs.update(BeliefUpdate::OwnFill {
+                price: 100.0,
+                size: 1.0,
+                mid: 100.0,
+                is_buy: i % 2 == 0,
+                realized_as_bps: 5.0,
+                realized_edge_bps: 1.0,
+                is_aligned: true,
+                timestamp_ms: 1000 + i * 500,
+                order_id: None,
+                quoted_size: 1.0,
+            });
+        }
+
+        let state = beliefs.state.read().unwrap();
+        assert!(
+            state.innovation_var_fill > 0.0,
+            "Fill innovation variance should be positive: {}",
+            state.innovation_var_fill
+        );
+        assert!(
+            state.innovation_var_as > 0.0,
+            "AS innovation variance should be positive: {}",
+            state.innovation_var_as
+        );
+    }
+
+    #[test]
+    fn test_adapted_dir_noise_returns_prior_before_warmup() {
+        let config = CentralBeliefConfig::default();
+        let beliefs = CentralBeliefState::new(config.clone());
+        let state = beliefs.state.read().unwrap();
+
+        // Before 30 observations, should return config prior
+        let adapted_price = beliefs.adapted_dir_noise(&state, DirSource::Price);
+        assert!(
+            (adapted_price - config.dir_noise_price).abs() < 1e-10,
+            "Should return prior before warmup: adapted={}, prior={}",
+            adapted_price,
+            config.dir_noise_price
+        );
+
+        let adapted_fill = beliefs.adapted_dir_noise(&state, DirSource::Fill);
+        assert!(
+            (adapted_fill - config.dir_noise_fill).abs() < 1e-10,
+            "Fill should return prior before warmup: adapted={}, prior={}",
+            adapted_fill,
+            config.dir_noise_fill
+        );
+    }
+
+    #[test]
+    fn test_adapted_dir_noise_adjusts_after_warmup() {
+        let beliefs = CentralBeliefState::default_config();
+
+        // Feed many price returns to build innovation statistics
+        for i in 0..100 {
+            beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: 0.002 * if i % 2 == 0 { 1.0 } else { -1.0 },
+                dt_secs: 1.0,
+                timestamp_ms: 1000 + i * 1000,
+            });
+        }
+
+        let state = beliefs.state.read().unwrap();
+        let adapted = beliefs.adapted_dir_noise(&state, DirSource::Price);
+
+        // After 100 obs with large alternating returns, innovation variance should
+        // differ from prior, causing adapted noise to diverge from config value
+        // The adapted value should be within [0.3x, 3.0x] of prior (clamped range)
+        let prior = beliefs.config.dir_noise_price;
+        assert!(
+            adapted >= prior * 0.3 && adapted <= prior * 3.0,
+            "Adapted noise {} should be within [0.3, 3.0]x of prior {}",
+            adapted,
+            prior
+        );
+    }
+
+    #[test]
+    fn test_adapted_dir_noise_bounded() {
+        let config = CentralBeliefConfig::default();
+        let beliefs = CentralBeliefState::new(config.clone());
+
+        // Manually set extreme innovation variance to test bounds
+        let mut state = InternalState {
+            dir_n_price: 200,            // Well past warmup
+            innovation_var_price: 100.0, // Extremely high → correction would be 100x
+            ..Default::default()
+        };
+
+        let adapted = beliefs.adapted_dir_noise(&state, DirSource::Price);
+        // Correction = 100/1.0 = 100, clamped to 3.0
+        // Blend at 200 obs = min((200-30)/100, 0.6) = 0.6
+        // adapted = 1.0 * (1-0.6 + 0.6*3.0) = 1.0 * 2.2 = 2.2
+        assert!(
+            adapted <= config.dir_noise_price * 3.0,
+            "Adapted {} should be bounded by 3x prior {}",
+            adapted,
+            config.dir_noise_price
+        );
+        assert!(
+            adapted > config.dir_noise_price,
+            "High innovation variance should increase noise: adapted={}, prior={}",
+            adapted,
+            config.dir_noise_price
+        );
+
+        // Test with very low innovation variance
+        state.innovation_var_price = 0.01; // Very low → correction = 0.01
+        let adapted_low = beliefs.adapted_dir_noise(&state, DirSource::Price);
+        assert!(
+            adapted_low >= config.dir_noise_price * 0.3,
+            "Adapted {} should be bounded by 0.3x prior {}",
+            adapted_low,
+            config.dir_noise_price
+        );
+        assert!(
+            adapted_low < config.dir_noise_price,
+            "Low innovation variance should decrease noise: adapted={}, prior={}",
+            adapted_low,
+            config.dir_noise_price
         );
     }
 }

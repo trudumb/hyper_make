@@ -508,6 +508,34 @@ impl CapitalAwarePolicy {
     }
 }
 
+impl CapitalAwarePolicy {
+    /// Observation phase duration for this capital tier (seconds).
+    ///
+    /// Smaller tiers need shorter observation to avoid the death spiral
+    /// (no fills → no progress → wider spreads → no fills).
+    pub fn startup_observation_secs(&self) -> u64 {
+        match self.tier {
+            CapitalTier::Micro => 15,
+            CapitalTier::Small => 30,
+            CapitalTier::Medium => 60,
+            CapitalTier::Large => 60,
+        }
+    }
+
+    /// Calibration gate timeout for this capital tier (seconds).
+    ///
+    /// After observation + gate_timeout, force quoting with Bayesian priors.
+    /// Smaller tiers get shorter timeouts to start earning fills sooner.
+    pub fn startup_gate_timeout_secs(&self) -> u64 {
+        match self.tier {
+            CapitalTier::Micro => 30,
+            CapitalTier::Small => 60,
+            CapitalTier::Medium => 120,
+            CapitalTier::Large => 120,
+        }
+    }
+}
+
 impl Default for CapitalAwarePolicy {
     fn default() -> Self {
         Self::from_tier(CapitalTier::Large)
@@ -985,5 +1013,49 @@ mod tests {
         let budget = CapacityBudget::compute(100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33);
         let policy = budget.policy();
         assert_eq!(policy.tier, budget.capital_tier);
+    }
+
+    // === WS2: Startup Timing Tests ===
+
+    #[test]
+    fn test_startup_timing_micro() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Micro);
+        assert_eq!(policy.startup_observation_secs(), 15);
+        assert_eq!(policy.startup_gate_timeout_secs(), 30);
+    }
+
+    #[test]
+    fn test_startup_timing_small() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Small);
+        assert_eq!(policy.startup_observation_secs(), 30);
+        assert_eq!(policy.startup_gate_timeout_secs(), 60);
+    }
+
+    #[test]
+    fn test_startup_timing_medium() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Medium);
+        assert_eq!(policy.startup_observation_secs(), 60);
+        assert_eq!(policy.startup_gate_timeout_secs(), 120);
+    }
+
+    #[test]
+    fn test_startup_timing_large() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Large);
+        assert_eq!(policy.startup_observation_secs(), 60);
+        assert_eq!(policy.startup_gate_timeout_secs(), 120);
+    }
+
+    #[test]
+    fn test_startup_timing_smaller_tiers_are_faster() {
+        let micro = CapitalAwarePolicy::from_tier(CapitalTier::Micro);
+        let large = CapitalAwarePolicy::from_tier(CapitalTier::Large);
+        let micro_total = micro.startup_observation_secs() + micro.startup_gate_timeout_secs();
+        let large_total = large.startup_observation_secs() + large.startup_gate_timeout_secs();
+        assert!(
+            micro_total < large_total,
+            "Micro total {}s should be less than Large total {}s",
+            micro_total,
+            large_total
+        );
     }
 }

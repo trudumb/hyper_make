@@ -22,9 +22,31 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::market_maker::calibration::ParameterRegistry;
 use crate::market_maker::config::auto_derive::CapitalTier;
 
 use super::MarketParams;
+
+/// Beta name constants for ParameterRegistry lookups.
+/// Matches entries registered in `create_default_registry()`.
+pub const BETA_NAMES: [&str; 16] = [
+    "beta_volatility",
+    "beta_toxicity",
+    "beta_inventory",
+    "beta_hawkes",
+    "beta_book_depth",
+    "beta_uncertainty",
+    "beta_confidence",
+    "beta_cascade",
+    "beta_tail_risk",
+    "beta_drawdown",
+    "beta_regime",
+    "beta_ghost",
+    "beta_continuation",
+    "beta_edge_uncertainty",
+    "beta_calibration",
+    "beta_as_ratio",
+];
 
 fn default_beta_cascade() -> f64 {
     1.2 // Interim: pending data-driven calibration from gamma_calibration.jsonl
@@ -59,6 +81,24 @@ fn default_beta_calibration() -> f64 {
 }
 fn default_beta_as_ratio() -> f64 {
     0.8 // At ratio=0.5: e^(0.8×0.5) = 1.49× gamma. At ratio=1.0: e^0.8 = 2.23×
+}
+
+/// Decomposition of gamma computation for diagnostic logging.
+///
+/// Captures each beta x feature contribution so we can identify which
+/// risk features are driving gamma inflation in production.
+#[derive(Debug, Clone)]
+pub struct GammaDecomposition {
+    /// (feature_name, beta * feature_value) for each term in the log-additive sum
+    pub contributions: Vec<(&'static str, f64)>,
+    /// Sum of all beta*feature products before sigmoid regularization
+    pub raw_sum: f64,
+    /// Sum after sigmoid regularization
+    pub regulated_sum: f64,
+    /// exp(log_gamma_base) — the base gamma before any features
+    pub base_gamma: f64,
+    /// Final gamma after exp + clamp
+    pub final_gamma: f64,
 }
 
 /// Calibration state for the risk model.
@@ -229,7 +269,7 @@ impl Default for CalibratedRiskModel {
             beta_ghost: 0.5,
             beta_continuation: -0.5,
             beta_edge_uncertainty: 0.5, // edge_uncertainty=0.5 cold-start → exp(0.25) = 1.28× (was 2.12×)
-            beta_calibration: 0.3,    // calibration_deficit=0.25 → exp(0.075) = 1.08× (was 1.22×)
+            beta_calibration: 0.3,      // calibration_deficit=0.25 → exp(0.075) = 1.08× (was 1.22×)
             beta_as_ratio: 0.8,
 
             gamma_min: 0.05,
@@ -366,6 +406,78 @@ impl CalibratedRiskModel {
         log_gamma.exp().clamp(self.gamma_min, self.gamma_max)
     }
 
+    /// Same math as `compute_gamma()`, but returns a `GammaDecomposition` alongside
+    /// the final gamma value for diagnostic logging. No behavior change.
+    pub fn compute_gamma_with_decomposition(
+        &self,
+        features: &RiskFeatures,
+    ) -> (f64, GammaDecomposition) {
+        let inventory_pressure = features.inventory_fraction.powi(2);
+
+        let contributions = vec![
+            (
+                "volatility",
+                self.beta_volatility * features.excess_volatility,
+            ),
+            ("toxicity", self.beta_toxicity * features.toxicity_score),
+            ("inventory", self.beta_inventory * inventory_pressure),
+            ("hawkes", self.beta_hawkes * features.excess_intensity),
+            (
+                "book_depth",
+                self.beta_book_depth * features.depth_depletion,
+            ),
+            (
+                "uncertainty",
+                self.beta_uncertainty * features.model_uncertainty,
+            ),
+            (
+                "confidence",
+                self.beta_confidence * features.position_direction_confidence,
+            ),
+            ("cascade", self.beta_cascade * features.cascade_intensity),
+            (
+                "tail_risk",
+                self.beta_tail_risk * features.tail_risk_intensity,
+            ),
+            ("drawdown", self.beta_drawdown * features.drawdown_fraction),
+            ("regime", self.beta_regime * features.regime_risk_score),
+            ("ghost", self.beta_ghost * features.ghost_depletion),
+            (
+                "continuation",
+                self.beta_continuation * features.continuation_probability,
+            ),
+            (
+                "edge_uncertainty",
+                self.beta_edge_uncertainty * features.edge_uncertainty,
+            ),
+            (
+                "calibration",
+                self.beta_calibration * features.calibration_deficit,
+            ),
+            ("as_ratio", self.beta_as_ratio * features.as_informed_ratio),
+        ];
+
+        let raw_sum: f64 = contributions.iter().map(|(_, v)| v).sum();
+
+        const MAX_GAMMA_CONTRIBUTION: f64 = 2.5;
+        const GAMMA_REG_STEEPNESS: f64 = 2.0;
+        let regulated_sum = MAX_GAMMA_CONTRIBUTION
+            * (raw_sum / (MAX_GAMMA_CONTRIBUTION * GAMMA_REG_STEEPNESS)).tanh();
+
+        let log_gamma = self.log_gamma_base + regulated_sum;
+        let final_gamma = log_gamma.exp().clamp(self.gamma_min, self.gamma_max);
+
+        let decomp = GammaDecomposition {
+            contributions,
+            raw_sum,
+            regulated_sum,
+            base_gamma: self.log_gamma_base.exp(),
+            final_gamma,
+        };
+
+        (final_gamma, decomp)
+    }
+
     /// Compute gamma with policy adjustments.
     /// Single source of truth for all effective_gamma() call sites.
     ///
@@ -466,6 +578,96 @@ impl CalibratedRiskModel {
         self.beta_continuation = betas[12];
         self.beta_edge_uncertainty = betas[13];
         self.beta_calibration = betas[14];
+    }
+
+    /// Create a risk model with beta values from the ParameterRegistry.
+    ///
+    /// Uses current EB posterior estimates (which degrade to prior means when
+    /// no data has been observed). This ensures defaults are always principled.
+    pub fn from_registry(registry: &ParameterRegistry) -> Self {
+        Self {
+            log_gamma_base: 0.15_f64.ln(),
+            beta_volatility: registry.get_value_or("beta_volatility", 1.0),
+            beta_toxicity: registry.get_value_or("beta_toxicity", 0.5),
+            beta_inventory: registry.get_value_or("beta_inventory", 4.0),
+            beta_hawkes: registry.get_value_or("beta_hawkes", 0.4),
+            beta_book_depth: registry.get_value_or("beta_book_depth", 0.3),
+            beta_uncertainty: registry.get_value_or("beta_uncertainty", 0.2),
+            beta_confidence: registry.get_value_or("beta_confidence", -0.4),
+            beta_cascade: registry.get_value_or("beta_cascade", 1.2),
+            beta_tail_risk: registry.get_value_or("beta_tail_risk", 0.7),
+            beta_drawdown: registry.get_value_or("beta_drawdown", 1.4),
+            beta_regime: registry.get_value_or("beta_regime", 1.0),
+            beta_ghost: registry.get_value_or("beta_ghost", 0.5),
+            beta_continuation: registry.get_value_or("beta_continuation", -0.5),
+            beta_edge_uncertainty: registry.get_value_or("beta_edge_uncertainty", 0.5),
+            beta_calibration: registry.get_value_or("beta_calibration", 0.3),
+            beta_as_ratio: registry.get_value_or("beta_as_ratio", 0.8),
+            gamma_min: 0.05,
+            gamma_max: 5.0,
+            n_samples: 0,
+            last_calibration_ms: 0,
+            r_squared: 0.0,
+            state: CalibrationState::Cold,
+        }
+    }
+
+    /// Observe current beta values back into the ParameterRegistry.
+    ///
+    /// Called after the OnlineBayesianGammaCalibrator updates betas,
+    /// so the registry tracks the learned posterior distribution.
+    pub fn observe_betas_to_registry(&self, registry: &mut ParameterRegistry) {
+        let betas = self.betas_as_array();
+        let names = &BETA_NAMES[..15]; // betas_as_array is 15 elements (excludes as_ratio)
+        for (name, &value) in names.iter().zip(betas.iter()) {
+            // Use observation variance proportional to remaining uncertainty
+            // More samples → lower obs_var → stronger pull toward learned value
+            let obs_var = if self.n_samples > 0 {
+                // Shrink obs_var as data accumulates: 1.0 at 1 sample → 0.01 at 100+
+                (1.0 / (self.n_samples as f64).sqrt()).clamp(0.01, 1.0)
+            } else {
+                1.0 // Very uncertain — weak observation
+            };
+            registry.observe_normal(name, value, obs_var);
+        }
+        // Also observe beta_as_ratio
+        let obs_var = if self.n_samples > 0 {
+            (1.0 / (self.n_samples as f64).sqrt()).clamp(0.01, 1.0)
+        } else {
+            1.0
+        };
+        registry.observe_normal("beta_as_ratio", self.beta_as_ratio, obs_var);
+    }
+
+    /// Clamp all betas to the ParameterRegistry's hard bounds.
+    ///
+    /// Prevents catastrophic miscalibration from the online learner.
+    /// Called after `apply_calibrated_betas()` as a safety rail.
+    pub fn clamp_betas_to_registry_bounds(&mut self, registry: &ParameterRegistry) {
+        let names = BETA_NAMES;
+        let betas = [
+            &mut self.beta_volatility,
+            &mut self.beta_toxicity,
+            &mut self.beta_inventory,
+            &mut self.beta_hawkes,
+            &mut self.beta_book_depth,
+            &mut self.beta_uncertainty,
+            &mut self.beta_confidence,
+            &mut self.beta_cascade,
+            &mut self.beta_tail_risk,
+            &mut self.beta_drawdown,
+            &mut self.beta_regime,
+            &mut self.beta_ghost,
+            &mut self.beta_continuation,
+            &mut self.beta_edge_uncertainty,
+            &mut self.beta_calibration,
+            &mut self.beta_as_ratio,
+        ];
+        for (name, beta) in names.iter().zip(betas.into_iter()) {
+            if let Some((lo, hi)) = registry.get_bounds(name) {
+                *beta = beta.clamp(lo, hi);
+            }
+        }
     }
 
     /// Blend this model with conservative defaults based on staleness.
@@ -1682,6 +1884,135 @@ mod tests {
         assert!(
             g_bad > g_good,
             "Poor calibration should widen gamma: bad={g_bad:.4}, good={g_good:.4}"
+        );
+    }
+
+    #[test]
+    fn test_gamma_decomposition_matches_compute_gamma() {
+        let model = CalibratedRiskModel::default();
+        let features = RiskFeatures {
+            excess_volatility: 0.5,
+            toxicity_score: 0.3,
+            inventory_fraction: 0.4,
+            excess_intensity: 0.2,
+            depth_depletion: 0.1,
+            ..RiskFeatures::neutral()
+        };
+
+        let gamma_direct = model.compute_gamma(&features);
+        let (gamma_decomp, _decomp) = model.compute_gamma_with_decomposition(&features);
+
+        assert!(
+            (gamma_direct - gamma_decomp).abs() < 1e-12,
+            "Decomposition gamma ({gamma_decomp:.10}) must match compute_gamma ({gamma_direct:.10})"
+        );
+    }
+
+    // === Phase 2: EB Prior Integration Tests ===
+
+    #[test]
+    fn test_from_registry_matches_defaults() {
+        let registry = crate::market_maker::calibration::create_default_registry();
+        let from_reg = CalibratedRiskModel::from_registry(&registry);
+        let defaults = CalibratedRiskModel::default();
+
+        // All beta values should match the registry priors (which now match defaults)
+        assert!(
+            (from_reg.beta_volatility - defaults.beta_volatility).abs() < 1e-6,
+            "beta_volatility: reg={}, default={}",
+            from_reg.beta_volatility,
+            defaults.beta_volatility
+        );
+        assert!(
+            (from_reg.beta_inventory - defaults.beta_inventory).abs() < 1e-6,
+            "beta_inventory: reg={}, default={}",
+            from_reg.beta_inventory,
+            defaults.beta_inventory
+        );
+        assert!(
+            (from_reg.beta_confidence - defaults.beta_confidence).abs() < 1e-6,
+            "beta_confidence: reg={}, default={}",
+            from_reg.beta_confidence,
+            defaults.beta_confidence
+        );
+    }
+
+    #[test]
+    fn test_from_registry_produces_valid_gamma() {
+        let registry = crate::market_maker::calibration::create_default_registry();
+        let model = CalibratedRiskModel::from_registry(&registry);
+        let features = RiskFeatures::neutral();
+        let gamma = model.compute_gamma(&features);
+        assert!(gamma > 0.01 && gamma < 5.0, "gamma={}", gamma);
+    }
+
+    #[test]
+    fn test_observe_betas_to_registry() {
+        let mut registry = crate::market_maker::calibration::create_default_registry();
+        let model = CalibratedRiskModel {
+            n_samples: 50,
+            ..Default::default()
+        };
+        model.observe_betas_to_registry(&mut registry);
+
+        // After observing, registry values should be close to model values
+        // (since model defaults match registry priors, the posterior stays near the prior)
+        let vol_val = registry.get_value("beta_volatility").unwrap();
+        assert!(
+            (vol_val - model.beta_volatility).abs() < 0.5,
+            "After observe, registry should track model: reg={vol_val}, model={}",
+            model.beta_volatility
+        );
+    }
+
+    #[test]
+    fn test_clamp_betas_to_registry_bounds() {
+        let registry = crate::market_maker::calibration::create_default_registry();
+        let mut model = CalibratedRiskModel {
+            beta_volatility: 100.0, // Hard bound is (-1.0, 4.0)
+            beta_confidence: -50.0, // Hard bound is (-1.5, 0.5)
+            beta_inventory: -10.0,  // Hard bound is (0.5, 10.0)
+            ..Default::default()
+        };
+
+        model.clamp_betas_to_registry_bounds(&registry);
+
+        assert!(
+            model.beta_volatility <= 4.0,
+            "beta_vol should be clamped: {}",
+            model.beta_volatility
+        );
+        assert!(
+            model.beta_confidence >= -1.5,
+            "beta_conf should be clamped: {}",
+            model.beta_confidence
+        );
+        assert!(
+            model.beta_inventory >= 0.5,
+            "beta_inv should be clamped: {}",
+            model.beta_inventory
+        );
+    }
+
+    #[test]
+    fn test_gamma_decomposition_sum_equals_raw_sum() {
+        let model = CalibratedRiskModel::default();
+        let features = RiskFeatures {
+            excess_volatility: 1.0,
+            toxicity_score: 0.5,
+            inventory_fraction: 0.6,
+            cascade_intensity: 0.3,
+            edge_uncertainty: 0.4,
+            ..RiskFeatures::neutral()
+        };
+
+        let (_gamma, decomp) = model.compute_gamma_with_decomposition(&features);
+        let sum_of_contributions: f64 = decomp.contributions.iter().map(|(_, v)| v).sum();
+
+        assert!(
+            (sum_of_contributions - decomp.raw_sum).abs() < 1e-12,
+            "Sum of contributions ({sum_of_contributions:.10}) must equal raw_sum ({:.10})",
+            decomp.raw_sum
         );
     }
 }

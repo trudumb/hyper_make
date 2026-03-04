@@ -773,6 +773,13 @@ pub struct SignalIntegrator {
     hl_perp_basis_bps: f64,
     /// EWMA of perp net trade flow (signed size). Positive = buy-dominated.
     hl_perp_flow_imbalance: f64,
+    /// Count of HL perp basis observations for warmup gating.
+    hl_perp_obs_count: usize,
+    /// Whether HL perp signal has enough observations to be valid.
+    /// Uses Cell because staleness is checked in &self get_signals().
+    hl_perp_signal_valid: Cell<bool>,
+    /// Last HL perp basis update timestamp (ms) for staleness detection.
+    hl_perp_last_update_ms: u64,
 
     /// Current funding rate (8h period, fraction not bps).
     /// Positive = longs pay shorts. Updated via `set_funding_rate_8h`.
@@ -829,6 +836,9 @@ impl SignalIntegrator {
             // HL perp lead-lag
             hl_perp_basis_bps: 0.0,
             hl_perp_flow_imbalance: 0.0,
+            hl_perp_obs_count: 0,
+            hl_perp_signal_valid: Cell::new(false),
+            hl_perp_last_update_ms: 0,
             // Funding rate
             funding_rate_8h: 0.0,
             // BTC beta
@@ -1009,10 +1019,19 @@ impl SignalIntegrator {
     ///
     /// The basis is EWMA-smoothed (decay=0.95) to filter tick noise.
     /// Fed to drift estimation: perp premium predicts spot price increase.
-    pub fn on_hl_perp_basis(&mut self, basis_bps: f64, _timestamp_ms: u64) {
+    pub fn on_hl_perp_basis(&mut self, basis_bps: f64, timestamp_ms: u64) {
         // EWMA smooth with decay=0.95 (~20 observation half-life)
         const DECAY: f64 = 0.95;
         self.hl_perp_basis_bps = DECAY * self.hl_perp_basis_bps + (1.0 - DECAY) * basis_bps;
+
+        // Track observation count for warmup gating
+        self.hl_perp_obs_count += 1;
+        self.hl_perp_last_update_ms = timestamp_ms;
+        // After 10 observations, mark signal as valid
+        const WARMUP_OBS: usize = 10;
+        if self.hl_perp_obs_count >= WARMUP_OBS {
+            self.hl_perp_signal_valid.set(true);
+        }
     }
 
     /// Update with signed perp trade flow for flow imbalance tracking.
@@ -1566,9 +1585,20 @@ impl SignalIntegrator {
                 (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
         }
 
+        // Staleness check for HL perp signal: invalidate if no update in >5s
+        if self.hl_perp_signal_valid.get() && self.hl_perp_last_update_ms > 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if now_ms.saturating_sub(self.hl_perp_last_update_ms) > 5_000 {
+                self.hl_perp_signal_valid.set(false);
+            }
+        }
+
         // Update signal availability state machine
         let current = self.signal_availability.get();
-        if signals.cross_venue_valid || signals.lead_lag_actionable {
+        if signals.cross_venue_valid || signals.lead_lag_actionable || self.hl_perp_signal_valid.get() {
             // Signal is healthy — transition to Available
             if current != SignalAvailability::Available {
                 self.signal_availability.set(SignalAvailability::Available);
@@ -1972,6 +2002,9 @@ impl SignalIntegrator {
                 SignalAvailability::NeverConfigured
             });
         self.logged_signal_state.set(false);
+        self.hl_perp_obs_count = 0;
+        self.hl_perp_signal_valid.set(false);
+        self.hl_perp_last_update_ms = 0;
     }
 }
 

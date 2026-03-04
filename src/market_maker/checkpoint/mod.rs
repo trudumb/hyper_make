@@ -251,6 +251,8 @@ mod tests {
             gamma_calibrator: Default::default(),
             particle_filter: ParticleFilterCheckpoint::default(),
             directional_belief: DirectionalBeliefCheckpoint::default(),
+            as_fills_measured: 0,
+            parameter_registry: Default::default(),
         }
     }
 

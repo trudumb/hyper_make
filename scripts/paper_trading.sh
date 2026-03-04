@@ -7,7 +7,7 @@
 #   ./scripts/paper_trading.sh BTC 300                 # 5 minute simulation
 #   ./scripts/paper_trading.sh BTC 3600 --report       # 1 hour with calibration report
 #   ./scripts/paper_trading.sh BTC 300 --verbose       # With verbose logging
-#   ./scripts/paper_trading.sh HYPE 1200 --dex hyna    # HIP-3 DEX paper trading
+#   ./scripts/paper_trading.sh HYPE 1800 --dex hyna    # HIP-3 DEX paper trading
 #   ./scripts/paper_trading.sh HYPE 3600 --dex hyna --capture  # HIP-3 with capture
 #   ./scripts/paper_trading.sh HYPE 1800
 #   ./scripts/paper_trading.sh BTC 300 --capture       # With dashboard + screenshot capture

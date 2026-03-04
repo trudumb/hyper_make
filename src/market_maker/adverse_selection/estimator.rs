@@ -370,6 +370,8 @@ impl AdverseSelectionEstimator {
             if is_toxic {
                 self.informed_fills_count += 1;
                 // Glosten-Milgrom: Track informed jump magnitude (fractional)
+                // α=0.1 → half-life ≈ -1/ln(1-0.1) ≈ 6.6 fills (principled: reacts to
+                // regime-level AS changes within ~7 fills while smoothing single-fill noise)
                 const GM_ALPHA: f64 = 0.1;
                 self.informed_as_ewma =
                     GM_ALPHA * signed_as.abs() + (1.0 - GM_ALPHA) * self.informed_as_ewma;
@@ -391,7 +393,9 @@ impl AdverseSelectionEstimator {
                 }
             }
 
-            // Update rolling AS severity EWMA (alpha=0.1, ~10 fill half-life)
+            // Update rolling AS severity EWMA
+            // α=0.1 → half-life ≈ 6.6 fills (consistent with GM_ALPHA above;
+            // both track regime-level changes with matched time constants)
             const AS_SEVERITY_ALPHA: f64 = 0.1;
             // Variance update: E[(x - mean)²] via Welford-style EWMA
             let deviation = adverse_move_bps - self.recent_as_ewma_bps;
@@ -404,6 +408,9 @@ impl AdverseSelectionEstimator {
 
         // Periodically update best horizon selection
         self.update_best_horizon();
+
+        // Adapt informed threshold from AS posterior distribution
+        self.adapt_informed_threshold();
     }
 
     /// Update best horizon selection based on variance (stability).
@@ -492,6 +499,12 @@ impl AdverseSelectionEstimator {
     /// Get the number of fills measured.
     pub fn fills_measured(&self) -> usize {
         self.fills_measured
+    }
+
+    /// Restore fills_measured from checkpoint (time-decayed).
+    /// Prevents warmup amnesia: sessions start near full size instead of 30%.
+    pub fn set_fills_measured(&mut self, count: usize) {
+        self.fills_measured = count;
     }
 
     /// Get the number of pending fills awaiting resolution.
@@ -886,6 +899,37 @@ impl AdverseSelectionEstimator {
         } else {
             self.recent_as_variance_bps2
         }
+    }
+
+    /// Adapt `informed_threshold_bps` from the AS posterior distribution.
+    ///
+    /// Derives threshold as: `μ_AS + k × σ_AS` where k=1.0 (one standard deviation
+    /// above mean). Fills with adverse move > μ+σ are classified as "informed" —
+    /// this corresponds to the ~84th percentile of the AS distribution under
+    /// normality, providing a natural Bayesian decision boundary.
+    ///
+    /// The threshold is floored at `min_threshold_bps` (default 2.0) to prevent
+    /// classifying noise as informed during low-AS regimes, and capped at
+    /// `max_threshold_bps` (default 20.0) to remain responsive during high-AS regimes.
+    ///
+    /// Called automatically after each markout batch when sufficient data exists.
+    pub fn adapt_informed_threshold(&mut self) {
+        // Need enough data for stable mean/variance estimates
+        const MIN_FILLS_FOR_ADAPTATION: usize = 20;
+        const MIN_THRESHOLD_BPS: f64 = 2.0;
+        const MAX_THRESHOLD_BPS: f64 = 20.0;
+        // k=1.0: one sigma above mean (84th percentile decision boundary)
+        const K_SIGMA: f64 = 1.0;
+
+        if self.fills_measured < MIN_FILLS_FOR_ADAPTATION {
+            return; // Keep default until sufficient data
+        }
+
+        let as_std_bps = self.recent_as_variance_bps2.sqrt();
+        let adaptive_threshold = self.recent_as_ewma_bps + K_SIGMA * as_std_bps;
+
+        self.informed_threshold_bps =
+            adaptive_threshold.clamp(MIN_THRESHOLD_BPS, MAX_THRESHOLD_BPS);
     }
 }
 
@@ -1418,6 +1462,61 @@ mod tests {
         assert!(
             shift_losing.abs() > shift_long.abs(),
             "Losing PnL should increase shift magnitude via HARA gamma"
+        );
+    }
+
+    // === Adaptive Informed Threshold Tests ===
+
+    #[test]
+    fn test_adapt_informed_threshold_no_change_before_warmup() {
+        let mut est = make_estimator();
+        let initial_threshold = est.informed_threshold_bps();
+
+        // Fewer than 20 fills → threshold stays at default
+        est.adapt_informed_threshold();
+        assert_eq!(
+            est.informed_threshold_bps(),
+            initial_threshold,
+            "Threshold should not change before warmup"
+        );
+    }
+
+    #[test]
+    fn test_adapt_informed_threshold_tracks_as_distribution() {
+        let mut est = make_estimator();
+
+        // Simulate 25 fills with consistent 10 bps adverse selection
+        for i in 0..25 {
+            est.record_fill(i as u64, 1.0, true, 100.0);
+            std::thread::sleep(TEST_HORIZON_SLEEP);
+            est.update(99.9); // 10 bps adverse
+        }
+
+        // After 25 fills, threshold should have adapted
+        // With consistent 10 bps AS, mean → 10, variance → 0 (no variation)
+        // Threshold = mean + 1σ ≈ 10 + 0 = 10, clamped to [2, 20]
+        let threshold = est.informed_threshold_bps();
+        assert!(
+            (2.0..=20.0).contains(&threshold),
+            "Threshold should be within bounds: {threshold}"
+        );
+    }
+
+    #[test]
+    fn test_adapt_informed_threshold_respects_bounds() {
+        let mut est = make_estimator();
+
+        // Simulate tiny AS (< 2 bps) — threshold should floor at 2.0
+        for i in 0..25 {
+            est.record_fill(i as u64, 1.0, true, 100.0);
+            std::thread::sleep(TEST_HORIZON_SLEEP);
+            est.update(99.999); // ~0.1 bps adverse
+        }
+
+        let threshold = est.informed_threshold_bps();
+        assert!(
+            threshold >= 2.0,
+            "Threshold should not go below 2.0 bps: {threshold}"
         );
     }
 }

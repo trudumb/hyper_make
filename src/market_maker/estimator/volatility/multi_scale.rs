@@ -112,4 +112,19 @@ impl MultiScaleBipowerEstimator {
     pub(crate) fn tick_count(&self) -> usize {
         self.tick_count
     }
+
+    /// Coefficient of variation between fast and slow sigma estimates.
+    ///
+    /// Measures disagreement between timescales as a proxy for estimation uncertainty.
+    /// CV = |fast - slow| / mean(fast, slow). Returns 0.0 if no data.
+    /// Low CV (<0.3) indicates stable, well-calibrated sigma estimates.
+    pub(crate) fn sigma_cv(&self) -> f64 {
+        let fast = self.fast.sigma_clean();
+        let slow = self.slow.sigma_clean();
+        let mean = (fast + slow) / 2.0;
+        if mean < 1e-15 {
+            return 0.0;
+        }
+        (fast - slow).abs() / mean
+    }
 }

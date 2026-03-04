@@ -646,7 +646,8 @@ fn sample_standard_normal<R: Rng>(rng: &mut R) -> f64 {
 // Sampling Bias Tracker (Q18: Vol Debiasing)
 // ============================================================================
 
-/// EWMA decay for bias tracking (~100 observation half-life).
+/// EWMA decay for bias tracking.
+/// Derivation: half-life = 99 observations → α = 1 - 2^(-1/99) ≈ 0.007.
 const BIAS_EWMA_ALPHA: f64 = 0.007;
 
 /// Tracks sampling bias in volatility estimation: σ̂ conditioned on fills

@@ -1438,8 +1438,8 @@ impl Default for MarketParams {
             drift_uncertainty_bps: 0.0,
             hysteresis_bid_gamma_mult: 1.0,
             hysteresis_ask_gamma_mult: 1.0,
-            edge_uncertainty: 0.3,     // Mild uncertainty — aggressive start, model learns from fills
-            calibration_deficit: 0.0,  // Assume calibrated until measured (no phantom penalty)
+            edge_uncertainty: 0.3, // Mild uncertainty — aggressive start, model learns from fills
+            calibration_deficit: 0.0, // Assume calibrated until measured (no phantom penalty)
             current_drawdown_frac: 0.0,
             // Capital tier
             capital_tier: CapitalTier::Large,

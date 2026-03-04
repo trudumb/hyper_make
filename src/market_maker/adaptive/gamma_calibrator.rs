@@ -12,6 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::market_maker::calibration::ParameterRegistry;
+use crate::market_maker::strategy::BETA_NAMES;
+
 /// Number of beta coefficients in CalibratedRiskModel.
 pub const NUM_BETAS: usize = 15;
 
@@ -112,6 +115,17 @@ impl OnlineBayesianGammaCalibrator {
             self.precision_diag[i] = self.precision_diag[i].clamp(1e-6, 1e6);
         }
         self.n_samples += 1;
+
+        // Soft-clamp betas toward prior when they drift too far.
+        // Each beta is pulled back if it exceeds 3× the prior-to-default distance.
+        // This prevents catastrophic RLS divergence without requiring the registry.
+        for i in 0..NUM_BETAS {
+            let max_drift = (self.beta_prior[i].abs() + 1.0) * 3.0;
+            self.beta[i] = self.beta[i].clamp(
+                self.beta_prior[i] - max_drift,
+                self.beta_prior[i] + max_drift,
+            );
+        }
     }
 
     /// Returns calibrated betas, blended with prior when sample count is low.
@@ -125,6 +139,61 @@ impl OnlineBayesianGammaCalibrator {
             *val = (1.0 - blend) * self.beta_prior[i] + blend * self.beta[i];
         }
         result
+    }
+
+    /// Create a calibrator initialized from ParameterRegistry EB priors.
+    ///
+    /// Uses registry posterior estimates as priors (which degrade to defaults
+    /// when no data is available). This enables warm-starting from checkpoints.
+    pub fn new_from_registry(registry: &ParameterRegistry) -> Self {
+        let mut beta = Vec::with_capacity(NUM_BETAS);
+        let mut beta_prior = Vec::with_capacity(NUM_BETAS);
+
+        // BETA_NAMES[0..15] matches the 15-element beta array order
+        for &name in BETA_NAMES[..NUM_BETAS].iter() {
+            let val = registry.get_value_or(name, 0.0);
+            beta.push(val);
+            beta_prior.push(val);
+        }
+
+        let precision_diag = vec![default_prior_strength(); NUM_BETAS];
+        Self {
+            beta,
+            precision_diag,
+            lambda: default_lambda(),
+            min_samples: default_min_samples(),
+            n_samples: 0,
+            beta_prior,
+            prior_strength: default_prior_strength(),
+        }
+    }
+
+    /// Clamp all betas to ParameterRegistry hard bounds.
+    ///
+    /// Called after each RLS update to prevent catastrophic drift.
+    /// No-op for parameters not found in registry.
+    pub fn clamp_to_registry_bounds(&mut self, registry: &ParameterRegistry) {
+        for (i, &name) in BETA_NAMES[..NUM_BETAS].iter().enumerate() {
+            if let Some((lo, hi)) = registry.get_bounds(name) {
+                self.beta[i] = self.beta[i].clamp(lo, hi);
+            }
+        }
+    }
+
+    /// Observe learned betas back into the ParameterRegistry.
+    ///
+    /// Updates the registry's posterior distribution with the learned values.
+    /// Observation variance decreases as sample count increases, giving
+    /// more weight to well-learned values.
+    pub fn observe_to_registry(&self, registry: &mut ParameterRegistry) {
+        let obs_var = if self.n_samples > 0 {
+            (1.0 / (self.n_samples as f64).sqrt()).clamp(0.01, 1.0)
+        } else {
+            1.0
+        };
+        for (i, &name) in BETA_NAMES[..NUM_BETAS].iter().enumerate() {
+            registry.observe_normal(name, self.beta[i], obs_var);
+        }
     }
 
     /// Whether the calibrator has enough data to influence gamma computation.
@@ -184,12 +253,17 @@ mod tests {
         // Before any updates: effective_betas = prior
         let betas_cold = cal.effective_betas();
         assert!((betas_cold[0] - 1.0).abs() < 1e-10, "Cold should be prior");
+        assert!((cal.blend_ratio() - 0.0).abs() < 1e-10, "Cold blend = 0");
 
-        // After 50 fills (half warmup): blend = 0.5
-        for _ in 0..50 {
+        // After 10 fills (half of min_samples=20): blend = 0.5
+        for _ in 0..10 {
             cal.update(&features, 0.15, 2.0);
         }
-        assert!((cal.blend_ratio() - 0.5).abs() < 1e-10);
+        assert!(
+            (cal.blend_ratio() - 0.5).abs() < 1e-10,
+            "Half-warmed blend: {}",
+            cal.blend_ratio()
+        );
         let betas_half = cal.effective_betas();
         // Should be between prior and learned
         assert!(
@@ -197,11 +271,15 @@ mod tests {
             "Half-warmed should differ from cold (unless learned == prior)"
         );
 
-        // After 100 fills (fully warmed): blend = 1.0
-        for _ in 0..50 {
+        // After 20+ fills (fully warmed): blend = 1.0
+        for _ in 0..10 {
             cal.update(&features, 0.15, 2.0);
         }
-        assert!((cal.blend_ratio() - 1.0).abs() < 1e-10);
+        assert!(
+            (cal.blend_ratio() - 1.0).abs() < 1e-10,
+            "Fully warmed blend: {}",
+            cal.blend_ratio()
+        );
         assert!(cal.is_warmed_up());
     }
 
@@ -248,6 +326,93 @@ mod tests {
             sum_after < sum_before,
             "Positive edge should gently push betas down: before={sum_before:.3}, after={sum_after:.3}"
         );
+    }
+
+    #[test]
+    fn test_gamma_calibrator_from_registry() {
+        let registry = crate::market_maker::calibration::create_default_registry();
+        let cal = OnlineBayesianGammaCalibrator::new_from_registry(&registry);
+        assert_eq!(cal.beta.len(), NUM_BETAS);
+        assert!(!cal.is_warmed_up());
+
+        // Betas should match registry values (which match CalibratedRiskModel defaults)
+        assert!(
+            (cal.beta[0] - 1.0).abs() < 1e-6,
+            "beta_volatility from registry: {}",
+            cal.beta[0]
+        );
+        assert!(
+            (cal.beta[2] - 4.0).abs() < 1e-6,
+            "beta_inventory from registry: {}",
+            cal.beta[2]
+        );
+    }
+
+    #[test]
+    fn test_gamma_calibrator_observe_to_registry() {
+        let mut registry = crate::market_maker::calibration::create_default_registry();
+        let mut cal = OnlineBayesianGammaCalibrator::default();
+
+        // Update with some data
+        let features = vec![0.05; NUM_BETAS];
+        for _ in 0..20 {
+            cal.update(&features, 0.15, 2.0);
+        }
+
+        cal.observe_to_registry(&mut registry);
+
+        // Registry should have updated values close to the learned betas
+        let vol_val = registry.get_value("beta_volatility").unwrap();
+        assert!(
+            (vol_val - cal.beta[0]).abs() < 1.0,
+            "Registry should track learned beta: reg={vol_val}, learned={}",
+            cal.beta[0]
+        );
+    }
+
+    #[test]
+    fn test_gamma_calibrator_clamp_bounds() {
+        let registry = crate::market_maker::calibration::create_default_registry();
+        let mut cal = OnlineBayesianGammaCalibrator::default();
+
+        // Force extreme betas
+        cal.beta[0] = 100.0; // beta_volatility, hard bound (-1.0, 4.0)
+        cal.beta[6] = -50.0; // beta_confidence, hard bound (-1.5, 0.5)
+
+        cal.clamp_to_registry_bounds(&registry);
+
+        assert!(
+            cal.beta[0] <= 4.0,
+            "beta_volatility clamped: {}",
+            cal.beta[0]
+        );
+        assert!(
+            cal.beta[6] >= -1.5,
+            "beta_confidence clamped: {}",
+            cal.beta[6]
+        );
+    }
+
+    #[test]
+    fn test_gamma_calibrator_soft_clamp_prevents_divergence() {
+        let mut cal = OnlineBayesianGammaCalibrator::default();
+
+        // Feed extreme data that would cause wild beta drift
+        let extreme_features = vec![10.0; NUM_BETAS]; // Very large features
+        for _ in 0..100 {
+            cal.update(&extreme_features, 0.01, -100.0); // Extreme negative edge
+        }
+
+        // Betas should be bounded by the soft clamp (3× prior distance)
+        for (i, &beta) in cal.beta.iter().enumerate() {
+            let max_drift = (cal.beta_prior[i].abs() + 1.0) * 3.0;
+            assert!(
+                beta >= cal.beta_prior[i] - max_drift - 1e-10
+                    && beta <= cal.beta_prior[i] + max_drift + 1e-10,
+                "Beta[{i}] = {beta} exceeded soft clamp around prior {}",
+                cal.beta_prior[i]
+            );
+        }
     }
 
     #[test]

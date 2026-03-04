@@ -220,6 +220,10 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// `None` until the data quality gate first passes. Using session_start_time
     /// includes WS connection time (~40s for HYPE), defeating the 30s warmup timeout.
     first_data_time: Option<std::time::Instant>,
+    /// Whether startup timing has been configured from capital tier policy (WS2).
+    startup_timing_configured: bool,
+    /// Whether the transition to Quoting phase has been logged (WS2).
+    startup_quoting_logged: bool,
 
     // === L2 Book & Trade Cache (for EnhancedFlowContext) ===
     /// Cached L2 bid sizes (top 5 levels) for EnhancedFlowContext depth imbalance.
@@ -640,6 +644,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             learning: learning::LearningModule::default(),
             session_start_time: std::time::Instant::now(),
             first_data_time: None,
+            startup_timing_configured: false,
+            startup_quoting_logged: false,
             // L2 book & trade cache for EnhancedFlowContext
             cached_bid_sizes: Vec::with_capacity(5),
             cached_ask_sizes: Vec::with_capacity(5),
@@ -1223,6 +1229,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     kappa_smoothed,
                 }
             },
+            as_fills_measured: self.tier1.adverse_selection.fills_measured(),
+            parameter_registry: Default::default(),
         }
     }
 
@@ -1262,6 +1270,45 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         );
         // Restore online Bayesian gamma calibrator
         self.stochastic.gamma_calibrator = bundle.gamma_calibrator.clone();
+        // Restore AS fills_measured with time-decay (half-life ~33h, 48h e-fold)
+        // Prevents warmup amnesia: sessions start near full warmup instead of 0.
+        // Fallback: if as_fills_measured not yet in checkpoint, use kappa orchestrator's
+        // total_own_fills (which IS checkpointed) as a conservative seed.
+        let raw_fills = if bundle.as_fills_measured > 0 {
+            bundle.as_fills_measured
+        } else if bundle.kappa_orchestrator.total_own_fills > 0 {
+            // Kappa orchestrator tracks total fills across sessions — use as seed
+            bundle.kappa_orchestrator.total_own_fills as usize
+        } else {
+            0
+        };
+        if raw_fills > 0 {
+            let age_hours = if bundle.metadata.timestamp_ms > 0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let age_ms = now_ms.saturating_sub(bundle.metadata.timestamp_ms);
+                age_ms as f64 / 3_600_000.0
+            } else {
+                0.0
+            };
+            let decay = (-age_hours / 48.0).exp();
+            let decayed_fills = (raw_fills as f64 * decay) as usize;
+            if decayed_fills > 0 {
+                self.tier1
+                    .adverse_selection
+                    .set_fills_measured(decayed_fills);
+                tracing::info!(
+                    raw_fills,
+                    source = if bundle.as_fills_measured > 0 { "checkpoint" } else { "kappa_fallback" },
+                    age_hours = %format!("{:.1}", age_hours),
+                    decay = %format!("{:.3}", decay),
+                    restored = decayed_fills,
+                    "Restored AS fills_measured from checkpoint"
+                );
+            }
+        }
         // Restore directional Kalman drift from checkpoint
         self.central_beliefs.restore_directional_state(
             bundle.directional_belief.dir_mu,

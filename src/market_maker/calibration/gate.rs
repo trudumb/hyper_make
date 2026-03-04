@@ -511,6 +511,8 @@ mod tests {
                 crate::market_maker::checkpoint::types::ParticleFilterCheckpoint::default(),
             directional_belief:
                 crate::market_maker::checkpoint::types::DirectionalBeliefCheckpoint::default(),
+            as_fills_measured: 0,
+            parameter_registry: Default::default(),
         }
     }
 

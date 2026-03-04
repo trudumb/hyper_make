@@ -22,6 +22,7 @@ mod brier_score;
 mod coefficient_estimator;
 mod conditional_metrics;
 pub mod derived_constants;
+pub mod empirical_bayes;
 pub mod gate;
 pub mod historical_calibrator;
 mod information_ratio;
@@ -44,6 +45,7 @@ pub use derived_constants::{
     derive_quote_latch_threshold, derive_reduce_only_threshold, derive_spread_floor,
     derive_toxic_hour_multiplier,
 };
+pub use empirical_bayes::{create_default_registry, EBParam, ParamSummary, ParameterRegistry};
 pub use gate::{CalibrationGate, CalibrationGateConfig, PriorStatus};
 pub use historical_calibrator::{
     CalibrationSummary, FillRecord, HistoricalCalibrator, MarketSnapshot, PowerAnalysis,
