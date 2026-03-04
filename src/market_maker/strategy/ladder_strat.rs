@@ -440,6 +440,51 @@ impl LadderStrategy {
         (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
     }
 
+    /// Adaptive holding time that accounts for measured fill intervals,
+    /// inventory urgency, and volatility regime.
+    ///
+    /// Improvements over simple 1/λ:
+    /// 1. Uses measured tau_inventory EWMA when available (more accurate than theoretical)
+    /// 2. Shortens tau when inventory is high (urgency to unwind)
+    /// 3. Shortens tau in high-vol regimes (risk grows as σ²×T)
+    ///
+    /// Formula: tau = blend(measured, theoretical) / (1 + |q|/Q_max) / sqrt(σ/σ_baseline)
+    /// Clamped to [30s, max_holding_time]
+    fn adaptive_holding_time(
+        &self,
+        market_params: &MarketParams,
+        inventory_ratio: f64,
+        measured_weight: f64,
+    ) -> f64 {
+        let theoretical_tau = self.holding_time(market_params.arrival_intensity);
+
+        // Base: blend measured EWMA with theoretical
+        let base_tau = if market_params.tau_inventory_s > 1.0 {
+            // Measured tau available — blend with theoretical
+            // Prevents full dependence on potentially stale EWMA
+            let w = measured_weight.clamp(0.0, 1.0);
+            w * market_params.tau_inventory_s + (1.0 - w) * theoretical_tau
+        } else {
+            // No fill data yet — use theoretical
+            theoretical_tau
+        };
+
+        // Inventory urgency: higher inventory → shorter tau → more aggressive unwind
+        // At 0% utilization: factor = 1.0 (no urgency)
+        // At 50% utilization: factor = 0.67
+        // At 100% utilization: factor = 0.5 (halve the horizon)
+        let abs_ratio = inventory_ratio.abs().clamp(0.0, 1.0);
+        let inventory_factor = 1.0 / (1.0 + abs_ratio);
+
+        // Volatility adjustment: higher vol → shorter tau
+        // Risk grows as σ²×T, so halving tau at 4× vol keeps σ²×T constant
+        let vol_ratio = (market_params.sigma / self.risk_config.sigma_baseline).clamp(0.25, 4.0);
+        let vol_factor = 1.0 / vol_ratio.sqrt();
+
+        let tau = base_tau * inventory_factor * vol_factor;
+        tau.clamp(30.0, self.risk_config.max_holding_time.min(3600.0))
+    }
+
     /// Build a MarketRegime from MarketParams for entropy-based allocation.
     ///
     /// The MarketRegime provides market state signals that the entropy optimizer
@@ -602,9 +647,9 @@ impl LadderStrategy {
         let glft_half_frac = self.depth_generator.glft_optimal_spread(gamma, kappa);
         let glft_half_bps = glft_half_frac * 10_000.0;
 
-        // Risk premium from regime and position zone
-        let risk_premium_bps =
-            market_params.regime_risk_premium_bps + market_params.total_risk_premium_bps;
+        // Risk premium: total_risk_premium_bps already includes regime_risk_premium_bps
+        // (seeded in quote_engine.rs Phase 5). Do NOT add regime_risk_premium_bps again.
+        let risk_premium_bps = market_params.total_risk_premium_bps;
 
         let quota_addon_bps = market_params.quota_shadow_spread_bps.min(50.0);
 
@@ -679,7 +724,7 @@ impl LadderStrategy {
 
         // Conviction gamma escalation: wider spreads when directional conviction is moderate+.
         // Applied multiplicatively to base gamma (conviction_gamma_mult ∈ [1.0, 1.5]).
-        let mut gamma = base_gamma * market_params.conviction_gamma_mult;
+        let gamma = base_gamma * market_params.conviction_gamma_mult;
 
         // NOTE: regime_gamma_multiplier is already applied inside effective_gamma()
         // (L456) and participates in the gamma_max clamp. Do NOT re-apply here.
@@ -789,13 +834,16 @@ impl LadderStrategy {
             );
         }
 
-        let time_horizon = self.holding_time(market_params.arrival_intensity);
-
+        // Pre-compute inventory_ratio for adaptive tau (needed before time_horizon)
         let inventory_ratio = if effective_max_position > EPSILON {
             (position / effective_max_position).clamp(-1.0, 1.0)
         } else {
             0.0
         };
+
+        // Adaptive holding time: uses measured fill intervals, inventory urgency, vol regime
+        // Measured weight 0.7 = 70% measured EWMA + 30% theoretical 1/λ
+        let time_horizon = self.adaptive_holding_time(market_params, inventory_ratio, 0.7);
 
         // === CONTINUOUS γ(q) REPLACED DISCRETE ZONES ===
         // Smooth γ(q) = γ_base × (1 + β × utilization²) in glft.rs handles graduated
@@ -818,35 +866,31 @@ impl LadderStrategy {
         // Convert AS spread adjustment to bps for ladder generation
         let as_at_touch_bps = market_params.as_spread_adjustment * 10000.0;
 
-        // === REALIZED AS → GAMMA FLOOR ===
-        // If realized AS exceeds our half-spread, gamma must increase to widen spreads.
-        // This ensures the spread covers AS costs, not just the E[PnL] filter.
+        // === REALIZED AS → KAPPA REDUCTION (replaces gamma death spiral) ===
+        // The old approach widened gamma to cover AS, creating a death spiral:
+        //   wider spreads → fewer fills → only toxic fills → more AS → wider...
+        // The correct response: reduce kappa (effective order arrival rate) by the
+        // informed fraction α = AS / (AS + spread). This is Glosten-Milgrom:
+        //   κ_effective = κ × (1 - α)
+        // The spread stays competitive while fill intensity correctly reflects
+        // that some fraction of flow is informed. The E[PnL] filter then drops
+        // levels where informed flow dominates — no gamma override needed.
         if as_at_touch_bps > 0.0 {
-            let glft_half_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
             let fee_bps = self.risk_config.maker_fee_rate * 10_000.0;
-            let net_capture_bps = glft_half_bps - fee_bps;
-
-            // If AS > 1.2× net capture, we're losing on every fill. Increase gamma until
-            // GLFT spread covers AS + fee + 1 bps margin.
-            if as_at_touch_bps > net_capture_bps * 1.2 {
-                let target_half_spread_frac = (as_at_touch_bps + fee_bps + 1.0) / 10_000.0;
-                let gamma_floor = super::glft::solve_min_gamma(
-                    target_half_spread_frac,
-                    kappa,
-                    market_params.sigma,
-                    time_horizon,
-                    self.risk_config.maker_fee_rate,
+            let glft_half_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
+            // α = P(informed) ∈ [0, 0.5]: fraction of flow that is informed
+            // Capped at 0.5 to prevent kappa collapsing to zero
+            let alpha = (as_at_touch_bps / (as_at_touch_bps + glft_half_bps + fee_bps)).min(0.5);
+            let kappa_before = kappa;
+            kappa *= 1.0 - alpha;
+            if alpha > 0.05 {
+                info!(
+                    alpha = %format!("{:.3}", alpha),
+                    kappa_before = %format!("{:.0}", kappa_before),
+                    kappa_after = %format!("{:.0}", kappa),
+                    as_bps = %format!("{:.1}", as_at_touch_bps),
+                    "AS feedback: reducing kappa for informed flow defense"
                 );
-                if gamma_floor > gamma {
-                    info!(
-                        as_bps = %format!("{:.1}", as_at_touch_bps),
-                        capture_bps = %format!("{:.1}", net_capture_bps),
-                        gamma_before = %format!("{:.3}", gamma),
-                        gamma_floor = %format!("{:.3}", gamma_floor),
-                        "AS defense: raising gamma floor to cover realized AS"
-                    );
-                    gamma = gamma_floor;
-                }
             }
         }
 
@@ -890,8 +934,24 @@ impl LadderStrategy {
             0.5, // min_mult at p=1 (HOLD: strong alignment)
         );
         // Penalty = q * gamma * cont_mult * sigma^2 * T in bps
-        let inv_penalty_bps =
+        let tactical_penalty_bps =
             q * gamma * cont_gamma_mult * market_params.sigma.powi(2) * time_horizon * 10_000.0;
+
+        // 2b. Strategic penalty: long-horizon regime-dependent inventory risk
+        // In adverse regimes (cascade, bursty), inventory cost extends beyond tactical tau
+        // because unwinding is harder and adverse moves are persistent.
+        // Uses MultiHorizonValue from HJB solver for regime-weighted tau extension.
+        let strategic_penalty_bps = {
+            use crate::market_maker::stochastic::hjb_solver::MultiHorizonValue;
+            let mhv = MultiHorizonValue::default();
+            let strategic_tau_ext =
+                mhv.strategic_tau_extension(market_params.regime_probs, inventory_ratio);
+            // Strategic penalty uses same formula but with extended tau
+            // Only applies the extension portion (tactical already included above)
+            q * gamma * market_params.sigma.powi(2) * strategic_tau_ext * 10_000.0
+        };
+
+        let inv_penalty_bps = tactical_penalty_bps + strategic_penalty_bps;
 
         // 3. Funding Carry (annualized rate converted to per-second, multiply by T)
         // 365.25 * 24 * 60 * 60 = 31,557,600
@@ -921,9 +981,12 @@ impl LadderStrategy {
                 signal_drift_bps = %format!("{:.2}", market_params.drift_signal_bps),
                 belief_confidence = %format!("{:.3}", market_params.belief_confidence),
                 drift_bps = %format!("{:.2}", drift_shift_bps),
+                tactical_penalty_bps = %format!("{:.2}", tactical_penalty_bps),
+                strategic_penalty_bps = %format!("{:.2}", strategic_penalty_bps),
                 inv_penalty_bps = %format!("{:.2}", inv_penalty_bps),
                 funding_carry_bps = %format!("{:.2}", funding_carry_bps),
                 total_shift_bps = %format!("{:.2}", total_shift_bps),
+                adaptive_tau_s = %format!("{:.1}", time_horizon),
                 reservation_mid = %format!("{:.4}", reservation_mid),
                 effective_mid = %format!("{:.4}", effective_mid),
                 "Unified continuous reservation mid computed"
@@ -1265,6 +1328,14 @@ impl LadderStrategy {
             let pre_ask_count = dynamic_depths.ask.len();
 
             use super::glft::EPnLParams;
+            // Phase 4.2: Regime-adjusted inventory beta
+            // In adverse regimes (cascade), gamma is more sensitive to inventory
+            // (V''(q) is steeper → higher effective beta)
+            let effective_beta = {
+                use crate::market_maker::stochastic::hjb_solver::MultiHorizonValue;
+                let mhv = MultiHorizonValue::default();
+                mhv.regime_adjusted_beta(self.risk_model.beta_inventory, market_params.regime_probs)
+            };
             let mut bid_params = EPnLParams {
                 depth_bps: 0.0,
                 is_bid: true,
@@ -1282,7 +1353,7 @@ impl LadderStrategy {
                 circuit_breaker_active: market_params.should_pull_quotes,
                 drawdown_frac: 0.0,   // handled by capital coordinator
                 self_impact_bps: 0.0, // self impact handled by actuary later
-                inventory_beta: self.risk_model.beta_inventory,
+                inventory_beta: effective_beta,
                 continuation_gamma_mult: cont_gamma_mult,
                 kappa_variance: market_params.kappa_variance,
             };
@@ -1308,15 +1379,22 @@ impl LadderStrategy {
                 gamma_baseline,
             );
 
+            // Queue position has option value — accept slightly negative E[PnL] fills
+            // rather than dropping levels and losing queue priority. The threshold is
+            // -fee_bps: we'll accept fills that lose up to the fee (we'd pay the fee
+            // anyway on a taker order to flatten). This dramatically increases fill rate
+            // while still protecting against truly toxic levels.
+            let queue_value_threshold = -fee_bps * 0.5; // Accept up to half-fee negative EV
+
             let bid_threshold = if bid_is_reducing {
                 reducing_thresh
             } else {
-                0.0
+                queue_value_threshold
             };
             let ask_threshold = if ask_is_reducing {
                 reducing_thresh
             } else {
-                0.0
+                queue_value_threshold
             };
 
             // (closest levels tracking removed)
@@ -2100,6 +2178,34 @@ impl LadderStrategy {
                     }
                 }
 
+                // 8c. SELF-IMPACT CAP: Prevent dominating any price level.
+                // Convert near-touch depth from USD to contracts for comparison.
+                let level_depth_contracts =
+                    market_params.near_touch_depth_usd / market_params.microprice.max(1e-8);
+                let self_impact_ratio = self.ladder_config.self_impact_max_ratio;
+                if level_depth_contracts > 0.0 && self_impact_ratio > 0.0 {
+                    let mut any_impact_capped = false;
+                    for level in ladder.bids.iter_mut().chain(ladder.asks.iter_mut()) {
+                        let capped = cap_size_for_self_impact(
+                            level.size,
+                            level_depth_contracts,
+                            self_impact_ratio,
+                        );
+                        if capped < level.size {
+                            any_impact_capped = true;
+                            level.size = capped;
+                        }
+                    }
+                    if any_impact_capped {
+                        info!(
+                            level_depth_usd = %format!("{:.0}", market_params.near_touch_depth_usd),
+                            level_depth_contracts = %format!("{:.4}", level_depth_contracts),
+                            max_ratio = %format!("{:.2}", self_impact_ratio),
+                            "Self-impact cap applied: order sizes capped to avoid book dominance"
+                        );
+                    }
+                }
+
                 // WS6: Diagnostic logging with size distribution
                 let bid_sizes_str: String = ladder
                     .bids
@@ -2418,6 +2524,33 @@ impl LadderStrategy {
                         "Per-level size cap applied: no single order exceeds {}% of risk max position",
                         (MAX_SINGLE_ORDER_FRACTION * 100.0) as u32,
                     );
+                }
+
+                // 8c. SELF-IMPACT CAP: Prevent dominating any price level (legacy path).
+                let level_depth_contracts =
+                    market_params.near_touch_depth_usd / market_params.microprice.max(1e-8);
+                let self_impact_ratio = self.ladder_config.self_impact_max_ratio;
+                if level_depth_contracts > 0.0 && self_impact_ratio > 0.0 {
+                    let mut any_impact_capped = false;
+                    for level in ladder.bids.iter_mut().chain(ladder.asks.iter_mut()) {
+                        let capped = cap_size_for_self_impact(
+                            level.size,
+                            level_depth_contracts,
+                            self_impact_ratio,
+                        );
+                        if capped < level.size {
+                            any_impact_capped = true;
+                            level.size = capped;
+                        }
+                    }
+                    if any_impact_capped {
+                        info!(
+                            level_depth_usd = %format!("{:.0}", market_params.near_touch_depth_usd),
+                            level_depth_contracts = %format!("{:.4}", level_depth_contracts),
+                            max_ratio = %format!("{:.2}", self_impact_ratio),
+                            "Self-impact cap applied (legacy): order sizes capped to avoid book dominance"
+                        );
+                    }
                 }
 
                 // 9. Filter out levels below minimum notional (exchange will reject them anyway)
@@ -3016,6 +3149,15 @@ fn adverse_selection_at_depth(depth_bps: f64, params: &LadderParams) -> f64 {
         // Legacy fallback: exponential decay with 10bp characteristic depth
         params.as_at_touch_bps * (-depth_bps / 10.0).exp()
     }
+}
+
+/// Cap order size to avoid being dominant on any price level.
+/// On thin HIP-3 books, large quotes increase adverse selection.
+fn cap_size_for_self_impact(order_size: f64, level_depth: f64, max_ratio: f64) -> f64 {
+    if level_depth <= 0.0 || max_ratio <= 0.0 {
+        return order_size;
+    }
+    order_size.min(max_ratio * level_depth)
 }
 
 #[cfg(test)]
@@ -4444,11 +4586,12 @@ mod tests {
             market_mid: 100.0,
             margin_available: 1000.0,
             leverage: 1.0,
-            sigma: 0.005,
+            sigma: 0.0005, // Moderate vol (5 bps/√s) — keeps adaptive tau reasonable
             kappa: 200.0,
             arrival_intensity: 0.5,
             cached_best_bid: 99.90,
             cached_best_ask: 100.10,
+            tau_inventory_s: 0.0, // Disable measured EWMA — use theoretical 1/λ for stable test
             ..Default::default()
         };
         params.capital_policy.use_tick_grid = false;
@@ -4470,8 +4613,10 @@ mod tests {
         };
 
         // Use small drifts to avoid clamp interactions.
-        // posterior = signum(0.001) * 0.005 * 10000 * 0.05 = 2.5 bps
-        // signal = 2.0 bps, combined = 4.5 bps (GLFT δ* ≈ 50 bps, plenty of room)
+        // Adaptive tau with sigma=0.0005: vol_ratio=2.5, vol_factor=0.63
+        // theoretical_tau=2s, adaptive_tau=max(30, 2 * 1.0 * 0.63)=30s (floor)
+        // posterior = 0.0001 * 30 * 10000 * 0.1 = 3.0 bps
+        // signal = 2.0 bps, combined = 5.0 bps (GLFT δ* ≈ 50 bps, plenty of room)
 
         // Baseline
         params.belief_predictive_bias = 0.0;
@@ -4480,9 +4625,9 @@ mod tests {
         let ladder_base = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         let asym_base = touch_asymmetry(&ladder_base);
 
-        // Posterior only (2.5 bps shift)
-        params.belief_predictive_bias = 0.001;
-        params.belief_confidence = 0.05;
+        // Posterior only (3.0 bps shift)
+        params.belief_predictive_bias = 0.0001;
+        params.belief_confidence = 0.1;
         params.drift_signal_bps = 0.0;
         let ladder_post = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         let asym_post = touch_asymmetry(&ladder_post);
@@ -4494,9 +4639,9 @@ mod tests {
         let ladder_sig = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         let asym_sig = touch_asymmetry(&ladder_sig);
 
-        // Both (4.5 bps shift)
-        params.belief_predictive_bias = 0.001;
-        params.belief_confidence = 0.05;
+        // Both (5.0 bps shift)
+        params.belief_predictive_bias = 0.0001;
+        params.belief_confidence = 0.1;
         params.drift_signal_bps = 2.0;
         let ladder_both = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         let asym_both = touch_asymmetry(&ladder_both);

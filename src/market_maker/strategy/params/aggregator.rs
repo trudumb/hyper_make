@@ -305,6 +305,12 @@ impl ParameterAggregator {
             // AS estimator needs fills, but fills need quotes, and quotes need AS warmup.
             as_warmed_up: sources.adverse_selection.is_warmed_up()
                 || sources.calibration_progress >= 0.25,
+            // Wire realized P(informed|fill) into gamma via RiskFeatures.
+            // Returns 0.0 if no fills classified yet (neutral — no gamma inflation).
+            as_informed_ratio: sources
+                .adverse_selection
+                .empirical_alpha_touch()
+                .unwrap_or(0.0),
             depth_decay_as: Some(sources.depth_decay_as.clone()),
             // Conditional AS posterior mean from Bayesian fill AS tracker.
             // E[AS | fill] from Normal posterior updated on each fill.

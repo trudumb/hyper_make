@@ -6,7 +6,7 @@
 # with identical configurations to isolate where PnL divergence originates.
 #
 # Examples:
-#   ./scripts/validate_side_by_side.sh HYPE hyna 1800          # 30 min, hip3 profile
+#   ./scripts/validate_side_by_side.sh HYPE hyna 3600          # 1 hour, hip3 profile
 #   ./scripts/validate_side_by_side.sh HYPE hyna 3600 hip3     # 1 hour explicit profile
 #   ./scripts/validate_side_by_side.sh ETH hyna 1800 default   # ETH with default profile
 #

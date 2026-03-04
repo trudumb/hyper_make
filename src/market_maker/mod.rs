@@ -341,6 +341,10 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// for lead-lag skew and cross-venue flow analysis.
     binance_receiver: Option<tokio::sync::mpsc::Receiver<infra::BinanceUpdate>>,
 
+    /// HL perp receiver for HIP-3 cross-venue lead-lag signal.
+    /// When enabled (for HIP-3 assets), feeds perp BBO/trades to signal integrator.
+    hl_perp_receiver: Option<tokio::sync::mpsc::Receiver<infra::HlPerpUpdate>>,
+
     // === Checkpoint Persistence ===
     /// Checkpoint manager for saving/loading learned state across sessions.
     /// Enabled via `with_checkpoint_dir()`. Saves every 5 minutes + on shutdown.
@@ -411,6 +415,8 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     pub cross_asset_signals: learning::cross_asset::CrossAssetSignals,
     /// Last Binance mid price for computing BTC returns.
     last_binance_mid: f64,
+    /// Last HL perp mid price for HIP-3 perp-spot basis signal.
+    last_hl_perp_mid: f64,
     /// Last reference perp mid price for HIP-3 cross-venue drift.
     /// When trading hyna:HYPE, this tracks the HYPE perp mid from AllMids.
     reference_perp_mid: f64,
@@ -684,6 +690,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             cached_market_params: None,
             // Cross-exchange lead-lag (disabled by default, enabled via with_binance_receiver)
             binance_receiver: None,
+            // HL perp lead-lag (disabled by default, enabled via with_hl_perp_receiver)
+            hl_perp_receiver: None,
             // Checkpoint persistence (disabled by default, enabled via with_checkpoint_dir)
             checkpoint_manager: None,
             last_checkpoint_save: std::time::Instant::now(),
@@ -718,6 +726,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             reconcile_outcome_tracker: tracking::ReconcileOutcomeTracker::new(),
             cross_asset_signals,
             last_binance_mid: 0.0,
+            last_hl_perp_mid: 0.0,
             reference_perp_mid: 0.0,
             prev_reference_perp_mid: 0.0,
             reference_perp_drift_ema: 0.0,
@@ -789,6 +798,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self
     }
 
+    /// Enable HL perp lead-lag feed for HIP-3 cross-venue signal.
+    ///
+    /// For HIP-3 assets (e.g., HYPE on hyna), the HL perp market leads the spot book.
+    /// Perp BBO/trades feed into the signal integrator for drift adjustment.
+    pub fn with_hl_perp_receiver(
+        mut self,
+        receiver: tokio::sync::mpsc::Receiver<infra::HlPerpUpdate>,
+    ) -> Self {
+        self.hl_perp_receiver = Some(receiver);
+        info!("HL perp lead-lag feed enabled");
+        self
+    }
+
     /// Enable checkpoint persistence for warm-starting across sessions.
     ///
     /// When enabled:
@@ -808,11 +830,30 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             &bundle.metadata.asset,
                             &self.config.asset,
                         ) {
-                            self.restore_from_bundle(&bundle);
+                            // Compute checkpoint age and apply time-based decay
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let age_s =
+                                now_ms.saturating_sub(bundle.metadata.timestamp_ms) as f64 / 1000.0;
+                            let age_hours = age_s / 3600.0;
+                            let mut decayed_bundle = bundle.clone();
+                            if age_hours > 0.5 {
+                                // Only decay if checkpoint is > 30 min old
+                                decayed_bundle.apply_time_decay(age_hours);
+                                info!(
+                                    age_hours = %format!("{:.1}", age_hours),
+                                    decay = %format!("{:.3}", (-age_hours / 12.0_f64).exp()),
+                                    "Applied time decay to checkpoint"
+                                );
+                            }
+                            self.restore_from_bundle(&decayed_bundle);
                             info!(
                                 asset = %bundle.metadata.asset,
-                                samples = bundle.pre_fill.learning_samples,
+                                samples = decayed_bundle.pre_fill.learning_samples,
                                 session_duration_s = bundle.metadata.session_duration_s,
+                                age_hours = %format!("{:.1}", age_hours),
                                 "Restored from checkpoint"
                             );
                         } else {
@@ -1167,6 +1208,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
             gamma_calibrator: self.stochastic.gamma_calibrator.clone(),
+            particle_filter: checkpoint::ParticleFilterCheckpoint::default(), // TODO: wire when particle filter is integrated
+            directional_belief: {
+                let (dir_mu, dir_sigma_sq, n_price, n_fill, n_as, n_flow, n_burst, kappa_smoothed) =
+                    self.central_beliefs.directional_state_for_checkpoint();
+                checkpoint::DirectionalBeliefCheckpoint {
+                    dir_mu,
+                    dir_sigma_sq,
+                    n_price,
+                    n_fill,
+                    n_as,
+                    n_flow,
+                    n_burst,
+                    kappa_smoothed,
+                }
+            },
         }
     }
 
@@ -1206,6 +1262,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         );
         // Restore online Bayesian gamma calibrator
         self.stochastic.gamma_calibrator = bundle.gamma_calibrator.clone();
+        // Restore directional Kalman drift from checkpoint
+        self.central_beliefs.restore_directional_state(
+            bundle.directional_belief.dir_mu,
+            bundle.directional_belief.dir_sigma_sq,
+            bundle.directional_belief.kappa_smoothed,
+        );
     }
 
     // =========================================================================

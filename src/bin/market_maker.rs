@@ -1185,6 +1185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create runtime config from asset metadata (HIP-3 detection happens here, ONCE at startup)
     let mut runtime_config = AssetRuntimeConfig::from_asset_meta(asset_meta);
+    let is_hip3 = runtime_config.is_hip3; // Save before runtime_config is moved into mm_config
 
     // Handle --force-isolated flag: override is_cross to false
     if cli.force_isolated && runtime_config.is_cross {
@@ -2042,6 +2043,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         position_stuck_threshold_fraction: 0.10,
         unrealized_as_warn_fraction: 0.01,
         unrealized_as_kill_fraction: 0.05,
+        auto_recovery_cooldown_secs: 30,
     };
     info!(
         max_daily_loss = %kill_switch_config.max_daily_loss,
@@ -2180,6 +2182,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             market_maker.set_changepoint_regime_thin_dex();
             tracing::info!("Changepoint detector set to ThinDex regime (Binance disabled)");
         }
+    }
+
+    // === HL Perp Feed: Asset perp lead-lag + BTC systematic risk ===
+    // For HIP-3 assets, the perp leads the spot book — subscribe for basis signal.
+    // BTC feed always enabled for systematic risk factor (beta).
+    {
+        use hyperliquid_rust_sdk::market_maker::{
+            resolve_hl_perp_coin, should_use_hl_perp_lead, HlPerpFeed, HlPerpFeedConfig,
+        };
+
+        let is_testnet = matches!(base_url, BaseUrl::Testnet);
+        let (hl_perp_tx, hl_perp_rx) = tokio::sync::mpsc::channel(2000);
+
+        // Spawn asset perp feed if HIP-3 asset has a liquid perp market
+        if should_use_hl_perp_lead(&asset, is_hip3) {
+            let perp_coin = resolve_hl_perp_coin(&asset);
+            let config = if is_testnet {
+                HlPerpFeedConfig::testnet(&perp_coin)
+            } else {
+                HlPerpFeedConfig::for_asset(&perp_coin)
+            };
+            let asset_feed = HlPerpFeed::new(config, hl_perp_tx.clone());
+            tokio::spawn(async move {
+                asset_feed.run().await;
+                tracing::warn!("HL perp feed (asset) task terminated");
+            });
+            tracing::info!(
+                asset = %asset,
+                perp_coin = %perp_coin,
+                "HL perp lead-lag feed active for HIP-3 asset"
+            );
+        }
+
+        // Always spawn BTC feed for systematic risk factor (beta)
+        let btc_config = if is_testnet {
+            HlPerpFeedConfig::testnet("BTC")
+        } else {
+            HlPerpFeedConfig::for_asset("BTC")
+        };
+        let btc_feed = HlPerpFeed::new(btc_config, hl_perp_tx);
+        tokio::spawn(async move {
+            btc_feed.run().await;
+            tracing::warn!("HL perp feed (BTC) task terminated");
+        });
+        tracing::info!("BTC systematic risk feed active");
+
+        market_maker = market_maker.with_hl_perp_receiver(hl_perp_rx);
     }
 
     // === Prior Injection: Discover and inject paper prior (φ→ψ) ===
@@ -2907,6 +2956,51 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
 
     // Disable Binance signals for paper (no cross-venue feed)
     market_maker.disable_binance_signals();
+
+    // Wire HL perp feed for paper mode (same as live — BTC beta + asset perp)
+    {
+        use hyperliquid_rust_sdk::market_maker::{
+            resolve_hl_perp_coin, should_use_hl_perp_lead, HlPerpFeed, HlPerpFeedConfig,
+        };
+
+        let is_testnet = matches!(base_url, BaseUrl::Testnet);
+        let (hl_perp_tx, hl_perp_rx) = tokio::sync::mpsc::channel(2000);
+
+        // mm_config consumed runtime_config; check asset name for HIP-3 detection
+        let is_dex_asset = asset.contains(':');
+        if is_dex_asset && should_use_hl_perp_lead(&asset, true) {
+            let perp_coin = resolve_hl_perp_coin(&asset);
+            let config = if is_testnet {
+                HlPerpFeedConfig::testnet(&perp_coin)
+            } else {
+                HlPerpFeedConfig::for_asset(&perp_coin)
+            };
+            let asset_feed = HlPerpFeed::new(config, hl_perp_tx.clone());
+            tokio::spawn(async move {
+                asset_feed.run().await;
+                tracing::warn!("Paper: HL perp feed (asset) task terminated");
+            });
+            tracing::info!(
+                asset = %asset,
+                perp_coin = %perp_coin,
+                "Paper: HL perp lead-lag feed active"
+            );
+        }
+
+        let btc_config = if is_testnet {
+            HlPerpFeedConfig::testnet("BTC")
+        } else {
+            HlPerpFeedConfig::for_asset("BTC")
+        };
+        let btc_feed = HlPerpFeed::new(btc_config, hl_perp_tx);
+        tokio::spawn(async move {
+            btc_feed.run().await;
+            tracing::warn!("Paper: HL perp feed (BTC) task terminated");
+        });
+        tracing::info!("Paper: BTC systematic risk feed active");
+
+        market_maker = market_maker.with_hl_perp_receiver(hl_perp_rx);
+    }
 
     // Set ThinDex regime for DEX assets in paper mode (same as live path)
     if asset.contains(':') {

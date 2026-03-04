@@ -107,6 +107,11 @@ pub struct KillSwitchConfig {
     /// Unrealized AS cost (fraction of max_position_notional) that triggers kill.
     /// Default: 0.05 (5% → ~$10 for $200 max).
     pub unrealized_as_kill_fraction: f64,
+
+    /// Cooldown seconds before auto-recovering from transient triggers.
+    /// Set to 0 to disable auto-recovery. Only triggers classified as transient
+    /// (stale data, rate limits, cascades) are eligible — NEVER financial triggers.
+    pub auto_recovery_cooldown_secs: u64,
 }
 
 impl Default for KillSwitchConfig {
@@ -136,6 +141,7 @@ impl Default for KillSwitchConfig {
             position_stuck_threshold_fraction: 0.10,
             unrealized_as_warn_fraction: 0.01,
             unrealized_as_kill_fraction: 0.05,
+            auto_recovery_cooldown_secs: 30,
         }
     }
 }
@@ -183,6 +189,7 @@ impl KillSwitchConfig {
             position_stuck_threshold_fraction: 0.10,
             unrealized_as_warn_fraction: 0.01,
             unrealized_as_kill_fraction: 0.05,
+            auto_recovery_cooldown_secs: 30,
         }
     }
 
@@ -489,6 +496,22 @@ impl std::fmt::Display for KillReason {
     }
 }
 
+impl KillReason {
+    /// Whether this kill reason is transient and eligible for auto-recovery.
+    ///
+    /// Transient reasons resolve on their own (data comes back, rate limit cools,
+    /// cascade subsides). Financial reasons (loss, drawdown, position breach)
+    /// and manual triggers NEVER auto-recover.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            KillReason::StaleData { .. }
+                | KillReason::RateLimit { .. }
+                | KillReason::CascadeDetected { .. }
+        )
+    }
+}
+
 /// Current state being monitored by the kill switch.
 #[derive(Debug, Clone)]
 pub struct KillSwitchState {
@@ -571,6 +594,8 @@ pub struct KillSwitch {
     /// Timestamp of last own fill, for liquidation self-detection.
     /// If position jumps without a recent fill, it may be a liquidation.
     last_fill_time: Mutex<Option<Instant>>,
+    /// Timestamp of last kill switch trigger, for auto-recovery cooldown.
+    last_trigger_time: Mutex<Option<Instant>>,
 }
 
 impl KillSwitch {
@@ -584,6 +609,7 @@ impl KillSwitch {
             state: Mutex::new(KillSwitchState::default()),
             atomic_max_position_value: AtomicF64::new(initial_max_position_value),
             last_fill_time: Mutex::new(None),
+            last_trigger_time: Mutex::new(None),
         }
     }
 
@@ -642,6 +668,65 @@ impl KillSwitch {
     pub fn reset(&self) {
         self.triggered.store(false, Ordering::SeqCst);
         self.trigger_reasons.lock().unwrap().clear();
+    }
+
+    /// Check whether the kill switch can auto-recover from transient triggers.
+    ///
+    /// Auto-recovery is attempted when ALL of the following hold:
+    /// 1. Kill switch is currently triggered
+    /// 2. Auto-recovery is enabled (`auto_recovery_cooldown_secs > 0`)
+    /// 3. ALL trigger reasons are transient (stale data, rate limit, cascade)
+    /// 4. The current state shows the transient condition has resolved
+    /// 5. Cooldown period has elapsed since the trigger
+    ///
+    /// NEVER auto-recovers from: MaxLoss, MaxDrawdown, Drawdown, MaxPosition,
+    /// PositionRunaway, Manual, LiquidationDetected, InventoryStuck.
+    ///
+    /// Returns `true` if auto-recovery occurred.
+    pub fn check_auto_recovery(&self, state: &KillSwitchState) -> bool {
+        if !self.is_triggered() {
+            return false;
+        }
+
+        let config = self.config.lock().unwrap();
+        if config.auto_recovery_cooldown_secs == 0 {
+            return false; // Auto-recovery disabled
+        }
+
+        // Check all reasons are transient
+        let reasons = self.trigger_reasons.lock().unwrap();
+        if reasons.is_empty() || reasons.iter().any(|r| !r.is_transient()) {
+            return false; // Has non-transient (financial/manual) reasons
+        }
+
+        // Check cooldown elapsed
+        let last_trigger = *self.last_trigger_time.lock().unwrap();
+        let cooldown = Duration::from_secs(config.auto_recovery_cooldown_secs);
+        match last_trigger {
+            Some(t) if t.elapsed() < cooldown => return false, // Cooldown not elapsed
+            None => return false,                              // No trigger timestamp
+            _ => {}
+        }
+
+        // Verify the transient conditions have actually resolved
+        let data_fresh = state.last_data_time.elapsed() < config.stale_data_threshold;
+        let rate_ok = state.rate_limit_errors <= config.max_rate_limit_errors;
+        let cascade_ok = state.cascade_severity < config.cascade_severity_threshold;
+
+        if !data_fresh || !rate_ok || !cascade_ok {
+            return false; // Conditions haven't resolved yet
+        }
+
+        // All clear — auto-recover
+        tracing::warn!(
+            reasons = ?reasons.iter().map(|r| format!("{r}")).collect::<Vec<_>>(),
+            cooldown_secs = config.auto_recovery_cooldown_secs,
+            "Kill switch AUTO-RECOVERING from transient triggers"
+        );
+        drop(reasons); // Release lock before reset
+        drop(config);
+        self.reset();
+        true
     }
 
     /// Update the state and check all kill conditions.
@@ -859,6 +944,9 @@ impl KillSwitch {
     fn trigger(&self, reason: KillReason) {
         // Set atomic flag
         self.triggered.store(true, Ordering::SeqCst);
+
+        // Record trigger timestamp for auto-recovery cooldown
+        *self.last_trigger_time.lock().unwrap() = Some(Instant::now());
 
         // Add reason to list
         let mut reasons = self.trigger_reasons.lock().unwrap();
@@ -2531,5 +2619,164 @@ mod tests {
         let checkpoint = ks.to_checkpoint();
         assert!(checkpoint.position_stuck_cycles > 0);
         assert!(checkpoint.unrealized_as_cost_usd > 0.0);
+    }
+
+    // === Auto-recovery tests ===
+
+    #[test]
+    fn test_auto_recovery_from_stale_data() {
+        let config = KillSwitchConfig {
+            stale_data_threshold: Duration::from_millis(10),
+            auto_recovery_cooldown_secs: 0, // Use 0 so we can test with instant "cooldown"
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Trigger via stale data
+        let stale_state = KillSwitchState {
+            last_data_time: Instant::now() - Duration::from_millis(100),
+            ..Default::default()
+        };
+        let reason = ks.check(&stale_state);
+        assert!(reason.is_some());
+        assert!(ks.is_triggered());
+
+        // Auto-recovery disabled (cooldown_secs = 0)
+        let fresh_state = KillSwitchState {
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        assert!(!ks.check_auto_recovery(&fresh_state));
+        assert!(ks.is_triggered()); // Still triggered
+    }
+
+    #[test]
+    fn test_auto_recovery_transient_with_cooldown() {
+        let config = KillSwitchConfig {
+            stale_data_threshold: Duration::from_millis(10),
+            auto_recovery_cooldown_secs: 1, // 1 second cooldown
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Trigger via stale data
+        let stale_state = KillSwitchState {
+            last_data_time: Instant::now() - Duration::from_millis(100),
+            ..Default::default()
+        };
+        ks.check(&stale_state);
+        assert!(ks.is_triggered());
+
+        // Fresh data but cooldown not elapsed
+        let fresh_state = KillSwitchState {
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        assert!(!ks.check_auto_recovery(&fresh_state));
+        assert!(ks.is_triggered());
+
+        // Wait for cooldown
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // Now auto-recovery should succeed
+        let fresh_state = KillSwitchState {
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        assert!(ks.check_auto_recovery(&fresh_state));
+        assert!(!ks.is_triggered()); // Recovered!
+    }
+
+    #[test]
+    fn test_auto_recovery_never_for_financial_triggers() {
+        let config = KillSwitchConfig {
+            max_daily_loss: 5.0,
+            auto_recovery_cooldown_secs: 1,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Trigger via daily loss
+        let loss_state = KillSwitchState {
+            daily_pnl: -10.0,
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        ks.check(&loss_state);
+        assert!(ks.is_triggered());
+
+        // Wait for cooldown
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // Auto-recovery must NOT work for financial triggers
+        let ok_state = KillSwitchState {
+            daily_pnl: 0.0,
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        assert!(!ks.check_auto_recovery(&ok_state));
+        assert!(ks.is_triggered()); // Still triggered — financial reasons never auto-recover
+    }
+
+    #[test]
+    fn test_auto_recovery_blocked_when_condition_persists() {
+        let config = KillSwitchConfig {
+            stale_data_threshold: Duration::from_millis(10),
+            auto_recovery_cooldown_secs: 1,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Trigger via stale data
+        let stale_state = KillSwitchState {
+            last_data_time: Instant::now() - Duration::from_millis(100),
+            ..Default::default()
+        };
+        ks.check(&stale_state);
+        assert!(ks.is_triggered());
+
+        // Wait for cooldown
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // Data is STILL stale — should NOT recover
+        let still_stale = KillSwitchState {
+            last_data_time: Instant::now() - Duration::from_millis(100),
+            ..Default::default()
+        };
+        assert!(!ks.check_auto_recovery(&still_stale));
+        assert!(ks.is_triggered());
+    }
+
+    #[test]
+    fn test_kill_reason_is_transient() {
+        // Transient reasons
+        assert!(KillReason::StaleData {
+            elapsed: Duration::from_secs(60),
+            threshold: Duration::from_secs(30),
+        }
+        .is_transient());
+        assert!(KillReason::RateLimit { count: 5, limit: 3 }.is_transient());
+        assert!(KillReason::CascadeDetected { severity: 2.0 }.is_transient());
+
+        // Non-transient reasons
+        assert!(!KillReason::MaxLoss {
+            loss: 100.0,
+            limit: 50.0,
+        }
+        .is_transient());
+        assert!(!KillReason::MaxDrawdown {
+            drawdown: 0.10,
+            limit: 0.05,
+        }
+        .is_transient());
+        assert!(!KillReason::Manual {
+            reason: "test".to_string(),
+        }
+        .is_transient());
+        assert!(!KillReason::MaxPosition {
+            value: 200.0,
+            limit: 100.0,
+        }
+        .is_transient());
     }
 }

@@ -590,20 +590,20 @@ impl RiskConfig {
     pub fn hip3() -> Self {
         Self {
             gamma_base: 0.15,               // Aggressive (vs 0.3 default)
-            gamma_min: 0.08,                // Allow tight quotes
-            gamma_max: 2.0,                 // Lower ceiling
-            sigma_baseline: 0.00015,        // 15 bps/sec (lower vol expectation)
-            volatility_weight: 0.3,         // Less vol scaling
+            gamma_min: 0.10, // Let calibrated risk model decide — don't impose high floor
+            gamma_max: 2.0,  // Lower ceiling
+            sigma_baseline: 0.00035, // 3.5 bps/√s (realistic HYPE observed vol)
+            volatility_weight: 0.3, // Less vol scaling
             max_volatility_multiplier: 2.0, // Lower cap
-            toxicity_threshold: 2.0,        // Higher tolerance (less informed flow on HIP-3)
-            toxicity_sensitivity: 0.2,      // Less sensitive
-            inventory_threshold: 0.4,       // Higher inventory tolerance
-            inventory_sensitivity: 1.5,     // Less aggressive scaling
-            inventory_beta: 7.0,            // Smooth γ(q) scaling (same as default)
-            min_spread_floor: 0.00015,      // 1.5 bps floor (HL maker fee — physical minimum)
-            max_holding_time: 300.0,        // 5 minutes (slower markets)
-            flow_sensitivity: 0.3,          // Less flow adjustment
-            maker_fee_rate: 0.00015,        // 1.5 bps — standard HL maker fee (add: 0.00015)
+            toxicity_threshold: 2.0, // Higher tolerance (less informed flow on HIP-3)
+            toxicity_sensitivity: 0.2, // Less sensitive
+            inventory_threshold: 0.4, // Higher inventory tolerance
+            inventory_sensitivity: 1.5, // Less aggressive scaling
+            inventory_beta: 7.0, // Smooth γ(q) scaling (same as default)
+            min_spread_floor: 0.00015, // 1.5 bps floor (HL maker fee — physical minimum)
+            max_holding_time: 300.0, // 5 minutes (slower markets)
+            flow_sensitivity: 0.3, // Less flow adjustment
+            maker_fee_rate: 0.00015, // 1.5 bps — standard HL maker fee (add: 0.00015)
             // DISABLE time-of-day scaling for HIP-3 (different patterns)
             enable_time_of_day_scaling: false,
             toxic_hour_gamma_multiplier: 1.0,

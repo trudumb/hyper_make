@@ -242,6 +242,61 @@ impl BayesianModelAverager {
             .map(|(m, w)| (m.name, w))
             .collect()
     }
+
+    /// Compute pairwise Bayes factors (diagnostic).
+    ///
+    /// Returns `Vec<(model_i, model_j, log_bf)>` where
+    /// `log_bf = log_ml_i - log_ml_j` (positive = model_i preferred).
+    pub(crate) fn bayes_factors(&self) -> Vec<(&str, &str, f64)> {
+        let mut bfs = Vec::new();
+        for i in 0..self.models.len() {
+            for j in (i + 1)..self.models.len() {
+                if self.models[i].sigma_estimate > 0.0 && self.models[j].sigma_estimate > 0.0 {
+                    let log_bf = self.models[i].log_ml - self.models[j].log_ml;
+                    bfs.push((self.models[i].name, self.models[j].name, log_bf));
+                }
+            }
+        }
+        bfs
+    }
+
+    /// Herfindahl concentration index of BMA weights [0, 1].
+    ///
+    /// - Near `1/n` (≈0.33 for 3 models) = weights are diffuse (high model uncertainty)
+    /// - Near `1.0` = one model dominates (low model uncertainty)
+    ///
+    /// Use: When concentration is low (<0.4), widen spreads for defense.
+    pub(crate) fn concentration_index(&self) -> f64 {
+        let weights = self.weights();
+        weights.iter().map(|w| w * w).sum()
+    }
+
+    /// Whether model uncertainty is high enough to warrant defensive widening.
+    ///
+    /// Returns true when:
+    /// 1. Sufficient observations exist for meaningful comparison, AND
+    /// 2. No single model dominates (Herfindahl < 0.5), AND
+    /// 3. Between-model variance exceeds 20% of mean sigma²
+    ///
+    /// Signal_integration can use this to add spread premium.
+    pub(crate) fn high_model_uncertainty(&self) -> bool {
+        if self.n_observations < self.min_obs_for_bma {
+            return false; // Not enough data to judge
+        }
+        let hhi = self.concentration_index();
+        if hhi >= 0.5 {
+            return false; // One model dominates, low uncertainty
+        }
+        // Check between-model variance ratio
+        let sigma_bma = self.sigma_bma();
+        if sigma_bma <= 0.0 {
+            return false;
+        }
+        let bma_var = self.sigma_variance_bma();
+        let sigma_sq = sigma_bma * sigma_bma;
+        let cv_sq = bma_var / (sigma_sq * sigma_sq).max(1e-30);
+        cv_sq > 0.2 // Models disagree by more than ~45% of mean
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +391,84 @@ mod tests {
             (weights[0] - 0.5).abs() < 0.01,
             "Two active models should share: {:.4}",
             weights[0]
+        );
+    }
+
+    #[test]
+    fn test_bayes_factors_symmetric() {
+        let mut bma = BayesianModelAverager::default();
+        bma.update_estimates(0.001, 0.002, 0.003);
+        // Before observations, all log_ml are 0, so BF = 0
+        let bfs = bma.bayes_factors();
+        assert_eq!(bfs.len(), 3, "3 pairwise BFs");
+        for (_, _, log_bf) in &bfs {
+            assert!(log_bf.abs() < 1e-10, "BF should be 0 before observations");
+        }
+    }
+
+    #[test]
+    fn test_bayes_factors_favor_accurate_model() {
+        let mut bma = BayesianModelAverager::default();
+        for _ in 0..50 {
+            bma.update_estimates(0.001, 0.003, 0.002);
+            // Realized variance closest to model 0 (clean_bv)
+            bma.observe_realized_variance(0.001_f64.powi(2));
+        }
+        let bfs = bma.bayes_factors();
+        // BF(clean_bv vs leverage_adjusted) should be positive (clean_bv preferred)
+        let bf_01 = bfs
+            .iter()
+            .find(|(a, b, _)| *a == "clean_bv" && *b == "leverage_adjusted");
+        assert!(
+            bf_01.unwrap().2 > 0.0,
+            "Clean BV should be preferred over leverage when clean is accurate"
+        );
+    }
+
+    #[test]
+    fn test_concentration_index_equal_weights() {
+        let mut bma = BayesianModelAverager::default();
+        bma.update_estimates(0.001, 0.001, 0.001);
+        let hhi = bma.concentration_index();
+        // Equal weights → HHI = 3 × (1/3)² = 1/3
+        assert!(
+            (hhi - 1.0 / 3.0).abs() < 0.01,
+            "HHI should be ~0.33 for equal weights, got {hhi:.3}"
+        );
+    }
+
+    #[test]
+    fn test_concentration_index_dominant_model() {
+        let mut bma = BayesianModelAverager::default();
+        for _ in 0..100 {
+            bma.update_estimates(0.001, 0.005, 0.005);
+            bma.observe_realized_variance(0.001_f64.powi(2));
+        }
+        let hhi = bma.concentration_index();
+        // Model 0 should dominate → HHI approaches 1.0
+        assert!(
+            hhi > 0.5,
+            "HHI should be high when one model dominates, got {hhi:.3}"
+        );
+    }
+
+    #[test]
+    fn test_high_model_uncertainty_before_warmup() {
+        let bma = BayesianModelAverager::default();
+        assert!(
+            !bma.high_model_uncertainty(),
+            "Should not signal uncertainty before warmup"
+        );
+    }
+
+    #[test]
+    fn test_high_model_uncertainty_not_before_warmup() {
+        // With disagreeing models but < min_obs, high_model_uncertainty should be false
+        let mut bma = BayesianModelAverager::default();
+        bma.update_estimates(0.0005, 0.001, 0.002);
+        assert!(
+            !bma.high_model_uncertainty(),
+            "Should not flag uncertainty before warmup even with disagreement"
         );
     }
 

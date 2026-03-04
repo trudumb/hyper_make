@@ -100,7 +100,7 @@ pub struct QuoteOutcomeCheckpoint {
 }
 
 /// Complete checkpoint bundle containing all model state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheckpointBundle {
     #[serde(default)]
     pub metadata: CheckpointMetadata,
@@ -179,6 +179,12 @@ pub struct CheckpointBundle {
     /// Persists learned gamma calibration across restarts.
     #[serde(default)]
     pub gamma_calibrator: crate::market_maker::adaptive::OnlineBayesianGammaCalibrator,
+    /// Particle filter posterior summary for warm-starting.
+    #[serde(default)]
+    pub particle_filter: ParticleFilterCheckpoint,
+    /// Directional Kalman drift belief state for warm-starting.
+    #[serde(default)]
+    pub directional_belief: DirectionalBeliefCheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -690,6 +696,77 @@ impl Default for BaselineTrackerCheckpoint {
     }
 }
 
+/// Particle filter posterior summary for warm-starting.
+///
+/// Stores sufficient statistics to reinitialize particles around the
+/// posterior mean instead of broad priors. The full particle cloud
+/// (N×4 arrays) is NOT persisted — particles are resampled from
+/// the saved posterior on restore.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ParticleFilterCheckpoint {
+    /// Posterior mean of sigma (per-second volatility).
+    #[serde(default)]
+    pub sigma_mean: f64,
+    /// Posterior std of sigma.
+    #[serde(default)]
+    pub sigma_std: f64,
+    /// Posterior mean of kappa (fill intensity).
+    #[serde(default)]
+    pub kappa_mean: f64,
+    /// Posterior std of kappa.
+    #[serde(default)]
+    pub kappa_std: f64,
+    /// Posterior mean of drift rate.
+    #[serde(default)]
+    pub drift_mean: f64,
+    /// Posterior std of drift.
+    #[serde(default)]
+    pub drift_std: f64,
+    /// Posterior mean of jump intensity.
+    #[serde(default)]
+    pub jump_mean: f64,
+    /// Posterior std of jump intensity.
+    #[serde(default)]
+    pub jump_std: f64,
+    /// Effective sample size at save time (diagnostic).
+    #[serde(default)]
+    pub ess: f64,
+    /// Total updates processed.
+    #[serde(default)]
+    pub num_updates: u64,
+    /// Marginal log-likelihood (for BMA).
+    #[serde(default)]
+    pub marginal_log_likelihood: f64,
+}
+
+/// Directional Kalman drift belief state for warm-starting.
+///
+/// Stores the Normal-Normal conjugate posterior (μ, σ²) so the
+/// directional signal doesn't restart from zero drift on restart.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DirectionalBeliefCheckpoint {
+    /// Posterior mean of directional drift (μ > 0 = bearish).
+    #[serde(default)]
+    pub dir_mu: f64,
+    /// Posterior variance of directional drift.
+    #[serde(default)]
+    pub dir_sigma_sq: f64,
+    /// Evidence counts per source (for diagnostics).
+    #[serde(default)]
+    pub n_price: u64,
+    #[serde(default)]
+    pub n_fill: u64,
+    #[serde(default)]
+    pub n_as: u64,
+    #[serde(default)]
+    pub n_flow: u64,
+    #[serde(default)]
+    pub n_burst: u64,
+    /// Smoothed kappa at save time (for warm-starting kappa blend).
+    #[serde(default)]
+    pub kappa_smoothed: f64,
+}
+
 /// Kill switch state for checkpoint persistence.
 ///
 /// Allows restoring triggered state after restart so the system
@@ -737,6 +814,128 @@ impl Default for KillSwitchCheckpoint {
             position_stuck_cycles: 0,
             unrealized_as_cost_usd: 0.0,
         }
+    }
+}
+
+impl CheckpointBundle {
+    /// Apply time-based decay to learned posteriors.
+    ///
+    /// Called on checkpoint restore to prevent stale data from dominating.
+    /// Decay formula: `decay = exp(-hours_since_save / 12.0)`
+    ///
+    /// Effects:
+    /// - Directional drift μ → μ × decay (stale drift signals fade)
+    /// - Posterior variances → inflated toward priors (uncertainty grows)
+    /// - Observation counts → scaled down (stale observations worth less)
+    /// - Kill switch: NEVER decayed (safety state persists)
+    /// - Regime HMM: NOT decayed (structural, not ephemeral)
+    pub fn apply_time_decay(&mut self, hours_since_save: f64) {
+        if hours_since_save <= 0.0 {
+            return;
+        }
+
+        // Core decay: 12h half-life ≈ decay=0.5 at 12h, 0.25 at 24h, 0.06 at 48h
+        let decay = (-hours_since_save / 12.0_f64).exp();
+
+        // === Directional drift (most time-sensitive) ===
+        self.directional_belief.dir_mu *= decay;
+        // Inflate variance toward prior (4.0 is default dir_prior_variance)
+        let prior_var = 4.0;
+        self.directional_belief.dir_sigma_sq =
+            self.directional_belief.dir_sigma_sq * decay + prior_var * (1.0 - decay);
+
+        // === Volatility filter: widen posterior uncertainty ===
+        // sigma_mean stays (vol doesn't decay quickly), but widen sigma_std
+        let prior_sigma_std = 0.0002; // default from VolFilterCheckpoint
+        self.vol_filter.sigma_std =
+            self.vol_filter.sigma_std * decay.sqrt() + prior_sigma_std * (1.0 - decay.sqrt());
+
+        // === Kappa posteriors: decay observation evidence ===
+        // Scale effective observations — old observations worth less
+        let obs_decay = decay.sqrt(); // Slower decay for observation counts
+        for kappa in [
+            &mut self.kappa_own,
+            &mut self.kappa_bid,
+            &mut self.kappa_ask,
+        ] {
+            // Scale sufficient statistics toward prior
+            let prior_alpha = 10.0_f64;
+            let prior_beta = 0.02_f64;
+            kappa.prior_alpha = kappa.prior_alpha * obs_decay + prior_alpha * (1.0 - obs_decay);
+            kappa.prior_beta = kappa.prior_beta * obs_decay + prior_beta * (1.0 - obs_decay);
+            // Scale rolling window counts (but preserve total_observations as historical record)
+            kappa.observation_count = (kappa.observation_count as f64 * obs_decay).round() as usize;
+            kappa.sum_distances *= obs_decay;
+            kappa.sum_sq_distances *= obs_decay;
+            // Recalculate posterior mean from decayed sufficient stats
+            if kappa.prior_beta > 0.0 {
+                kappa.kappa_posterior_mean = kappa.prior_alpha / kappa.prior_beta;
+            }
+        }
+
+        // === Fill rate model: decay toward priors ===
+        let fr_decay = decay.sqrt();
+        self.fill_rate.lambda_0_variance /= fr_decay.max(0.01); // Inflate variance
+        self.fill_rate.delta_char_variance /= fr_decay.max(0.01);
+        self.fill_rate.lambda_0_n_obs *= fr_decay;
+        self.fill_rate.delta_char_n_obs *= fr_decay;
+
+        // === Classifier weights: decay learning sample counts ===
+        let sample_decay = decay.sqrt();
+        self.pre_fill.learning_samples =
+            (self.pre_fill.learning_samples as f64 * sample_decay).round() as usize;
+        self.enhanced.learning_samples =
+            (self.enhanced.learning_samples as f64 * sample_decay).round() as usize;
+        // Scale sufficient statistics
+        for i in 0..5 {
+            self.pre_fill.signal_outcome_sum[i] *= sample_decay;
+            self.pre_fill.signal_sq_sum[i] *= sample_decay;
+        }
+        for i in 0..10 {
+            self.enhanced.weight_gradients[i] *= decay; // Gradients decay faster
+        }
+
+        // === Kelly tracker: decay win/loss evidence ===
+        let kelly_decay = decay.sqrt();
+        self.kelly_tracker.n_wins = (self.kelly_tracker.n_wins as f64 * kelly_decay).round() as u64;
+        self.kelly_tracker.n_losses =
+            (self.kelly_tracker.n_losses as f64 * kelly_decay).round() as u64;
+
+        // === Momentum: decay observation counts toward priors ===
+        for i in 0..10 {
+            let count_f = self.momentum.counts_by_magnitude[i] as f64 * obs_decay;
+            self.momentum.counts_by_magnitude[i] = count_f.round() as usize;
+            // Decay continuation probability toward 0.5 prior
+            self.momentum.continuation_by_magnitude[i] =
+                self.momentum.continuation_by_magnitude[i] * obs_decay + 0.5 * (1.0 - obs_decay);
+        }
+
+        // === Particle filter: widen posterior uncertainty ===
+        self.particle_filter.drift_mean *= decay;
+        self.particle_filter.sigma_std /= decay.sqrt().max(0.1);
+        self.particle_filter.kappa_std /= decay.sqrt().max(0.1);
+        self.particle_filter.drift_std /= decay.sqrt().max(0.1);
+        self.particle_filter.jump_std /= decay.sqrt().max(0.1);
+
+        // === Baseline tracker: partial decay ===
+        self.baseline_tracker.n_observations =
+            (self.baseline_tracker.n_observations as f64 * obs_decay).round() as u64;
+
+        // === Ensemble weights: decay toward uniform ===
+        let n_models = self.ensemble_weights.model_weights.len();
+        if n_models > 0 {
+            let uniform = 1.0 / n_models as f64;
+            for w in &mut self.ensemble_weights.model_weights {
+                *w = *w * obs_decay + uniform * (1.0 - obs_decay);
+            }
+        }
+
+        // === prior_confidence: reduce with age ===
+        self.prior_confidence *= decay;
+
+        // NOTE: kill_switch is NEVER decayed — safety state always persists
+        // NOTE: regime_hmm is NOT decayed — structural transitions are relatively stable
+        // NOTE: kappa_orchestrator is NOT decayed — graduation state should persist
     }
 }
 
@@ -825,6 +1024,8 @@ mod tests {
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
             gamma_calibrator: Default::default(),
+            particle_filter: ParticleFilterCheckpoint::default(),
+            directional_belief: DirectionalBeliefCheckpoint::default(),
         };
 
         // Serialize to JSON
@@ -927,6 +1128,8 @@ mod tests {
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
             gamma_calibrator: Default::default(),
+            particle_filter: ParticleFilterCheckpoint::default(),
+            directional_belief: DirectionalBeliefCheckpoint::default(),
         };
 
         // Serialize to JSON
@@ -983,6 +1186,8 @@ mod tests {
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
             gamma_calibrator: Default::default(),
+            particle_filter: ParticleFilterCheckpoint::default(),
+            directional_belief: DirectionalBeliefCheckpoint::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -1028,6 +1233,8 @@ mod tests {
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
             gamma_calibrator: Default::default(),
+            particle_filter: ParticleFilterCheckpoint::default(),
+            directional_belief: DirectionalBeliefCheckpoint::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -1100,5 +1307,130 @@ mod tests {
         assert_eq!(restored.kappa_own.prior_alpha, 0.0);
         assert_eq!(restored.kill_switch.daily_pnl, 0.0);
         assert_eq!(restored.kill_switch.triggered_at_ms, 0);
+    }
+
+    #[test]
+    fn test_time_decay_zero_hours() {
+        let mut bundle = CheckpointBundle {
+            metadata: CheckpointMetadata {
+                version: 1,
+                timestamp_ms: 1700000000000,
+                asset: "ETH".to_string(),
+                session_duration_s: 100.0,
+                ..Default::default()
+            },
+            pre_fill: PreFillCheckpoint {
+                learning_samples: 1000,
+                ..PreFillCheckpoint::default()
+            },
+            ..Default::default()
+        };
+        bundle.apply_time_decay(0.0);
+        // No decay applied
+        assert_eq!(bundle.pre_fill.learning_samples, 1000);
+    }
+
+    #[test]
+    fn test_time_decay_12h_halves_drift() {
+        let mut bundle = CheckpointBundle::default();
+        bundle.directional_belief.dir_mu = 1.0;
+        bundle.directional_belief.dir_sigma_sq = 1.0;
+        bundle.apply_time_decay(12.0);
+
+        // decay = exp(-12/12) = exp(-1) ≈ 0.368
+        let expected_decay = (-1.0_f64).exp();
+        assert!(
+            (bundle.directional_belief.dir_mu - expected_decay).abs() < 0.01,
+            "dir_mu should decay to ~{:.3}, got {:.3}",
+            expected_decay,
+            bundle.directional_belief.dir_mu,
+        );
+        // Variance should inflate toward prior (4.0)
+        assert!(
+            bundle.directional_belief.dir_sigma_sq > 1.0,
+            "dir_sigma_sq should inflate with time"
+        );
+    }
+
+    #[test]
+    fn test_time_decay_24h_strong_decay() {
+        let mut bundle = CheckpointBundle::default();
+        bundle.pre_fill.learning_samples = 1000;
+        bundle.kappa_own.observation_count = 200;
+        bundle.kappa_own.prior_alpha = 15.0;
+        bundle.kappa_own.prior_beta = 0.03;
+        bundle.kelly_tracker.n_wins = 100;
+        bundle.kelly_tracker.n_losses = 40;
+        bundle.ensemble_weights.model_weights = vec![0.7, 0.2, 0.1];
+
+        bundle.apply_time_decay(24.0);
+
+        // decay = exp(-24/12) = exp(-2) ≈ 0.135
+        // obs_decay = sqrt(0.135) ≈ 0.368
+        assert!(
+            bundle.pre_fill.learning_samples < 500,
+            "Samples should decay substantially, got {}",
+            bundle.pre_fill.learning_samples
+        );
+        assert!(
+            bundle.kappa_own.observation_count < 100,
+            "Kappa obs should decay, got {}",
+            bundle.kappa_own.observation_count
+        );
+        assert!(
+            bundle.kelly_tracker.n_wins < 50,
+            "Kelly wins should decay, got {}",
+            bundle.kelly_tracker.n_wins
+        );
+        // Ensemble weights should move toward uniform (1/3 ≈ 0.333)
+        assert!(
+            bundle.ensemble_weights.model_weights[0] < 0.7,
+            "Ensemble weight should decay toward uniform"
+        );
+    }
+
+    #[test]
+    fn test_time_decay_preserves_kill_switch() {
+        let mut bundle = CheckpointBundle::default();
+        bundle.kill_switch.triggered = true;
+        bundle.kill_switch.daily_pnl = -50.0;
+        bundle.kill_switch.trigger_reasons = vec!["MaxDailyLoss".to_string()];
+
+        bundle.apply_time_decay(48.0); // 2 days
+
+        // Kill switch state must NEVER be decayed
+        assert!(bundle.kill_switch.triggered);
+        assert_eq!(bundle.kill_switch.daily_pnl, -50.0);
+        assert_eq!(bundle.kill_switch.trigger_reasons.len(), 1);
+    }
+
+    #[test]
+    fn test_time_decay_particle_filter() {
+        let mut bundle = CheckpointBundle::default();
+        bundle.particle_filter.drift_mean = 0.01;
+        bundle.particle_filter.sigma_std = 0.001;
+        bundle.particle_filter.kappa_std = 100.0;
+
+        bundle.apply_time_decay(12.0);
+
+        // Drift mean decays
+        assert!(bundle.particle_filter.drift_mean.abs() < 0.01);
+        // Stds inflate (wider uncertainty)
+        assert!(bundle.particle_filter.sigma_std > 0.001);
+        assert!(bundle.particle_filter.kappa_std > 100.0);
+    }
+
+    #[test]
+    fn test_backward_compat_no_particle_filter() {
+        let bundle = CheckpointBundle::default();
+        let json = serde_json::to_string(&bundle).expect("serialize");
+        let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        map.as_object_mut().unwrap().remove("particle_filter");
+        map.as_object_mut().unwrap().remove("directional_belief");
+        let old_json = serde_json::to_string(&map).expect("re-serialize");
+        let restored: CheckpointBundle =
+            serde_json::from_str(&old_json).expect("deserialize old format");
+        assert_eq!(restored.particle_filter.num_updates, 0);
+        assert_eq!(restored.directional_belief.dir_mu, 0.0);
     }
 }

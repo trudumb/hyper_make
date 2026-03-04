@@ -447,6 +447,101 @@ impl HJBSolver {
     }
 }
 
+// ==================== Multi-Horizon Value Function Decomposition ====================
+// Phase 4.1: V(q, regime, t) = V_immediate(q) + V_tactical(q, sigma) + V_strategic(q, regime, T-t)
+//
+// The three timescales:
+// - Immediate (1s): GLFT half-spread δ* = (1/γ) × ln(1 + γ/κ) — fast, existing
+// - Tactical (adaptive tau): Inventory penalty q × γ × σ² × τ — medium, adaptive tau
+// - Strategic (1h): Regime-dependent terminal penalty — slow, captures long-horizon risk
+
+/// Multi-horizon value function decomposition.
+///
+/// Provides analytical approximations for the value function V(q, regime, t)
+/// decomposed into three timescales, avoiding the need for a full backward
+/// induction grid solve while capturing the key economic insights.
+#[derive(Debug, Clone)]
+pub struct MultiHorizonValue {
+    /// Maximum strategic horizon extension (hours).
+    /// In cascade regimes, the effective inventory penalty horizon extends.
+    pub strategic_max_hours: f64,
+
+    /// Regime gamma multipliers [quiet, normal, bursty, cascade].
+    /// Strategic penalty scales with these.
+    pub regime_mults: [f64; 4],
+}
+
+impl Default for MultiHorizonValue {
+    fn default() -> Self {
+        Self {
+            strategic_max_hours: 1.0,
+            regime_mults: [0.3, 0.0, 1.0, 2.5],
+        }
+    }
+}
+
+impl MultiHorizonValue {
+    /// Compute the strategic time extension beyond the tactical tau.
+    ///
+    /// In adverse regimes (bursty, cascade), inventory risk extends well beyond
+    /// the immediate tactical horizon because:
+    /// 1. Liquidation is harder (kappa drops in cascade)
+    /// 2. Adverse price movements are larger and more persistent
+    /// 3. Regime transitions are sticky (cascade can last minutes-hours)
+    ///
+    /// Returns: additional seconds to add to the tactical tau for inventory penalty.
+    ///
+    /// # Arguments
+    /// * `regime_probs` - [quiet, normal, bursty, cascade] probabilities
+    /// * `inventory_ratio` - |q|/Q_max, normalized inventory level [0, 1]
+    pub fn strategic_tau_extension(&self, regime_probs: [f64; 4], inventory_ratio: f64) -> f64 {
+        // Regime-weighted extension factor
+        let regime_weight: f64 = regime_probs
+            .iter()
+            .zip(self.regime_mults.iter())
+            .map(|(p, m)| p * m)
+            .sum();
+
+        // Inventory amplification: higher inventory → more strategic urgency
+        // At 0% inventory: no strategic penalty needed
+        // At 100% inventory: full strategic penalty
+        let inv_factor = inventory_ratio.abs().clamp(0.0, 1.0).powi(2);
+
+        // Strategic extension in seconds
+        let max_extension_s = self.strategic_max_hours * 3600.0;
+        regime_weight * inv_factor * max_extension_s
+    }
+
+    /// Compute regime-adjusted inventory beta for state-dependent gamma.
+    ///
+    /// Phase 4.2: Approximates γ_optimal(q) = -V''(q) / V'(q) from the
+    /// multi-horizon value function. Since V(q) ≈ -½γσ²q²T, the curvature
+    /// increases with T and regime severity. This manifests as a higher
+    /// `inventory_beta` parameter in adverse regimes.
+    ///
+    /// # Arguments
+    /// * `base_beta` - Base inventory_beta from RiskConfig
+    /// * `regime_probs` - [quiet, normal, bursty, cascade] probabilities
+    ///
+    /// # Returns
+    /// Effective inventory beta, increased in adverse regimes.
+    pub fn regime_adjusted_beta(&self, base_beta: f64, regime_probs: [f64; 4]) -> f64 {
+        // In calm markets: reduce beta (V'' is shallow, gamma less sensitive to q)
+        // In cascade: increase beta (V'' is steep, gamma much more sensitive to q)
+        //
+        // Addons: quiet=-0.3, normal=0, bursty=+0.5, cascade=+2.0
+        let beta_addons = [-0.3, 0.0, 0.5, 2.0];
+        let weighted_addon: f64 = regime_probs
+            .iter()
+            .zip(beta_addons.iter())
+            .map(|(p, a)| p * a)
+            .sum();
+
+        // Clamp to prevent negative beta (would reverse inventory penalty)
+        (base_beta + weighted_addon * base_beta / 7.0).max(1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +722,86 @@ mod tests {
         assert!(
             quotes.half_spread > 5.0,
             "Cascade regime should widen spreads"
+        );
+    }
+
+    // === MultiHorizonValue Tests ===
+
+    #[test]
+    fn test_strategic_tau_extension_zero_in_calm() {
+        let mhv = MultiHorizonValue::default();
+        // Quiet regime: extension factor is negative (clamped by quiet mult of 0.3)
+        // But with mostly normal (0.0 mult), extension should be very small
+        let ext = mhv.strategic_tau_extension([0.0, 1.0, 0.0, 0.0], 0.5);
+        assert!(
+            ext < 1.0,
+            "Normal regime should produce near-zero strategic extension, got {ext}"
+        );
+    }
+
+    #[test]
+    fn test_strategic_tau_extension_large_in_cascade() {
+        let mhv = MultiHorizonValue::default();
+        let ext = mhv.strategic_tau_extension([0.0, 0.0, 0.0, 1.0], 1.0);
+        // 2.5 × 1.0² × 3600 = 9000s
+        assert!(
+            ext > 5000.0,
+            "Cascade at full inventory should give large extension, got {ext}"
+        );
+    }
+
+    #[test]
+    fn test_strategic_tau_extension_zero_at_zero_inventory() {
+        let mhv = MultiHorizonValue::default();
+        let ext = mhv.strategic_tau_extension([0.0, 0.0, 0.0, 1.0], 0.0);
+        assert!(
+            ext.abs() < 1e-6,
+            "Zero inventory should give zero strategic extension, got {ext}"
+        );
+    }
+
+    #[test]
+    fn test_strategic_tau_quadratic_in_inventory() {
+        let mhv = MultiHorizonValue::default();
+        let cascade = [0.0, 0.0, 0.0, 1.0];
+        let ext_50 = mhv.strategic_tau_extension(cascade, 0.5);
+        let ext_100 = mhv.strategic_tau_extension(cascade, 1.0);
+        // 0.5² = 0.25, 1.0² = 1.0 → ratio should be 4:1
+        let ratio = ext_100 / ext_50;
+        assert!(
+            (ratio - 4.0).abs() < 0.1,
+            "Extension should scale quadratically: ratio {ratio:.2}"
+        );
+    }
+
+    #[test]
+    fn test_regime_adjusted_beta_increases_in_cascade() {
+        let mhv = MultiHorizonValue::default();
+        let base_beta = 7.0;
+        let beta_calm = mhv.regime_adjusted_beta(base_beta, [1.0, 0.0, 0.0, 0.0]);
+        let beta_cascade = mhv.regime_adjusted_beta(base_beta, [0.0, 0.0, 0.0, 1.0]);
+        assert!(
+            beta_cascade > beta_calm,
+            "Beta should be higher in cascade ({beta_cascade:.2}) than calm ({beta_calm:.2})"
+        );
+    }
+
+    #[test]
+    fn test_regime_adjusted_beta_never_below_one() {
+        let mhv = MultiHorizonValue::default();
+        // Even with all quiet (negative addon), beta should be >= 1.0
+        let beta = mhv.regime_adjusted_beta(1.0, [1.0, 0.0, 0.0, 0.0]);
+        assert!(beta >= 1.0, "Beta should never go below 1.0, got {beta:.2}");
+    }
+
+    #[test]
+    fn test_regime_adjusted_beta_normal_regime_unchanged() {
+        let mhv = MultiHorizonValue::default();
+        let base_beta = 7.0;
+        let beta = mhv.regime_adjusted_beta(base_beta, [0.0, 1.0, 0.0, 0.0]);
+        assert!(
+            (beta - base_beta).abs() < 0.01,
+            "Normal regime should leave beta unchanged: {beta:.2} vs {base_beta}"
         );
     }
 }

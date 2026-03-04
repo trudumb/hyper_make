@@ -507,6 +507,10 @@ mod tests {
             bayesian_fair_value: Default::default(),
             shadow_tuner: None,
             gamma_calibrator: Default::default(),
+            particle_filter:
+                crate::market_maker::checkpoint::types::ParticleFilterCheckpoint::default(),
+            directional_belief:
+                crate::market_maker::checkpoint::types::DirectionalBeliefCheckpoint::default(),
         }
     }
 

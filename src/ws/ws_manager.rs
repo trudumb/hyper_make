@@ -71,7 +71,7 @@ impl Default for WsHealthConfig {
             max_reconnect_delay: Duration::from_secs(60),
             backoff_multiplier: 2.0,
             jitter_factor: 0.2,
-            max_consecutive_failures: 10,
+            max_consecutive_failures: 0, // Unlimited — kill switch is the safety net
         }
     }
 }

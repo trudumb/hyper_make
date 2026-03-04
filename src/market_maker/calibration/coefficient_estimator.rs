@@ -236,6 +236,7 @@ impl CoefficientEstimator {
                 // Edge accountability: not learned from AS data - use defaults
                 beta_edge_uncertainty: 1.5,
                 beta_calibration: 0.8,
+                beta_as_ratio: 0.8, // Not learned from AS data - use default
                 gamma_min: 0.05,
                 gamma_max: 5.0,
                 n_samples: self.samples.len(),

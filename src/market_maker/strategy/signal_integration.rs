@@ -91,6 +91,152 @@ pub struct LagAnalyzerStatus<'a> {
     pub sample_timestamps: (TimestampRange, TimestampRange),
 }
 
+/// BTC beta tracker: rolling covariance estimator for HYPE-BTC systematic risk.
+///
+/// Computes β = Cov(Δ_HYPE, Δ_BTC) / Var(Δ_BTC) using exponentially weighted
+/// moving averages. When BTC moves, shifts HYPE fair value by β × Δ_BTC.
+/// When BTC realized vol spikes, widens HYPE spreads (crypto-wide stress).
+///
+/// Window: ~1h effective via EWMA λ=0.995 (halflife ≈ 138 observations at 5s cadence).
+#[derive(Debug, Clone)]
+pub struct BtcBetaTracker {
+    /// EWMA decay factor (0.995 → ~1h halflife at 5s cadence).
+    lambda: f64,
+    /// Current BTC mid price (updated on each BTC price tick).
+    curr_btc_mid: f64,
+    /// Previous BTC mid price (snapshot at last paired observation).
+    prev_btc_mid: f64,
+    /// Previous HYPE mid price (snapshot at last paired observation).
+    prev_hype_mid: f64,
+    /// EWMA of BTC returns (mean).
+    ewma_btc_ret: f64,
+    /// EWMA of HYPE returns (mean).
+    ewma_hype_ret: f64,
+    /// EWMA of BTC return squared (for variance).
+    ewma_btc_ret_sq: f64,
+    /// EWMA of BTC × HYPE return product (for covariance).
+    ewma_cross_ret: f64,
+    /// EWMA of BTC return absolute value (for vol tracking).
+    ewma_btc_abs_ret: f64,
+    /// Baseline BTC vol (abs return) for stress detection.
+    baseline_btc_vol: f64,
+    /// Number of paired observations.
+    n_obs: u64,
+    /// Minimum observations before beta is considered valid.
+    min_obs: u64,
+    /// Last BTC update timestamp_ms.
+    last_btc_ts_ms: u64,
+}
+
+impl Default for BtcBetaTracker {
+    fn default() -> Self {
+        Self {
+            lambda: 0.995,
+            curr_btc_mid: 0.0,
+            prev_btc_mid: 0.0,
+            prev_hype_mid: 0.0,
+            ewma_btc_ret: 0.0,
+            ewma_hype_ret: 0.0,
+            ewma_btc_ret_sq: 0.0,
+            ewma_cross_ret: 0.0,
+            ewma_btc_abs_ret: 0.0,
+            baseline_btc_vol: 0.0003, // ~3 bps baseline 5s BTC return
+            n_obs: 0,
+            min_obs: 50, // ~4 min warmup at 5s cadence
+            last_btc_ts_ms: 0,
+        }
+    }
+}
+
+impl BtcBetaTracker {
+    /// Update with a new BTC mid price.
+    pub fn on_btc_price(&mut self, mid_price: f64, timestamp_ms: u64) {
+        if mid_price <= 0.0 {
+            return;
+        }
+        self.curr_btc_mid = mid_price;
+        self.last_btc_ts_ms = timestamp_ms;
+    }
+
+    /// Compute paired return and update EWMA. Called every quote cycle with HYPE mid.
+    ///
+    /// Returns the instantaneous BTC fair-value shift for HYPE in bps:
+    /// `beta * btc_return * 10_000`. Zero if not warmed up.
+    pub fn on_hype_price(&mut self, hype_mid: f64, timestamp_ms: u64) -> f64 {
+        if hype_mid <= 0.0 || self.curr_btc_mid <= 0.0 {
+            return 0.0;
+        }
+
+        // First call: seed previous prices, no return to compute
+        if self.prev_btc_mid <= 0.0 || self.prev_hype_mid <= 0.0 {
+            self.prev_btc_mid = self.curr_btc_mid;
+            self.prev_hype_mid = hype_mid;
+            return 0.0;
+        }
+
+        // Skip if BTC data is stale (> 30s old)
+        let btc_age_ms = timestamp_ms.saturating_sub(self.last_btc_ts_ms);
+        if btc_age_ms > 30_000 {
+            self.prev_hype_mid = hype_mid;
+            return 0.0;
+        }
+
+        // Compute log returns since last paired observation
+        let btc_ret = (self.curr_btc_mid / self.prev_btc_mid).ln();
+        let hype_ret = (hype_mid / self.prev_hype_mid).ln();
+
+        // Update EWMA statistics
+        let l = self.lambda;
+        self.ewma_btc_ret = l * self.ewma_btc_ret + (1.0 - l) * btc_ret;
+        self.ewma_hype_ret = l * self.ewma_hype_ret + (1.0 - l) * hype_ret;
+        self.ewma_btc_ret_sq = l * self.ewma_btc_ret_sq + (1.0 - l) * btc_ret * btc_ret;
+        self.ewma_cross_ret = l * self.ewma_cross_ret + (1.0 - l) * btc_ret * hype_ret;
+        self.ewma_btc_abs_ret = l * self.ewma_btc_abs_ret + (1.0 - l) * btc_ret.abs();
+        self.n_obs += 1;
+
+        // Snapshot current prices as "previous" for next cycle
+        self.prev_btc_mid = self.curr_btc_mid;
+        self.prev_hype_mid = hype_mid;
+
+        // Return fair-value shift: beta * btc_return_bps
+        if let Some(beta) = self.beta() {
+            beta * btc_ret * 10_000.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Compute rolling β = Cov(HYPE, BTC) / Var(BTC).
+    /// Returns None if insufficient data.
+    pub fn beta(&self) -> Option<f64> {
+        if self.n_obs < self.min_obs {
+            return None;
+        }
+        let var_btc = self.ewma_btc_ret_sq - self.ewma_btc_ret * self.ewma_btc_ret;
+        if var_btc < 1e-16 {
+            return None; // BTC not moving, beta undefined
+        }
+        let cov = self.ewma_cross_ret - self.ewma_btc_ret * self.ewma_hype_ret;
+        let beta = cov / var_btc;
+        // Clamp to reasonable range: HYPE beta to BTC typically 1-3
+        Some(beta.clamp(-5.0, 10.0))
+    }
+
+    /// BTC vol stress ratio: current_vol / baseline_vol.
+    /// > 2.0 indicates BTC stress (should widen HYPE spreads).
+    pub fn btc_vol_stress_ratio(&self) -> f64 {
+        if self.n_obs < self.min_obs || self.baseline_btc_vol < 1e-10 {
+            return 1.0; // No stress detected
+        }
+        (self.ewma_btc_abs_ret / self.baseline_btc_vol).clamp(0.5, 5.0)
+    }
+
+    /// Whether the tracker has enough data to produce valid estimates.
+    pub fn is_warmed_up(&self) -> bool {
+        self.n_obs >= self.min_obs
+    }
+}
+
 /// Configuration for signal integrator.
 #[derive(Debug, Clone)]
 pub struct SignalIntegratorConfig {
@@ -217,7 +363,7 @@ impl Default for SignalIntegratorConfig {
             binance_flow_config: BinanceFlowConfig::default(),
             cross_venue_config: CrossVenueConfig::default(),
             min_mi_threshold: 0.05,
-            max_lead_lag_skew_bps: 5.0,
+            max_lead_lag_skew_bps: 15.0,
             use_lead_lag: true,
             use_informed_flow: true,
             use_regime_kappa: true,
@@ -252,8 +398,8 @@ impl SignalIntegratorConfig {
     pub fn hip3() -> Self {
         Self {
             regime_kappa_config: RegimeKappaConfig::hip3(),
-            // More conservative for illiquid markets
-            max_lead_lag_skew_bps: 3.0,
+            // HIP-3: Binance leads HL by 50-500ms — exploit aggressively
+            max_lead_lag_skew_bps: 15.0,
             ..Default::default()
         }
     }
@@ -262,7 +408,7 @@ impl SignalIntegratorConfig {
     pub fn liquid() -> Self {
         Self {
             regime_kappa_config: RegimeKappaConfig::liquid(),
-            max_lead_lag_skew_bps: 5.0,
+            max_lead_lag_skew_bps: 15.0,
             ..Default::default()
         }
     }
@@ -451,6 +597,9 @@ pub struct IntegratedSignals {
     pub funding_premium_alpha: f64,
     /// Funding skew bias: positive = positive funding (skew short), negative = vice versa.
     pub funding_skew_bps: f64,
+    /// Funding settlement drift in bps from proximity-weighted funding rate.
+    /// Negative when funding is positive (selling pressure near settlement).
+    pub funding_settlement_drift_bps: f64,
 
     // === VPIN Blend ===
     /// Hyperliquid VPIN value [0, 1] (volume-synchronized toxicity).
@@ -502,6 +651,14 @@ pub struct IntegratedSignals {
     /// Separated from skew: drift shifts the reservation mid, skew shifts bid/ask asymmetry.
     /// Only bounded by the ±95% GLFT half-spread clamp in ladder_strat.rs.
     pub drift_signal_bps: f64,
+
+    // === Signal Conflict ===
+    /// Whether strongly conflicting signals were detected.
+    /// True when max(signal_z) - min(signal_z) > 4.0 across directional signals.
+    pub signal_conflict_detected: bool,
+    /// Additive spread penalty from signal conflict (bps).
+    /// When signals strongly disagree, widen spreads defensively.
+    pub signal_conflict_penalty_bps: f64,
 
     // === Attribution ===
     /// Per-signal contribution record for attribution analysis.
@@ -610,6 +767,19 @@ pub struct SignalIntegrator {
     /// Updated each cycle by the orchestrator. Maps EdgeSignalKind → [0, 1].
     /// 1.0 = healthy, 0.0 = stale. Applied as multiplicative gating on contributions.
     mi_attenuation: Option<HashMap<crate::market_maker::edge::EdgeSignalKind, f64>>,
+
+    // === HL Perp Lead-Lag (HIP-3) ===
+    /// EWMA of perp-spot basis in bps. Positive = perp premium (buying pressure).
+    hl_perp_basis_bps: f64,
+    /// EWMA of perp net trade flow (signed size). Positive = buy-dominated.
+    hl_perp_flow_imbalance: f64,
+
+    /// Current funding rate (8h period, fraction not bps).
+    /// Positive = longs pay shorts. Updated via `set_funding_rate_8h`.
+    funding_rate_8h: f64,
+
+    /// BTC-HYPE beta tracker for systematic risk factor.
+    btc_beta: BtcBetaTracker,
 }
 
 impl SignalIntegrator {
@@ -656,6 +826,13 @@ impl SignalIntegrator {
             as_sigma: 0.0002, // 2 bps/sec default
             as_gamma: 1.0,
             as_tau_s: 60.0, // 1 minute default
+            // HL perp lead-lag
+            hl_perp_basis_bps: 0.0,
+            hl_perp_flow_imbalance: 0.0,
+            // Funding rate
+            funding_rate_8h: 0.0,
+            // BTC beta
+            btc_beta: BtcBetaTracker::default(),
         }
     }
 
@@ -819,6 +996,118 @@ impl SignalIntegrator {
 
         // Update cross-venue features if we have both venues
         self.update_cross_venue_features();
+    }
+
+    // =========================================================================
+    // HL Perp Lead-Lag (HIP-3)
+    // =========================================================================
+
+    /// Update with perp-spot basis from HL perp BBO feed.
+    ///
+    /// `basis_bps`: perp mid / spot mid - 1 in bps. Positive = perp premium.
+    /// `_timestamp_ms`: exchange timestamp (reserved for latency tracking).
+    ///
+    /// The basis is EWMA-smoothed (decay=0.95) to filter tick noise.
+    /// Fed to drift estimation: perp premium predicts spot price increase.
+    pub fn on_hl_perp_basis(&mut self, basis_bps: f64, _timestamp_ms: u64) {
+        // EWMA smooth with decay=0.95 (~20 observation half-life)
+        const DECAY: f64 = 0.95;
+        self.hl_perp_basis_bps = DECAY * self.hl_perp_basis_bps + (1.0 - DECAY) * basis_bps;
+    }
+
+    /// Update with signed perp trade flow for flow imbalance tracking.
+    ///
+    /// `signed_size`: positive = buy, negative = sell.
+    /// `_price`: trade price (reserved for notional computation).
+    /// `_timestamp_ms`: exchange timestamp.
+    ///
+    /// EWMA-smoothed to give recent flow more weight.
+    pub fn on_hl_perp_trade_flow(&mut self, signed_size: f64, _price: f64, _timestamp_ms: u64) {
+        const DECAY: f64 = 0.98;
+        self.hl_perp_flow_imbalance =
+            DECAY * self.hl_perp_flow_imbalance + (1.0 - DECAY) * signed_size;
+    }
+
+    /// Get the EWMA-smoothed perp-spot basis in bps.
+    ///
+    /// Positive = perp premium (buying pressure expected on spot).
+    /// Negative = perp discount (selling pressure expected on spot).
+    pub fn hl_perp_basis_bps(&self) -> f64 {
+        self.hl_perp_basis_bps
+    }
+
+    /// Get the EWMA-smoothed perp trade flow imbalance.
+    ///
+    /// Positive = buy-dominated flow, Negative = sell-dominated flow.
+    pub fn hl_perp_flow_imbalance(&self) -> f64 {
+        self.hl_perp_flow_imbalance
+    }
+
+    // =========================================================================
+    // Funding Rate Settlement
+    // =========================================================================
+
+    /// Set the current 8h funding rate (fraction, not bps).
+    /// Positive = longs pay shorts.
+    pub fn set_funding_rate_8h(&mut self, rate: f64) {
+        self.funding_rate_8h = rate;
+    }
+
+    /// Compute funding rate settlement drift in bps.
+    ///
+    /// HL settles every 8h (00:00, 08:00, 16:00 UTC).
+    /// Positive funding -> longs pay shorts -> selling pressure near settlement.
+    /// Returns negative drift when funding is positive (expected sell flow).
+    fn compute_funding_settlement_drift_bps(&self) -> f64 {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Seconds into current 8h window (28800s = 8h)
+        let secs_into_window = (now_secs % 28800) as f64;
+        let secs_to_settlement = 28800.0 - secs_into_window;
+
+        // Proximity weight: ramps from 0.1 to 1.0 in last 30 minutes before settlement
+        let proximity_weight = if secs_to_settlement < 1800.0 {
+            1.0 - (secs_to_settlement / 1800.0) * 0.9
+        } else {
+            0.1
+        };
+
+        let funding_rate = self.funding_rate_8h;
+
+        // Negative drift when funding is positive (selling pressure from longs)
+        // Cap at 1% to prevent extreme values from corrupting quotes
+        -funding_rate.signum() * funding_rate.abs().min(0.01) * proximity_weight * 100.0
+    }
+
+    // =========================================================================
+    // BTC Cross-Asset (Placeholder for Task 4)
+    // =========================================================================
+
+    /// BTC price update for systematic risk (beta).
+    /// Feeds into rolling β = Cov(ΔHYPE, ΔBTC) / Var(ΔBTC).
+    pub fn on_btc_price(&mut self, mid_price: f64, timestamp_ms: u64) {
+        self.btc_beta.on_btc_price(mid_price, timestamp_ms);
+    }
+
+    /// BTC trade update for flow stress (reserved for future use).
+    pub fn on_btc_trade(&mut self, _price: f64, _size: f64, _is_buy: bool) {
+        // Future: aggregate BTC trade flow for stress detection.
+        // Currently BTC vol stress is tracked via price returns in BtcBetaTracker.
+    }
+
+    /// Update BTC beta paired observation with current HYPE mid.
+    /// Call once per quote cycle, before `get_signals()`.
+    /// Returns the BTC-implied fair-value shift in bps.
+    pub fn update_btc_beta(&mut self, hype_mid: f64, timestamp_ms: u64) -> f64 {
+        self.btc_beta.on_hype_price(hype_mid, timestamp_ms)
+    }
+
+    /// BTC vol stress ratio for spread widening. 1.0 = normal, >2.0 = stress.
+    pub fn btc_vol_stress_ratio(&self) -> f64 {
+        self.btc_beta.btc_vol_stress_ratio()
     }
 
     /// Update HL flow features from existing estimators.
@@ -1094,7 +1383,17 @@ impl SignalIntegrator {
             }
         }
 
-        let total_excess_uncapped = informed_excess + gating_excess + cross_venue_excess;
+        // BTC vol stress spread widening: stress_ratio > 1.5 → start widening
+        let btc_stress_excess = if self.btc_beta.is_warmed_up() {
+            let stress = self.btc_beta.btc_vol_stress_ratio();
+            // Ramp: 0 at stress≤1.5, linear up to 0.5 (50% widening) at stress=3.0
+            ((stress - 1.5) / 3.0).clamp(0.0, 0.5)
+        } else {
+            0.0
+        };
+
+        let total_excess_uncapped =
+            informed_excess + gating_excess + cross_venue_excess + btc_stress_excess;
         // Cap expressed as multiplier excess: max_spread_adjustment_bps / reference 10 bps
         let max_excess = self.config.max_spread_adjustment_bps / 10.0;
         let total_excess = total_excess_uncapped.clamp(-0.1, max_excess);
@@ -1203,13 +1502,51 @@ impl SignalIntegrator {
             0.0
         };
 
-        // Skew sources: base (cross-exchange) + cross-venue + buy pressure + inventory + signal
+        // === HL PERP BASIS SKEW: Perp premium/discount → directional drift ===
+        // Positive basis (perp premium) → expect spot to rise → lean bids.
+        // Scale: 1 bps basis → 0.5 bps skew (conservative).
+        let perp_basis_skew_bps = self.hl_perp_basis_bps * 0.5;
+
+        // === FUNDING SETTLEMENT DRIFT: Proximity-weighted funding rate pressure ===
+        // Positive funding → longs pay shorts → selling pressure near settlement.
+        let funding_settlement_drift_bps = self.compute_funding_settlement_drift_bps();
+        signals.funding_settlement_drift_bps = funding_settlement_drift_bps;
+
+        // === BTC BETA SYSTEMATIC RISK: Cross-asset fair-value shift ===
+        // When BTC moves, HYPE expected move = β × Δ_BTC. Applied as skew.
+        // BTC vol stress widens spreads (crypto-wide risk-off).
+        let btc_beta_skew_bps = if self.btc_beta.is_warmed_up() {
+            let beta = self.btc_beta.beta().unwrap_or(0.0);
+            // Use latest BTC return implied shift (computed in update_btc_beta)
+            // Stored as cross_asset fields for observability
+            let btc_ret_bps =
+                if self.btc_beta.prev_btc_mid > 0.0 && self.btc_beta.curr_btc_mid > 0.0 {
+                    (self.btc_beta.curr_btc_mid / self.btc_beta.prev_btc_mid).ln() * 10_000.0
+                } else {
+                    0.0
+                };
+            let shift = beta * btc_ret_bps;
+            // Populate cross-asset signal fields
+            signals.cross_asset_expected_move_bps = shift;
+            signals.cross_asset_confidence = (self.btc_beta.n_obs as f64 / 200.0).min(1.0);
+            signals.cross_asset_vol_mult = self.btc_beta.btc_vol_stress_ratio();
+            // Clamp BTC-implied skew to ±10 bps (prevent runaway in flash crashes)
+            shift.clamp(-10.0, 10.0)
+        } else {
+            0.0
+        };
+
+        // Skew sources: base (cross-exchange) + cross-venue + buy pressure + inventory
+        //             + signal + perp basis + funding settlement drift + btc beta
         // Inventory skew re-enabled as fast-acting Avellaneda-Stoikov nudge (capped at 4 bps).
         let raw_skew = base_skew_bps
             + cross_venue_skew_bps
             + buy_pressure_skew_bps
             + inventory_skew_bps
-            + signal_skew_bps;
+            + signal_skew_bps
+            + perp_basis_skew_bps
+            + funding_settlement_drift_bps
+            + btc_beta_skew_bps;
 
         // Clamp combined skew to prevent quote crossing: max 80% of half-spread
         let max_skew_bps =
@@ -1286,6 +1623,51 @@ impl SignalIntegrator {
 
         // Final clamp: ensure all additive skew components combined don't exceed safe bounds
         signals.combined_skew_bps = signals.combined_skew_bps.clamp(-max_skew_bps, max_skew_bps);
+
+        // === Signal Conflict Detection ===
+        // When directional signals strongly disagree, widen spreads defensively.
+        // Collect directional z-scores from all active signal sources.
+        {
+            let mut signal_zs: Vec<f64> = Vec::with_capacity(4);
+
+            // Lead-lag direction (normalize to z-score-like units: bps / reference)
+            if signals.lead_lag_actionable && signals.lead_lag_skew_bps.abs() > 0.1 {
+                signal_zs.push(signals.lead_lag_skew_bps * signals.skew_direction as f64);
+            }
+            // Cross-venue direction
+            if signals.cross_venue_valid {
+                signal_zs.push(signals.cross_venue_direction * 3.0); // Scale to comparable range
+            }
+            // Buy pressure z-score
+            if signals.buy_pressure_z.abs() > 0.5 {
+                signal_zs.push(signals.buy_pressure_z);
+            }
+            // Inventory skew direction (opposite to position)
+            if self.max_position > 0.0 && self.position.abs() > self.max_position * 0.1 {
+                let inv_z = -(self.position / self.max_position) * 3.0;
+                signal_zs.push(inv_z);
+            }
+
+            if signal_zs.len() >= 2 {
+                let max_z = signal_zs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let min_z = signal_zs.iter().cloned().fold(f64::INFINITY, f64::min);
+                let disagreement = max_z - min_z;
+
+                if disagreement > 4.0 {
+                    signals.signal_conflict_detected = true;
+                    // Penalty = 2.0 × excess disagreement above threshold
+                    signals.signal_conflict_penalty_bps = 2.0 * (disagreement - 4.0);
+                    // Add penalty to spread multiplier
+                    signals.signal_risk_premium_bps += signals.signal_conflict_penalty_bps;
+                    tracing::warn!(
+                        disagreement = %format!("{disagreement:.1}"),
+                        penalty_bps = %format!("{:.1}", signals.signal_conflict_penalty_bps),
+                        signals = ?signal_zs,
+                        "SIGNAL CONFLICT: strongly opposing signals — widening spreads"
+                    );
+                }
+            }
+        }
 
         // === Build per-signal contribution record for attribution ===
         let vpin_active = self.config.use_vpin_toxicity
@@ -2339,5 +2721,70 @@ mod tests {
                 max_reduction_after_secs: 300.0,
             });
         assert!((integrator.signal_position_limit_mult() - 1.0).abs() < f64::EPSILON);
+    }
+
+    // =========================================================================
+    // BTC Beta Tracker Tests
+    // =========================================================================
+
+    #[test]
+    fn test_btc_beta_not_warmed_up_returns_none() {
+        let tracker = BtcBetaTracker::default();
+        assert!(!tracker.is_warmed_up());
+        assert!(tracker.beta().is_none());
+    }
+
+    #[test]
+    fn test_btc_beta_warmup() {
+        let mut tracker = BtcBetaTracker::default();
+        // Feed 50 paired observations (min_obs = 50)
+        let mut btc_price = 60000.0;
+        let mut hype_price = 20.0;
+        tracker.on_btc_price(btc_price, 1000);
+        // First call seeds previous prices
+        tracker.on_hype_price(hype_price, 1000);
+
+        for i in 1..=55 {
+            btc_price *= 1.0001; // 1 bps BTC move
+            hype_price *= 1.0002; // 2 bps HYPE move (beta ~2)
+            let ts = 1000 + i * 5000; // 5s intervals
+            tracker.on_btc_price(btc_price, ts);
+            tracker.on_hype_price(hype_price, ts);
+        }
+
+        assert!(tracker.is_warmed_up());
+        let beta = tracker.beta().expect("should have beta after warmup");
+        // Beta should be approximately 2.0 (HYPE moves 2x BTC)
+        assert!(beta > 1.0 && beta < 4.0, "beta={beta} should be ~2.0");
+    }
+
+    #[test]
+    fn test_btc_beta_stale_data_skipped() {
+        let mut tracker = BtcBetaTracker::default();
+        // BTC price at t=0
+        tracker.on_btc_price(60000.0, 0);
+        tracker.on_hype_price(20.0, 0);
+        // HYPE price at t=60s (BTC data is 60s old > 30s threshold)
+        let shift = tracker.on_hype_price(20.01, 60_000);
+        assert_eq!(shift, 0.0, "should skip stale BTC data");
+    }
+
+    #[test]
+    fn test_btc_vol_stress_ratio_default() {
+        let tracker = BtcBetaTracker::default();
+        assert!((tracker.btc_vol_stress_ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_btc_beta_integrator_wiring() {
+        let mut integrator = SignalIntegrator::default_config();
+        // Feed BTC price
+        integrator.on_btc_price(60000.0, 1000);
+        // Update BTC beta with HYPE mid
+        let shift = integrator.update_btc_beta(20.0, 1000);
+        // Not warmed up yet, should be 0
+        assert_eq!(shift, 0.0);
+        // Vol stress should be 1.0 (default)
+        assert!((integrator.btc_vol_stress_ratio() - 1.0).abs() < f64::EPSILON);
     }
 }

@@ -908,24 +908,44 @@ impl PrometheusMetrics {
         };
         let mut state = self.dashboard.snapshot(&params);
 
-        // Populate BayesianPipelineState from available metrics
+        // Populate BayesianPipelineState from atomic pipeline metrics
+        let drift_bps_s = self.inner.pipeline_drift_bps_s.load();
+        let risk_premium_bps = self.inner.pipeline_risk_premium_bps.load();
+        let bid_depth_bps = self.inner.pipeline_bid_depth_bps.load();
+        let ask_depth_bps = self.inner.pipeline_ask_depth_bps.load();
+        let max_size = self.inner.pipeline_max_size.load();
+        let max_pos = self.inner.max_position.load();
+        let pos = self.inner.position.load().abs();
+        let margin_util = if max_pos > 0.0 {
+            (pos / max_pos * 100.0).min(100.0)
+        } else {
+            0.0
+        };
         state.pipeline = super::dashboard::BayesianPipelineState {
             data_age_ms: self.inner.data_staleness_secs.load() as u64 * 1000,
-            drift_bps_s: 0.0,
+            drift_bps_s,
             sigma_pct: sigma * 100.0,
             toxicity: self.inner.toxicity_score.load(),
             microprice: mid_price,
-            drift_bps: 0.0,
+            drift_bps: drift_bps_s, // Instantaneous drift rate
             reservation_price: mid_price,
             glft_spread_bps: spread_bps,
-            risk_premium_bps: 0.0,
-            total_spread_bps: spread_bps,
-            bid_depth_bps: spread_bps / 2.0,
-            ask_depth_bps: spread_bps / 2.0,
-            depth_skew_bps: 0.0,
+            risk_premium_bps,
+            total_spread_bps: spread_bps + risk_premium_bps,
+            bid_depth_bps: if bid_depth_bps > 0.0 {
+                bid_depth_bps
+            } else {
+                spread_bps / 2.0
+            },
+            ask_depth_bps: if ask_depth_bps > 0.0 {
+                ask_depth_bps
+            } else {
+                spread_bps / 2.0
+            },
+            depth_skew_bps: self.inner.pipeline_depth_skew_bps.load(),
             kelly_fraction: self.inner.kelly_fraction.load(),
-            max_size: 0.0,
-            margin_utilization_pct: 0.0,
+            max_size,
+            margin_utilization_pct: margin_util,
             bid_levels: 0,
             ask_levels: 0,
         };

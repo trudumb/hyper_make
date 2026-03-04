@@ -75,6 +75,7 @@ pub mod beliefs;
 pub mod conjugate;
 pub mod continuation;
 pub mod hjb_solver;
+pub mod stability;
 
 // Re-export key types
 pub use beliefs::{BeliefSummary, MarketBeliefs, Regime};

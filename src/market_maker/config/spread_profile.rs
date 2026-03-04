@@ -48,8 +48,8 @@ impl SpreadProfile {
     pub fn profile_min_half_spread_bps(&self) -> f64 {
         match self {
             Self::Default => 0.0,    // No profile floor for liquid perps
-            Self::Hip3 => 7.5,       // 15 bps total minimum for HIP-3
-            Self::Aggressive => 5.0, // 10 bps total minimum
+            Self::Hip3 => 2.0,       // 4 bps total floor — fee+tick only, let GLFT decide
+            Self::Aggressive => 1.5, // 3 bps total floor — fee minimum
         }
     }
 }
@@ -61,8 +61,8 @@ mod tests {
     #[test]
     fn test_profile_min_half_spread_per_type() {
         assert_eq!(SpreadProfile::Default.profile_min_half_spread_bps(), 0.0);
-        assert_eq!(SpreadProfile::Hip3.profile_min_half_spread_bps(), 7.5);
-        assert_eq!(SpreadProfile::Aggressive.profile_min_half_spread_bps(), 5.0);
+        assert_eq!(SpreadProfile::Hip3.profile_min_half_spread_bps(), 2.0);
+        assert_eq!(SpreadProfile::Aggressive.profile_min_half_spread_bps(), 1.5);
     }
 
     #[test]

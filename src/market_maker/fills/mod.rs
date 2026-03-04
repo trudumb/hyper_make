@@ -71,6 +71,10 @@ pub struct PendingFillOutcome {
     pub quoted_spread_bps: f64,
     /// Predicted AS at fill time (stored for temporal calibration correctness)
     pub predicted_as_bps: f64,
+    /// Gamma calibrator features and gamma from the quote cycle active at fill time.
+    /// Stored here so markout resolution (5s later) uses temporally-correct features,
+    /// not the current cycle's stale `last_gamma_cache`.
+    pub gamma_cache: Option<([f64; 15], f64)>,
 }
 
 /// A unified fill event containing all data needed by modules.
@@ -347,6 +351,7 @@ mod tests {
             mid_at_placement: 49_998.0,
             quoted_spread_bps: 0.4,
             predicted_as_bps: 2.5,
+            gamma_cache: None,
         };
         assert!(outcome.is_buy);
         assert!((outcome.fill_price - 50_000.0).abs() < f64::EPSILON);
@@ -373,6 +378,7 @@ mod tests {
                 mid_at_placement: 0.0,
                 quoted_spread_bps: 0.0,
                 predicted_as_bps: 0.0,
+                gamma_cache: None,
             });
         }
         assert_eq!(queue.len(), 3);

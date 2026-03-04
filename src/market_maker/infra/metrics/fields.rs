@@ -229,6 +229,20 @@ pub(super) struct MetricsInner {
     /// Full cycles skipped due to insufficient budget
     pub impulse_budget_skipped: AtomicU64,
 
+    // === Bayesian Pipeline Metrics ===
+    /// Drift rate in bps/second from Kalman posterior
+    pub pipeline_drift_bps_s: AtomicF64,
+    /// Total risk premium from all sources in bps
+    pub pipeline_risk_premium_bps: AtomicF64,
+    /// Best bid depth from mid in bps
+    pub pipeline_bid_depth_bps: AtomicF64,
+    /// Best ask depth from mid in bps
+    pub pipeline_ask_depth_bps: AtomicF64,
+    /// Depth skew (bid - ask) in bps
+    pub pipeline_depth_skew_bps: AtomicF64,
+    /// Dynamic max position size
+    pub pipeline_max_size: AtomicF64,
+
     /// Start time for uptime calculation
     pub start_time: Instant,
 }
@@ -338,6 +352,13 @@ impl MetricsInner {
             impulse_filter_blocked: AtomicU64::new(0),
             impulse_queue_locked: AtomicU64::new(0),
             impulse_budget_skipped: AtomicU64::new(0),
+            // Bayesian Pipeline defaults
+            pipeline_drift_bps_s: AtomicF64::new(0.0),
+            pipeline_risk_premium_bps: AtomicF64::new(0.0),
+            pipeline_bid_depth_bps: AtomicF64::new(0.0),
+            pipeline_ask_depth_bps: AtomicF64::new(0.0),
+            pipeline_depth_skew_bps: AtomicF64::new(0.0),
+            pipeline_max_size: AtomicF64::new(0.0),
             start_time: Instant::now(),
         }
     }

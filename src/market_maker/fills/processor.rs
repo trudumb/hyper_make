@@ -1070,9 +1070,11 @@ impl FillProcessor {
 
         // Record P&L attribution for dashboard breakdown
         // Note: adverse_selection and fees are typically negative values
+        let inv_carry = state.pnl_tracker.calculate_inventory_carry();
         state.prometheus.record_pnl_attribution(
             pnl_summary.spread_capture,
             -pnl_summary.adverse_selection, // Convert to negative (it's tracked as positive loss)
+            inv_carry,                      // Inventory carry P&L from snapshot tracking
             -pnl_summary.fees,              // Convert to negative (fees are costs)
         );
 

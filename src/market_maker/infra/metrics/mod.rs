@@ -120,10 +120,11 @@ impl PrometheusMetrics {
     /// Accumulates the components of P&L for dashboard display:
     /// - spread: Revenue from capturing bid-ask spread
     /// - adverse: Loss from adverse selection (negative value expected)
+    /// - inv_cost: P&L from inventory carry (positive = gained, negative = lost)
     /// - fees: Exchange fees paid (negative value expected)
-    pub fn record_pnl_attribution(&self, spread: f64, adverse: f64, fees: f64) {
+    pub fn record_pnl_attribution(&self, spread: f64, adverse: f64, inv_cost: f64, fees: f64) {
         self.dashboard
-            .record_pnl_attribution(spread, adverse, 0.0, fees);
+            .record_pnl_attribution(spread, adverse, inv_cost, fees);
     }
 }
 

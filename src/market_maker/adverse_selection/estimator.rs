@@ -7,7 +7,67 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use serde::{Deserialize, Serialize};
+
 use super::AdverseSelectionConfig;
+
+fn default_bb_alpha() -> f64 {
+    1.0
+}
+fn default_bb_beta() -> f64 {
+    9.0
+}
+
+/// Beta-Binomial Bayesian classifier for fill toxicity.
+/// P(toxic) ~ Beta(alpha, beta) with conjugate updating.
+/// Prior: alpha=1, beta=9 -> 10% toxic base rate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BetaBinomialClassifier {
+    #[serde(default = "default_bb_alpha")]
+    alpha: f64,
+    #[serde(default = "default_bb_beta")]
+    beta: f64,
+    #[serde(default)]
+    n_observations: u64,
+}
+
+impl Default for BetaBinomialClassifier {
+    fn default() -> Self {
+        Self {
+            alpha: 1.0,
+            beta: 9.0,
+            n_observations: 0,
+        }
+    }
+}
+
+impl BetaBinomialClassifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, is_toxic: bool) {
+        if is_toxic {
+            self.alpha += 1.0;
+        } else {
+            self.beta += 1.0;
+        }
+        self.n_observations += 1;
+    }
+
+    pub fn p_toxic(&self) -> f64 {
+        self.alpha / (self.alpha + self.beta)
+    }
+
+    pub fn uncertainty(&self) -> f64 {
+        let ab = self.alpha + self.beta;
+        (self.alpha * self.beta / (ab * ab * (ab + 1.0))).sqrt()
+    }
+
+    pub fn is_warmed_up(&self) -> bool {
+        self.n_observations >= 15
+    }
+}
 
 /// A fill waiting for price resolution to measure adverse selection.
 #[derive(Debug, Clone)]
@@ -146,6 +206,11 @@ pub struct AdverseSelectionEstimator {
     /// Latest EM-derived P(informed) and its confidence from the Hawkes GMM.
     /// Used to probabilistically override the heuristic alpha weights in `predicted_alpha()`.
     gmm_alpha_signal: Option<(f64, f64)>, // (p_informed, confidence)
+
+    // === Beta-Binomial Bayesian Classifier ===
+    /// Conjugate Bayesian classifier for fill toxicity.
+    /// Replaces frequentist empirical_alpha_touch once warmed up (>= 15 observations).
+    bb_classifier: BetaBinomialClassifier,
 }
 
 impl AdverseSelectionEstimator {
@@ -180,6 +245,7 @@ impl AdverseSelectionEstimator {
             informed_sell_count: 0,
             uninformed_sell_count: 0,
             gmm_alpha_signal: None,
+            bb_classifier: BetaBinomialClassifier::new(),
         }
     }
 
@@ -299,7 +365,9 @@ impl AdverseSelectionEstimator {
             // Classify fill as informed/uninformed for parameter learning
             // signed_as is in fractional form, threshold is in bps (1 bp = 0.0001)
             let adverse_move_bps = signed_as.abs() * 10000.0;
-            if adverse_move_bps > self.informed_threshold_bps {
+            let is_toxic = adverse_move_bps > self.informed_threshold_bps;
+            self.bb_classifier.update(is_toxic);
+            if is_toxic {
                 self.informed_fills_count += 1;
                 // Glosten-Milgrom: Track informed jump magnitude (fractional)
                 const GM_ALPHA: f64 = 0.1;
@@ -693,14 +761,26 @@ impl AdverseSelectionEstimator {
     }
 
     /// Get the empirical alpha_touch = P(informed | fill).
+    ///
+    /// Uses Beta-Binomial posterior when warmed up (>= 15 observations),
+    /// which provides a smoother estimate with proper uncertainty quantification.
+    /// Falls back to frequentist ratio when BB classifier is cold.
     /// Returns None if no fills have been classified yet.
     pub fn empirical_alpha_touch(&self) -> Option<f64> {
+        if self.bb_classifier.is_warmed_up() {
+            return Some(self.bb_classifier.p_toxic());
+        }
         let total = self.total_classified_fills();
         if total == 0 {
             None
         } else {
             Some(self.informed_fills_count as f64 / total as f64)
         }
+    }
+
+    /// Get the Beta-Binomial classifier (for diagnostics / calibration metrics).
+    pub fn bb_classifier(&self) -> &BetaBinomialClassifier {
+        &self.bb_classifier
     }
 
     /// Empirical P(informed | buy fill) from per-side classification.
@@ -1205,6 +1285,103 @@ mod tests {
         assert!(
             (low_conf_alpha - baseline_alpha).abs() < (gmm_alpha - baseline_alpha).abs(),
             "Low confidence should stay closer to baseline"
+        );
+    }
+
+    // === Beta-Binomial Classifier Tests ===
+
+    #[test]
+    fn test_bb_classifier_prior() {
+        let bb = BetaBinomialClassifier::new();
+        assert!(
+            (bb.p_toxic() - 0.1).abs() < 0.01,
+            "Prior p_toxic should be ~0.1, got {}",
+            bb.p_toxic()
+        );
+        assert!(!bb.is_warmed_up());
+    }
+
+    #[test]
+    fn test_bb_classifier_convergence() {
+        let mut bb = BetaBinomialClassifier::new();
+        for i in 0..100 {
+            bb.update(i % 3 == 0);
+        }
+        // 34 toxic out of 100 + prior (alpha=1, beta=9)
+        // posterior: alpha=35, beta=75 -> p_toxic = 35/110 ~ 0.318
+        assert!(
+            (bb.p_toxic() - 0.33).abs() < 0.05,
+            "After 100 obs with 1/3 toxic, p_toxic should be ~0.33, got {}",
+            bb.p_toxic()
+        );
+        assert!(bb.is_warmed_up());
+    }
+
+    #[test]
+    fn test_bb_classifier_uncertainty_decreases() {
+        let mut bb = BetaBinomialClassifier::new();
+        let initial_uncertainty = bb.uncertainty();
+        for _ in 0..50 {
+            bb.update(false);
+        }
+        let final_uncertainty = bb.uncertainty();
+        assert!(
+            final_uncertainty < initial_uncertainty,
+            "Uncertainty should decrease with observations: initial={initial_uncertainty}, final={final_uncertainty}"
+        );
+    }
+
+    #[test]
+    fn test_bb_classifier_wired_to_estimator() {
+        let mut est = make_estimator();
+
+        // Record an informed fill (> 5 bps threshold)
+        est.record_fill(1, 1.0, true, 100.0);
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        est.update(99.9); // 10 bps adverse -> toxic
+
+        // Record an uninformed fill (< 5 bps threshold)
+        est.record_fill(2, 1.0, true, 100.0);
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        est.update(99.98); // 2 bps adverse -> not toxic
+
+        // BB classifier should have received both observations
+        let bb = est.bb_classifier();
+        assert_eq!(bb.n_observations, 2);
+        // Prior alpha=1 + 1 toxic = 2, beta=9 + 1 not toxic = 10
+        // p_toxic = 2/12 ~ 0.167
+        assert!(
+            bb.p_toxic() > 0.1,
+            "p_toxic should increase from prior after toxic fill"
+        );
+    }
+
+    #[test]
+    fn test_empirical_alpha_uses_bb_when_warmed() {
+        let mut est = make_estimator();
+
+        // Feed 15+ fills to warm up BB classifier
+        for i in 0..20 {
+            est.record_fill(i as u64, 1.0, true, 100.0);
+            std::thread::sleep(TEST_HORIZON_SLEEP);
+            if i % 2 == 0 {
+                est.update(99.9); // 10 bps -> informed/toxic
+            } else {
+                est.update(99.98); // 2 bps -> uninformed/not toxic
+            }
+        }
+
+        assert!(
+            est.bb_classifier().is_warmed_up(),
+            "BB classifier should be warmed up after 20 fills"
+        );
+
+        // empirical_alpha_touch should now return BB posterior
+        let alpha = est.empirical_alpha_touch().unwrap();
+        let bb_p = est.bb_classifier().p_toxic();
+        assert!(
+            (alpha - bb_p).abs() < 1e-10,
+            "empirical_alpha_touch should use BB posterior: alpha={alpha}, bb_p={bb_p}"
         );
     }
 

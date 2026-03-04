@@ -947,7 +947,14 @@ impl GLFTStrategy {
         // WS2: sigma_cascade_mult removed — CovarianceTracker's Bayesian posterior
         // handles realized vol feedback. sigma_effective is used directly.
         let sigma = market_params.sigma_effective;
-        let tau = self.holding_time(market_params.arrival_intensity);
+        // Use measured tau EWMA when available for more accurate spread decomposition
+        let tau = if market_params.tau_inventory_s > 1.0 {
+            // Blend measured with theoretical (70/30)
+            let theoretical = self.holding_time(market_params.arrival_intensity);
+            0.7 * market_params.tau_inventory_s + 0.3 * theoretical
+        } else {
+            self.holding_time(market_params.arrival_intensity)
+        };
 
         // Core GLFT half-spread in fraction
         let glft_half_frac = self.half_spread(gamma, kappa, sigma, tau);
@@ -1736,7 +1743,29 @@ impl QuotingStrategy for GLFTStrategy {
         // - drift_urgency: First-principles urgency from HJB when position opposes momentum
         // - hawkes_skew: Hawkes flow-based directional adjustment
         // - funding_skew: Perpetual funding cost pressure
-        let skew = base_skew + drift_urgency + hawkes_skew + funding_skew;
+        // === Cold-start inventory penalty ===
+        // When edge_uncertainty is high (cold-start, no fills yet), apply additional
+        // skew against inventory direction. Decays naturally as edge_uncertainty drops.
+        // At 50% utilization + max uncertainty (0.5): penalty = 3.0 * 0.5 * 0.5 = 0.75 bps
+        const COLD_START_INVENTORY_PENALTY_BPS: f64 = 3.0;
+        let cold_start_skew = if market_params.edge_uncertainty > 0.3 {
+            let inv_ratio = (position / effective_max_position).abs().min(1.0);
+            let penalty_bps =
+                COLD_START_INVENTORY_PENALTY_BPS * inv_ratio * market_params.edge_uncertainty;
+            let penalty_frac = penalty_bps * 1e-4;
+            // Positive skew = lower prices = favor selling (same convention as PPIP base_skew)
+            if position > 0.0 {
+                penalty_frac // Positive skew → lower prices → favor selling
+            } else if position < 0.0 {
+                -penalty_frac // Negative skew → higher prices → favor buying
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let skew = base_skew + drift_urgency + hawkes_skew + funding_skew + cold_start_skew;
 
         // Diagnostic logging: track inventory skew magnitude for calibration verification.
         // Expected: 50% utilization → 3-8 bps, 80% → 8-15 bps.

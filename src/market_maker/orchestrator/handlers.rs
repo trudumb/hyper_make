@@ -14,7 +14,10 @@ use super::super::{
     environment::TradingEnvironment,
     estimator::{HmmObservation, MarketEstimator},
     fills,
-    infra::{BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate},
+    infra::{
+        BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate, HlPerpPriceUpdate,
+        HlPerpTradeUpdate, HlPerpUpdate,
+    },
     messages,
     tracking::ws_order_state::WsFillEvent,
     tracking::ws_order_state::WsOrderUpdateEvent,
@@ -551,19 +554,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                 // === Online Bayesian Gamma Calibration ===
                 // Feed fill outcome to RLS calibrator for beta coefficient learning.
-                // Uses cached features/gamma from most recent quote cycle (~5s ago).
-                if let Some((features, gamma_used)) = self.stochastic.last_gamma_cache {
+                // Uses features/gamma captured at fill time (not current cycle's stale cache).
+                if let Some((features, gamma_used)) = pending.gamma_cache {
                     self.stochastic
                         .gamma_calibrator
                         .update(&features, gamma_used, fill_pnl_bps);
-                    // Periodically apply calibrated betas to the risk model
-                    // (every 50 fills, after warmup)
+                    // Apply calibrated betas to the risk model every 10 fills.
+                    // With min_samples=20, calibrator starts influencing gamma early.
                     if self.stochastic.gamma_calibrator.is_warmed_up()
                         && self
                             .stochastic
                             .gamma_calibrator
                             .n_samples
-                            .is_multiple_of(50)
+                            .is_multiple_of(10)
                     {
                         let calibrated = self.stochastic.gamma_calibrator.effective_betas();
                         self.strategy.apply_calibrated_gamma_betas(&calibrated);
@@ -1317,6 +1320,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         mid_at_placement,
                         quoted_spread_bps,
                         predicted_as_bps: self.estimator.total_as_bps(),
+                        // Capture gamma features at fill time — not at markout time (5s later)
+                        // when last_gamma_cache would contain stale current-cycle features.
+                        gamma_cache: self.stochastic.last_gamma_cache,
                     },
                 );
 
@@ -2630,11 +2636,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
     /// Handle Binance price update for lead-lag signal.
     ///
-    /// This feeds Binance mid prices to the SignalIntegrator, which computes
-    /// optimal skew based on cross-exchange price discovery (Binance leads Hyperliquid).
+    /// Returns `true` if the Binance divergence is large enough to trigger an
+    /// immediate requote. This is the primary alpha extraction mechanism:
+    /// Binance leads Hyperliquid by 50-500ms, so when Binance moves significantly
+    /// we adjust our quotes BEFORE the HL book catches up.
     ///
     /// Called from the event loop when Binance feed is enabled.
-    pub(crate) fn handle_binance_price_update(&mut self, update: BinancePriceUpdate) {
+    pub(crate) fn handle_binance_price_update(&mut self, update: BinancePriceUpdate) -> bool {
         // Feed Binance price to SignalIntegrator
         self.stochastic
             .signal_integrator
@@ -2647,6 +2655,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .update_btc_return(update.timestamp_ms as u64, return_bps);
         }
         self.last_binance_mid = update.mid_price;
+
+        // === BINANCE-TRIGGERED REQUOTE ===
+        // When Binance diverges from HL mid by more than 2bps, we have alpha:
+        // our fair value estimate is better than the HL book's current mid.
+        // Trigger immediate requote to exploit the lead time.
+        let should_requote = if self.latest_mid > 0.0 && update.mid_price > 0.0 {
+            let divergence_bps = ((update.mid_price / self.latest_mid) - 1.0).abs() * 10_000.0;
+            // 2bps threshold: below this, the signal is noise. Above, it's alpha.
+            // This threshold should be > fee (1.5bps) to ensure profitable re-quoting.
+            divergence_bps > 2.0
+        } else {
+            false
+        };
 
         // Log periodically (every 1000 updates ≈ every 10 seconds at 100 updates/sec)
         static BINANCE_UPDATE_COUNTER: std::sync::atomic::AtomicU64 =
@@ -2672,6 +2693,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 );
             }
         }
+
+        should_requote
     }
 
     /// Handle Binance trade update for cross-venue flow analysis.
@@ -2708,14 +2731,113 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     ///
     /// This is the main entry point for all Binance feed updates.
     /// Routes to the appropriate handler based on update type.
-    pub(crate) fn handle_binance_update(&mut self, update: BinanceUpdate) {
+    /// Returns true if a Binance price divergence triggered a requote signal.
+    pub(crate) fn handle_binance_update(&mut self, update: BinanceUpdate) -> bool {
         match update {
-            BinanceUpdate::Price(price_update) => {
-                self.handle_binance_price_update(price_update);
-            }
+            BinanceUpdate::Price(price_update) => self.handle_binance_price_update(price_update),
             BinanceUpdate::Trade(trade_update) => {
                 self.handle_binance_trade(trade_update);
+                false
             }
         }
+    }
+
+    // =========================================================================
+    // HL Perp Feed Handlers (HIP-3 Lead-Lag)
+    // =========================================================================
+
+    /// Handle HL perp price update — perp-spot basis signal for HIP-3.
+    ///
+    /// Computes perp-spot basis (premium/discount in bps) and feeds it
+    /// as a directional drift signal. Perp premium → buying pressure coming.
+    pub(crate) fn handle_hl_perp_price_update(&mut self, update: HlPerpPriceUpdate) {
+        // Compute perp-spot basis (directional signal)
+        if self.latest_mid > 0.0 && update.mid_price > 0.0 {
+            let basis_bps = (update.mid_price / self.latest_mid - 1.0) * 10_000.0;
+
+            // Feed perp-spot basis to signal integrator as drift adjustment.
+            // Positive basis (perp premium) → expects upward price movement on spot.
+            // Capped at ±50 bps to prevent outlier basis from dominating.
+            let capped_basis_bps = basis_bps.clamp(-50.0, 50.0);
+            self.stochastic
+                .signal_integrator
+                .on_hl_perp_basis(capped_basis_bps, update.timestamp_ms);
+        }
+
+        self.last_hl_perp_mid = update.mid_price;
+
+        // Log periodically
+        static HL_PERP_UPDATE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let count = HL_PERP_UPDATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if count.is_multiple_of(1000) && self.latest_mid > 0.0 {
+            let basis_bps = (update.mid_price / self.latest_mid - 1.0) * 10_000.0;
+            trace!(
+                perp_mid = %format!("{:.4}", update.mid_price),
+                spot_mid = %format!("{:.4}", self.latest_mid),
+                basis_bps = %format!("{:.2}", basis_bps),
+                perp_spread_bps = %format!("{:.2}", update.spread_bps),
+                "HL perp-spot basis"
+            );
+        }
+    }
+
+    /// Handle HL perp trade update for flow analysis.
+    pub(crate) fn handle_hl_perp_trade(&mut self, trade: HlPerpTradeUpdate) {
+        // Feed perp trade flow to signal integrator
+        let signed_size = if trade.is_buy {
+            trade.size
+        } else {
+            -trade.size
+        };
+        self.stochastic.signal_integrator.on_hl_perp_trade_flow(
+            signed_size,
+            trade.price,
+            trade.timestamp_ms,
+        );
+    }
+
+    /// Handle a unified HL perp update (price or trade).
+    ///
+    /// Dispatches based on coin: BTC updates go to the BTC beta tracker
+    /// for systematic risk, while asset perp updates go to the existing
+    /// perp-spot basis signal.
+    pub(crate) fn handle_hl_perp_update(&mut self, update: HlPerpUpdate) {
+        match update {
+            HlPerpUpdate::Price(ref price_update) if price_update.coin == "BTC" => {
+                self.handle_btc_price_update(price_update);
+            }
+            HlPerpUpdate::Price(price_update) => {
+                self.handle_hl_perp_price_update(price_update);
+            }
+            HlPerpUpdate::Trade(ref trade_update) if trade_update.coin == "BTC" => {
+                // BTC trades: feed to signal integrator for BTC flow analysis
+                self.stochastic.signal_integrator.on_btc_trade(
+                    trade_update.price,
+                    trade_update.size,
+                    trade_update.is_buy,
+                );
+            }
+            HlPerpUpdate::Trade(trade_update) => {
+                self.handle_hl_perp_trade(trade_update);
+            }
+        }
+    }
+
+    /// Handle BTC price update for systematic risk factor (beta).
+    ///
+    /// BTC moves lead altcoin (HYPE) moves — when BTC drops 5%, HYPE drops 10-20%.
+    /// Feed BTC mid to signal integrator's BTC beta tracker for fair value shift.
+    fn handle_btc_price_update(&mut self, update: &HlPerpPriceUpdate) {
+        self.stochastic
+            .signal_integrator
+            .on_btc_price(update.mid_price, update.timestamp_ms);
+
+        trace!(
+            btc_mid = %format!("{:.2}", update.mid_price),
+            btc_spread_bps = %format!("{:.2}", update.spread_bps),
+            "BTC price update for beta signal"
+        );
     }
 }

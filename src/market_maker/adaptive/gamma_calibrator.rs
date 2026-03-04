@@ -46,7 +46,7 @@ fn default_lambda() -> f64 {
     0.999
 }
 fn default_min_samples() -> usize {
-    100
+    20 // Start influencing gamma after 20 fills (was 100 — too slow for small accounts)
 }
 fn default_prior_strength() -> f64 {
     0.1

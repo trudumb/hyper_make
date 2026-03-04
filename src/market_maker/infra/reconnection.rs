@@ -36,7 +36,7 @@ impl Default for ReconnectionConfig {
             max_delay: Duration::from_secs(60),
             backoff_multiplier: 2.0,
             jitter_factor: 0.2,
-            max_consecutive_failures: 10,
+            max_consecutive_failures: 0, // Unlimited — kill switch is the safety net
             stale_data_threshold: Duration::from_secs(30),
             health_check_interval: Duration::from_secs(5),
         }

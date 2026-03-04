@@ -8,6 +8,15 @@ fn default_burst_sigma_boost() -> f64 {
 fn default_cascade_cancel_threshold() -> f64 {
     0.8
 }
+fn default_true_flag() -> bool {
+    true
+}
+fn default_strategic_penalty_max_hours() -> f64 {
+    1.0
+}
+fn default_adaptive_tau_measured_weight() -> f64 {
+    0.7
+}
 
 /// Method for calculating Kelly time horizon for first-passage fill probability.
 ///
@@ -452,6 +461,27 @@ pub struct StochasticConfig {
     /// Default: 0.8 (only extreme cascades trigger side-cancel).
     #[serde(default = "default_cascade_cancel_threshold")]
     pub cascade_cancel_threshold: f64,
+
+    // ==================== Adaptive Holding Time (Phase 4.3) ====================
+    /// Enable adaptive holding time based on measured fill intervals.
+    /// When true, tau = blend(measured_tau, theoretical_tau) adjusted for
+    /// inventory urgency and volatility regime.
+    /// Default: true
+    #[serde(default = "default_true_flag")]
+    pub use_adaptive_tau: bool,
+
+    /// Maximum strategic time horizon extension (hours).
+    /// In cascade regimes, inventory penalty tau is extended by up to this amount
+    /// to account for long-horizon liquidation risk.
+    /// Default: 1.0 (1 hour strategic horizon)
+    #[serde(default = "default_strategic_penalty_max_hours")]
+    pub strategic_penalty_max_hours: f64,
+
+    /// Weight of measured tau EWMA vs theoretical 1/λ.
+    /// 0.7 = 70% measured + 30% theoretical (prevents stale EWMA dependence).
+    /// Default: 0.7
+    #[serde(default = "default_adaptive_tau_measured_weight")]
+    pub adaptive_tau_measured_weight: f64,
 }
 
 impl Default for StochasticConfig {
@@ -563,7 +593,7 @@ impl Default for StochasticConfig {
             kappa_baseline: 2500.0,             // Prior for liquid markets
             book_depth_baseline_usd: 100_000.0, // $100k baseline
             min_calibration_samples: 100,
-            calibration_staleness_hours: 4.0,
+            calibration_staleness_hours: 12.0, // Extended for 24h autonomous operation
 
             // Kelly Criterion Sizing
             // DISABLED by default - enable after tracker warmup
@@ -579,12 +609,17 @@ impl Default for StochasticConfig {
             use_learned_parameters: true,
             learned_param_min_observations: 100, // Power analysis: N for IR CI width < 0.2
             learned_param_max_cv: 0.5,           // 50% CV acceptable
-            learned_param_staleness_hours: 4.0,  // Signal decay half-life
+            learned_param_staleness_hours: 24.0, // Extended for 24h autonomous operation
 
             // Phase 2B: Configurable sigma boost (reduced from hardcoded 2.0)
             burst_sigma_boost: 1.5,
             // Phase 2C: Cascade cancel threshold
             cascade_cancel_threshold: 0.8,
+
+            // Adaptive tau (Phase 4.3)
+            use_adaptive_tau: true,
+            strategic_penalty_max_hours: 1.0,
+            adaptive_tau_measured_weight: 0.7,
         }
     }
 }

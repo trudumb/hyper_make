@@ -524,15 +524,30 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
 
                 // Binance feed (optional) - price updates and trades
-                // When enabled, updates SignalIntegrator for cross-exchange skew
-                // and cross-venue flow analysis
+                // When Binance diverges >2bps from HL, trigger immediate requote
+                // to exploit the 50-500ms lead time (primary alpha source)
                 Some(update) = async {
                     match self.binance_receiver.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    self.handle_binance_update(update);
+                    let should_requote = self.handle_binance_update(update);
+                    if should_requote {
+                        if let Err(e) = self.update_quotes().await {
+                            tracing::warn!(error = %e, "Binance-triggered requote failed");
+                        }
+                    }
+                }
+
+                // HL perp feed (optional) - BBO and trades for HIP-3 lead-lag
+                Some(update) = async {
+                    match self.hl_perp_receiver.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_hl_perp_update(update);
                 }
 
                 // Periodic safety sync
@@ -984,14 +999,29 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     }
                 }
 
-                // Binance feed (optional).
+                // Binance feed (optional) — trigger requote on divergence.
                 Some(update) = async {
                     match self.binance_receiver.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    self.handle_binance_update(update);
+                    let should_requote = self.handle_binance_update(update);
+                    if should_requote {
+                        if let Err(e) = self.update_quotes().await {
+                            tracing::warn!(error = %e, "Binance-triggered requote failed (paper)");
+                        }
+                    }
+                }
+
+                // HL perp feed (optional).
+                Some(update) = async {
+                    match self.hl_perp_receiver.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_hl_perp_update(update);
                 }
 
                 // Periodic safety sync + metrics + checkpoint.

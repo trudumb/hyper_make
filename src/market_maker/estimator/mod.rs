@@ -53,6 +53,7 @@ mod mock;
 mod momentum;
 pub mod mutual_info;
 mod parameter_estimator;
+pub mod particle_filter;
 pub mod regime_hmm;
 pub mod regime_kappa;
 mod robust_kappa;

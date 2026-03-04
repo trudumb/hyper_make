@@ -483,4 +483,25 @@ impl PrometheusMetrics {
             .learned_params_calibrated
             .store(if calibrated { 1 } else { 0 }, Ordering::Relaxed);
     }
+
+    /// Update Bayesian pipeline metrics from computed market_params.
+    ///
+    /// Called by quote_engine after building market_params each cycle.
+    pub fn update_pipeline_metrics(
+        &self,
+        drift_bps_s: f64,
+        risk_premium_bps: f64,
+        bid_depth_bps: f64,
+        ask_depth_bps: f64,
+        max_size: f64,
+    ) {
+        self.inner.pipeline_drift_bps_s.store(drift_bps_s);
+        self.inner.pipeline_risk_premium_bps.store(risk_premium_bps);
+        self.inner.pipeline_bid_depth_bps.store(bid_depth_bps);
+        self.inner.pipeline_ask_depth_bps.store(ask_depth_bps);
+        self.inner
+            .pipeline_depth_skew_bps
+            .store(bid_depth_bps - ask_depth_bps);
+        self.inner.pipeline_max_size.store(max_size);
+    }
 }

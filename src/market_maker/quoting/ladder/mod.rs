@@ -118,6 +118,17 @@ pub struct LadderConfig {
     /// Example: max_spread_per_side_bps = 15.0 → never quote wider than 15 bps per side
     #[serde(default)]
     pub max_spread_per_side_bps: f64,
+
+    /// Maximum ratio of our order size to estimated level depth.
+    /// Caps each order to avoid being dominant on any price level,
+    /// which increases adverse selection on thin HIP-3 books.
+    /// Default: 0.30 (never more than 30% of visible depth at a level).
+    #[serde(default = "default_self_impact_ratio")]
+    pub self_impact_max_ratio: f64,
+}
+
+fn default_self_impact_ratio() -> f64 {
+    0.30
 }
 
 impl Default for LadderConfig {
@@ -139,6 +150,7 @@ impl Default for LadderConfig {
             as_decay_bps: 10.0,
             dynamic_depths: None,
             max_spread_per_side_bps: 0.0, // Disabled by default
+            self_impact_max_ratio: default_self_impact_ratio(),
         }
     }
 }
@@ -276,6 +288,7 @@ mod tests {
             as_decay_bps: 10.0,
             dynamic_depths: None,
             max_spread_per_side_bps: 0.0,
+            self_impact_max_ratio: 0.30,
         };
 
         let params = LadderParams {
@@ -398,6 +411,7 @@ mod tests {
             as_decay_bps: 10.0, // Ignored when depth_decay_as is Some
             dynamic_depths: None,
             max_spread_per_side_bps: 0.0,
+            self_impact_max_ratio: 0.30,
         };
 
         // Calibrated AS model with higher AS at touch

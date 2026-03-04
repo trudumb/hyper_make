@@ -291,6 +291,11 @@ pub struct MarketParams {
     /// Is AS estimator warmed up with enough fills?
     pub as_warmed_up: bool,
 
+    /// Realized AS ratio: P(informed | fill) from AdverseSelectionEstimator.
+    /// Normalized [0, 1]: 0 = all fills are noise, 1 = all fills are informed.
+    /// Fed into CalibratedRiskModel as a gamma-increasing feature.
+    pub as_informed_ratio: f64,
+
     /// Depth-dependent AS model (calibrated from fills).
     /// First-principles: AS(δ) = AS₀ × exp(-δ/δ_char)
     /// Used by ladder for depth-aware spread capture.
@@ -1210,9 +1215,10 @@ impl Default for MarketParams {
             as_spread_adjustment: 0.0, // No adjustment until warmed up
             as_spread_adjustment_bid: 0.0,
             as_spread_adjustment_ask: 0.0,
-            predicted_alpha: 0.0, // Default: no informed flow detected
-            as_warmed_up: false,  // Starts not warmed up
-            depth_decay_as: None, // No calibrated model initially
+            predicted_alpha: 0.0,   // Default: no informed flow detected
+            as_warmed_up: false,    // Starts not warmed up
+            as_informed_ratio: 0.0, // No AS data yet
+            depth_decay_as: None,   // No calibrated model initially
             conditional_as_posterior_mean_bps: None, // Learned from fill AS data, not magic number
             // Tier 1: Pre-Fill AS Classifier (Phase 3)
             pre_fill_toxicity_bid: 0.0, // No toxicity initially
@@ -1432,8 +1438,8 @@ impl Default for MarketParams {
             drift_uncertainty_bps: 0.0,
             hysteresis_bid_gamma_mult: 1.0,
             hysteresis_ask_gamma_mult: 1.0,
-            edge_uncertainty: 0.5,    // Maximum ignorance — no data initially
-            calibration_deficit: 0.0, // Assume calibrated until proven otherwise
+            edge_uncertainty: 0.3,     // Mild uncertainty — aggressive start, model learns from fills
+            calibration_deficit: 0.0,  // Assume calibrated until measured (no phantom penalty)
             current_drawdown_frac: 0.0,
             // Capital tier
             capital_tier: CapitalTier::Large,

@@ -13,7 +13,7 @@ use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
 // QuoteGate removed (A4) — replaced by ExecutionMode state machine + E[PnL] filter
 use crate::market_maker::analytics::ToxicityInput;
 use crate::market_maker::config::{CapacityBudget, Viability};
-use crate::market_maker::estimator::EnhancedFlowContext;
+use crate::market_maker::estimator::{EnhancedFlowContext, MarketEstimator};
 use crate::market_maker::infra::metrics::dashboard::{
     classify_regime, compute_regime_probabilities, ChangepointDiagnostics, KappaDiagnostics,
     PnLAttribution, QuoteDecisionRecord, RegimeState, SignalSnapshot,
@@ -849,6 +849,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.tier1
                 .pre_fill_classifier
                 .update_funding(funding_rate_8h);
+            // Wire funding rate to signal integrator for settlement drift computation
+            self.stochastic
+                .signal_integrator
+                .set_funding_rate_8h(funding_rate_8h);
 
             // Trend signal update: feed 5-min EWMA momentum to classifier
             // Kyle (1985) drift conditioning — fills against strong trends are more toxic
@@ -888,8 +892,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         {
             let sigma_clean = self.estimator.sigma_effective();
             let sigma_leverage = sigma_clean * self.covariance_tracker.sigma_correction_factor();
-            // Particle filter sigma (0.0 if not warmed up)
-            let sigma_particle = self.estimator.sigma_effective();
+            // Particle filter sigma posterior (0.0 if not warmed up)
+            let sigma_particle = self.estimator.sigma_particle_filter();
             self.sigma_bma
                 .update_estimates(sigma_clean, sigma_leverage, sigma_particle);
         }
@@ -1130,7 +1134,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // === Fix 2: Wire AS floor from estimator ===
         {
             let as_floor = self.tier1.adverse_selection.as_floor_bps();
-            market_params.as_floor_bps = as_floor.max(self.as_floor_hwm);
+            // AS floor from estimator directly — no HWM ratchet.
+            // HWM was a permanent ratchet that never decayed, causing spreads to
+            // widen permanently after any toxic fill cluster. AS defense now routes
+            // through Glosten-Milgrom kappa reduction in ladder_strat.rs.
+            market_params.as_floor_bps = as_floor;
             // Q19: AS posterior variance for uncertainty premium
             market_params.as_floor_variance_bps2 =
                 self.tier1.adverse_selection.as_floor_variance_bps2();
@@ -1611,21 +1619,43 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .signal_integrator
                 .set_mi_attenuation(factors);
         }
+        // Update BTC beta paired observation before reading signals.
+        // This feeds the HYPE mid into the BtcBetaTracker for rolling β computation.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _btc_fv_shift = self
+            .stochastic
+            .signal_integrator
+            .update_btc_beta(self.latest_mid, now_ms);
+
         let mut signals = self.stochastic.signal_integrator.get_signals();
 
-        // Inject cross-asset signals (Sprint 4.1): BTC lead-lag + funding divergence
+        // Inject cross-asset signals (Sprint 4.1): BTC beta (from signal_integration)
+        // or legacy cross_asset_signals fallback.
+        //
+        // BTC beta tracker (in signal_integration) uses EWMA paired-return covariance
+        // and is preferred when warmed up. Legacy system uses funding-based proxy.
         {
-            let funding_rate = self.tier2.funding.current_rate();
-            let cross_signal = self.cross_asset_signals.aggregate_signal(funding_rate);
-            signals.cross_asset_expected_move_bps = cross_signal.expected_move_bps;
-            signals.cross_asset_confidence = cross_signal.confidence;
-            signals.cross_asset_vol_mult = self.cross_asset_signals.vol_multiplier();
+            let btc_beta_warmed = signals.cross_asset_confidence > 0.0
+                && signals.cross_asset_expected_move_bps != 0.0;
 
-            // Blend cross-asset skew into combined_skew_bps (additive, confidence-gated)
-            // Regime-dependent clamp: cross-asset signal is most valuable during cascades
-            if cross_signal.confidence > 0.3 {
+            if !btc_beta_warmed {
+                // Fallback to legacy cross-asset signals
+                let funding_rate = self.tier2.funding.current_rate();
+                let cross_signal = self.cross_asset_signals.aggregate_signal(funding_rate);
+                signals.cross_asset_expected_move_bps = cross_signal.expected_move_bps;
+                signals.cross_asset_confidence = cross_signal.confidence;
+                signals.cross_asset_vol_mult = self.cross_asset_signals.vol_multiplier();
+            }
+            // Note: when BTC beta IS warmed up, cross_asset fields are already set
+            // in get_signals() from BtcBetaTracker, and btc_beta_skew_bps is in combined_skew_bps.
+
+            // Additional cross-asset skew blending (for legacy path only)
+            if !btc_beta_warmed && signals.cross_asset_confidence > 0.3 {
                 let cross_asset_skew_bps =
-                    cross_signal.expected_move_bps * cross_signal.confidence * 0.5; // 50% weight — conservative blending
+                    signals.cross_asset_expected_move_bps * signals.cross_asset_confidence * 0.5;
                 let cross_asset_clamp = match self.stochastic.regime_state.regime {
                     crate::market_maker::strategy::regime_state::MarketRegime::Calm
                     | crate::market_maker::strategy::regime_state::MarketRegime::Normal => 3.0,
@@ -1636,10 +1666,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     cross_asset_skew_bps.clamp(-cross_asset_clamp, cross_asset_clamp);
             }
 
-            // OI-based vol multiplier flows into additive risk premium
+            // Vol multiplier flows into additive risk premium (both paths)
             if signals.cross_asset_vol_mult > 1.2 {
                 let oi_excess = signals.cross_asset_vol_mult - 1.0;
-                // 3 bps per unit of OI excess vol (e.g., vol_mult=1.5 → +1.5 bps)
+                // 3 bps per unit of excess vol (e.g., vol_mult=1.5 → +1.5 bps)
                 signals.signal_risk_premium_bps += oi_excess * 3.0;
             }
         }
@@ -4165,6 +4195,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Cache market params for signal diagnostics (fill handler uses this)
         self.cached_market_params = Some(market_params);
+
+        // Update pipeline metrics for dashboard/Prometheus
+        if let Some(ref mp) = self.cached_market_params {
+            self.infra.prometheus.update_pipeline_metrics(
+                mp.drift_rate_per_sec * 10_000.0, // Convert to bps/s
+                mp.total_risk_premium_bps,
+                0.0, // bid/ask depths filled by output.rs from spread_bps
+                0.0,
+                mp.dynamic_max_position,
+            );
+        }
 
         // === Push incremental update to WebSocket dashboard clients ===
         if let Some(ref ws) = self.infra.dashboard_ws {

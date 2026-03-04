@@ -179,8 +179,8 @@ impl CentralBeliefConfig {
         Self {
             kappa_prior: 1500.0,
             kappa_prior_strength: 15.0,
-            min_fills: 3,
-            changepoint_hazard: 1.0 / 150.0,  // More sensitive
+            min_fills: 1, // Bayesian priors (kappa_prior=1500, strength=15) regularize with just 1 fill
+            changepoint_hazard: 1.0 / 150.0, // More sensitive
             changepoint_min_confirmations: 4, // 4 consecutive required (vs default 2)
             changepoint_cooldown_ms: 300_000, // 5 minute cooldown between confirmed changepoints
             bayesian_fv_config: Some(BayesianFairValueConfig::default()),
@@ -725,6 +725,41 @@ impl CentralBeliefState {
 
         // Geometric mean
         (price_progress * fill_progress * time_progress).powf(1.0 / 3.0)
+    }
+
+    /// Extract raw directional Kalman state for checkpointing.
+    ///
+    /// Returns `(dir_mu, dir_sigma_sq, n_price, n_fill, n_as, n_flow, n_burst, kappa_smoothed)`.
+    /// These are the raw internal state values needed to warm-start the belief system.
+    pub fn directional_state_for_checkpoint(&self) -> (f64, f64, u64, u64, u64, u64, u64, f64) {
+        let state = self.state.read().unwrap();
+        (
+            state.dir_mu,
+            state.dir_sigma_sq,
+            state.dir_n_price,
+            state.dir_n_fill,
+            state.dir_n_as,
+            state.dir_n_flow,
+            state.dir_n_burst,
+            state.kappa_smoothed,
+        )
+    }
+
+    /// Restore directional Kalman state from a checkpoint.
+    ///
+    /// Used to warm-start the drift posterior after a restart.
+    /// Only restores if the saved state has meaningful evidence (n > 0).
+    pub fn restore_directional_state(&self, dir_mu: f64, dir_sigma_sq: f64, kappa_smoothed: f64) {
+        let mut state = self.state.write().unwrap();
+        // Only restore if the saved values have meaningful data
+        if dir_sigma_sq > 0.0 && dir_sigma_sq < self.config.dir_prior_variance * 2.0 {
+            state.dir_mu = dir_mu;
+            state.dir_sigma_sq = dir_sigma_sq;
+        }
+        if kappa_smoothed > 0.0 {
+            state.kappa_smoothed = kappa_smoothed;
+            state.kappa_smoothed_initialized = true;
+        }
     }
 
     // =========================================================================
