@@ -252,7 +252,7 @@ pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
     lambda *= drawdown_penalty;
 
     // Toxicity amplifies AS economically
-    let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
+    let toxicity_cost = params.toxicity_score * params.as_cost_bps;
 
     // Spread capture net of costs
     let capture = params.depth_bps - params.as_cost_bps - params.fee_bps - params.carry_cost_bps;
@@ -444,7 +444,7 @@ pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagn
     let drawdown_penalty = (1.0 - params.drawdown_frac * 5.0).max(0.1);
     lambda *= drawdown_penalty;
 
-    let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
+    let toxicity_cost = params.toxicity_score * params.as_cost_bps;
 
     let capture = params.depth_bps - params.as_cost_bps - params.fee_bps - params.carry_cost_bps;
 

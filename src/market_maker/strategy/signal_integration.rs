@@ -1598,7 +1598,10 @@ impl SignalIntegrator {
 
         // Update signal availability state machine
         let current = self.signal_availability.get();
-        if signals.cross_venue_valid || signals.lead_lag_actionable || self.hl_perp_signal_valid.get() {
+        if signals.cross_venue_valid
+            || signals.lead_lag_actionable
+            || self.hl_perp_signal_valid.get()
+        {
             // Signal is healthy — transition to Available
             if current != SignalAvailability::Available {
                 self.signal_availability.set(SignalAvailability::Available);

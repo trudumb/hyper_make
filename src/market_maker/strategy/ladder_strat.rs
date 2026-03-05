@@ -1458,12 +1458,10 @@ impl LadderStrategy {
                 gamma_baseline,
             );
 
-            // Queue position has option value — accept slightly negative E[PnL] fills
-            // rather than dropping levels and losing queue priority. The threshold is
-            // -fee_bps: we'll accept fills that lose up to the fee (we'd pay the fee
-            // anyway on a taker order to flatten). This dramatically increases fill rate
-            // while still protecting against truly toxic levels.
-            let queue_value_threshold = -fee_bps * 0.5; // Accept up to half-fee negative EV
+            // Break-even threshold: accept any level with non-negative expected PnL.
+            // E[PnL] >= 0 means positive edge after all costs. The old -fee*0.5 was
+            // an arbitrary tolerance that accepted losing trades.
+            let queue_value_threshold = 0.0;
 
             let bid_threshold = if bid_is_reducing {
                 reducing_thresh
@@ -2135,11 +2133,16 @@ impl LadderStrategy {
                 let mut bid_ticks = enumerate_bid_ticks(&grid_config);
                 let mut ask_ticks = enumerate_ask_ticks(&grid_config);
 
+                // AS decay rate: informed traders concentrate near the optimal spread.
+                // Use GLFT optimal spread as the characteristic depth scale.
+                // Lower kappa/wider spread → AS concentrated closer to mid → faster decay.
+                let as_decay_bps = touch_bps.clamp(3.0, 30.0);
+
                 let scoring = TickScoringParams {
                     sigma: market_params.sigma,
                     tau: market_params.kelly_time_horizon,
                     as_at_touch_bps,
-                    as_decay_bps: 10.0, // AS decays over ~10 bps depth
+                    as_decay_bps,
                     fee_bps: self.risk_config.maker_fee_rate * 10_000.0,
                     use_sc_as_ratio: true,
                 };
@@ -2178,10 +2181,17 @@ impl LadderStrategy {
                     market_params.adaptive_warmup_progress,
                     in_yellow_zone,
                 );
+                // Entropy floor: at least half the selected levels should be "effective"
+                // For K levels, max entropy = log2(K). We want at least log2(K/2) = log2(K) - 1.
+                // 4 levels → 1.0, 8 levels → 2.0, 15 levels → 2.9
+                let min_entropy_bits = ((effective_levels as f64).log2() - 1.0).max(1.0);
+                // Each level gets at least half-uniform share
+                let min_level_fraction = 1.0 / (effective_levels as f64 * 2.0);
+
                 let softmax_params = SoftmaxParams {
                     temperature: alloc_temperature,
-                    min_entropy_bits: 1.0,
-                    min_level_fraction: 0.05,
+                    min_entropy_bits,
+                    min_level_fraction,
                 };
 
                 // WS1: Allocate sizes via utility-proportional softmax

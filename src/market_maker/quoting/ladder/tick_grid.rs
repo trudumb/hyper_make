@@ -258,39 +258,45 @@ pub fn score_ticks(levels: &mut [TickLevel], params: &TickScoringParams) {
 
 /// Select top-K ticks by utility, always including the touch.
 ///
+/// The touch level (closest to mid) is always included regardless of its utility score.
+/// A market maker that doesn't quote at the touch is not a market maker — touch is where
+/// fills happen. Remaining slots are filled by highest-utility levels.
+///
 /// Returns levels sorted by depth ascending (closest to mid first).
 pub fn select_optimal_ticks(levels: &[TickLevel], max_levels: usize) -> Vec<TickLevel> {
     if levels.is_empty() || max_levels == 0 {
         return Vec::new();
     }
 
-    // Filter to positive utility
-    let mut candidates: Vec<TickLevel> =
-        levels.iter().filter(|l| l.utility > 0.0).copied().collect();
+    // Always include touch (closest to mid) — market makers must quote at the touch
+    let touch = levels[0];
 
-    // Always include touch (first level) even if utility is slightly negative
-    if candidates.is_empty() && !levels.is_empty() {
-        candidates.push(levels[0]);
-    }
+    // Select remaining levels by positive utility, excluding touch
+    let mut candidates: Vec<TickLevel> = levels
+        .iter()
+        .skip(1)
+        .filter(|l| l.utility > 0.0)
+        .copied()
+        .collect();
 
-    // Sort by utility descending
+    // Sort by utility descending, take top (max_levels - 1) to reserve touch slot
     candidates.sort_by(|a, b| {
         b.utility
             .partial_cmp(&a.utility)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    candidates.truncate(max_levels.saturating_sub(1));
 
-    // Take top max_levels
-    candidates.truncate(max_levels);
-
-    // Re-sort by depth ascending (closest to mid first)
-    candidates.sort_by(|a, b| {
+    // Combine: touch + best-utility levels, sorted by depth ascending
+    let mut result = vec![touch];
+    result.extend(candidates);
+    result.sort_by(|a, b| {
         a.depth_bps
             .partial_cmp(&b.depth_bps)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    candidates
+    result
 }
 
 /// Standard normal CDF approximation (Abramowitz & Stegun).
@@ -479,13 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn test_select_optimal_ticks_filters_negative() {
+    fn test_select_optimal_ticks_always_includes_touch() {
         let levels = vec![
             TickLevel {
                 price: 29.62,
                 depth_bps: 3.0,
                 tick_offset: 100,
-                utility: -0.5,
+                utility: -0.5, // Negative utility — but it's the touch
             },
             TickLevel {
                 price: 29.60,
@@ -509,14 +515,19 @@ mod tests {
 
         let selected = select_optimal_ticks(&levels, 3);
 
-        // Should exclude the negative-utility level
-        assert!(selected.len() <= 3);
-        for level in &selected {
-            assert!(
-                level.utility > 0.0,
-                "Selected level should have positive utility"
-            );
-        }
+        // Touch is always included even with negative utility
+        assert_eq!(selected.len(), 3);
+        assert!(
+            (selected[0].depth_bps - 3.0).abs() < 0.01,
+            "First selected should be touch at 3.0 bps"
+        );
+
+        // Non-touch levels with negative utility are still filtered
+        // The 2 remaining slots go to the highest-utility non-touch levels
+        assert!(
+            selected[1].utility > 0.0,
+            "Non-touch levels should have positive utility"
+        );
     }
 
     #[test]
