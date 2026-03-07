@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Order state in the simulation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,7 +392,7 @@ impl OrderExecutor for SimulationExecutor {
             ),
         );
 
-        info!(
+        debug!(
             oid,
             asset,
             side = if is_buy { "BUY" } else { "SELL" },
@@ -446,7 +446,7 @@ impl OrderExecutor for SimulationExecutor {
             mid_price / slippage_mult
         };
 
-        info!(
+        debug!(
             asset,
             side = if is_buy { "BUY" } else { "SELL" },
             size,
@@ -482,7 +482,7 @@ impl OrderExecutor for SimulationExecutor {
                         format!("Order {oid} cancelled"),
                     );
 
-                    info!(oid, "[SIM] Order cancelled");
+                    debug!(oid, "[SIM] Order cancelled");
                     CancelResult::Cancelled
                 }
                 SimulatedOrderStatus::Cancelled => CancelResult::AlreadyCancelled,
@@ -549,7 +549,7 @@ impl OrderExecutor for SimulationExecutor {
                 format!("Order {oid} modified to {new_size} @ {new_price}"),
             );
 
-            info!(oid, new_price, new_size, "[SIM] Order modified");
+            debug!(oid, new_price, new_size, "[SIM] Order modified");
 
             ModifyResult {
                 oid,

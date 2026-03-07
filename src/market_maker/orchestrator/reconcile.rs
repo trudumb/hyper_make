@@ -2127,7 +2127,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let num_current_bids = self.orders.get_all_by_side(Side::Buy).len();
         let num_current_asks = self.orders.get_all_by_side(Side::Sell).len();
 
-        info!(
+        debug!(
             local_bids = num_current_bids,
             local_asks = num_current_asks,
             target_bid_levels = bid_levels.len(),
@@ -2470,7 +2470,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .pre_fill_classifier
             .toxicity_regime(ofi_1s, ofi_5s);
 
-        info!(
+        debug!(
             gamma = %format!("{:.4}", gamma),
             kappa = %format!("{:.0}", kappa),
             sigma = %format!("{:.6}", sigma),
@@ -2664,7 +2664,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         let allocation = allocate(&mut all_scored, &budget, self.config.sz_decimals);
 
-        info!(
+        debug!(
             calls_used = allocation.calls_used,
             calls_budget = allocation.calls_budget,
             latched = allocation.latched_count,
@@ -2685,7 +2685,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let cancel_count = bid_cancels.len() + ask_cancels.len();
         let modify_count = bid_modifies.len() + ask_modifies.len();
 
-        info!(
+        debug!(
             bid_cancel = bid_cancels.len(),
             bid_modify = bid_modifies.len(),
             bid_place = bid_places.len(),
@@ -3128,7 +3128,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             raw_available
         };
 
-        info!(
+        debug!(
             side = %side_str,
             input_orders = input_count,
             total_available = %format!("{:.6}", total_available),
@@ -3347,7 +3347,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         // DIAGNOSTIC: Structured summary log with per-reason filter counts
-        info!(
+        debug!(
             side = %side_str,
             input_orders = input_count,
             orders_passed_filter = order_specs.len(),

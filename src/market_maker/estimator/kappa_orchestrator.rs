@@ -25,7 +25,8 @@
 use super::book_kappa::BookKappaEstimator;
 use super::kappa::BayesianKappaEstimator;
 use super::robust_kappa::RobustKappaEstimator;
-use tracing::info;
+use std::time::Instant;
+use tracing::{debug, info};
 
 /// Configuration for the kappa orchestrator.
 #[derive(Debug, Clone)]
@@ -215,6 +216,9 @@ pub(crate) struct KappaOrchestrator {
     /// Survives checkpoint restore so warmup graduation persists across restarts.
     total_own_fills: u64,
 
+    /// Last time a periodic INFO summary was logged (60s interval).
+    last_summary_time: Instant,
+
     /// EWMA of (kappa_book - kappa_robust) for empirical bias tracking
     book_robust_bias_ewma: f64,
     /// EWMA of (kappa_robust - kappa_robust_prev)^2 for robust variance tracking
@@ -254,6 +258,7 @@ impl KappaOrchestrator {
             has_exited_warmup: false,
             // Cumulative fill count (persisted across restarts)
             total_own_fills: 0,
+            last_summary_time: Instant::now(),
             // Precision-weighted blending stats (initialized to 0, warm up naturally)
             book_robust_bias_ewma: 0.0,
             robust_rolling_var: 0.0,
@@ -568,7 +573,7 @@ impl KappaOrchestrator {
 
         self.update_count += 1;
 
-        // Log periodically (every 10 trades for diagnostics)
+        // Detailed breakdown every 10 trades (debug level)
         if self.update_count.is_multiple_of(10) {
             let (
                 (k_own, w_own),
@@ -578,7 +583,7 @@ impl KappaOrchestrator {
                 is_warmup,
             ) = self.component_breakdown();
 
-            info!(
+            debug!(
                 kappa_effective = %format!("{:.0}", self.kappa_effective()),
                 kappa_raw = %format!("{:.0}", self.kappa_raw()),
                 own = %format!("{:.0} ({:.0}%)", k_own, w_own * 100.0),
@@ -592,6 +597,18 @@ impl KappaOrchestrator {
                 warmup = is_warmup,
                 "Kappa orchestrator breakdown"
             );
+        }
+
+        // Compact periodic INFO summary (every 60s)
+        if self.last_summary_time.elapsed().as_secs() >= 60 {
+            info!(
+                kappa_eff = %format!("{:.0}", self.kappa_effective()),
+                own_fills = self.total_own_fills,
+                outliers = self.robust_kappa.outlier_count(),
+                warmup = !self.has_exited_warmup,
+                "Kappa summary (60s)"
+            );
+            self.last_summary_time = Instant::now();
         }
     }
 

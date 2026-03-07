@@ -4274,6 +4274,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.log_estimator_diagnostics(&market_params);
         }
 
+        // === Session Metrics: regime time and per-regime KPIs ===
+        let regime_idx = market_params.regime_kappa_current_regime;
+        self.regime_time_tracker.update(regime_idx);
+        let cycle_spread_bps = self.tier2.spread_tracker.current_spread_bps();
+        self.regime_kpi_tracker
+            .record_cycle(regime_idx, cycle_spread_bps);
+
         // Cache market params for signal diagnostics (fill handler uses this)
         self.cached_market_params = Some(market_params);
 

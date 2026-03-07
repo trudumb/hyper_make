@@ -14,6 +14,7 @@ pub mod edge_metrics;
 pub mod live;
 pub mod market_toxicity;
 pub mod persistence;
+pub mod session_summary;
 pub mod sharpe;
 
 pub use attribution::{CycleContributions, SignalContribution, SignalPnLAttributor};
@@ -25,6 +26,7 @@ pub use market_toxicity::{
     ToxicityInput,
 };
 pub use persistence::AnalyticsLogger;
+pub use session_summary::{LatencyTracker, RegimeKPITracker, RegimeTimeTracker, SessionSummary};
 pub use sharpe::{
     EquityCurveSharpe, EquityCurveSummary, PerSignalSharpeTracker, SharpeSummary, SharpeTracker,
 };

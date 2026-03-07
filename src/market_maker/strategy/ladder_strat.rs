@@ -876,7 +876,7 @@ impl LadderStrategy {
                 REGIME_BLEND_WEIGHT_FULL
             };
             kappa = (1.0 - regime_blend_weight) * kappa + regime_blend_weight * regime_kappa;
-            info!(
+            debug!(
                 kappa_before = %format!("{:.0}", kappa_before_regime),
                 regime_kappa = %format!("{:.0}", regime_kappa),
                 kappa_after = %format!("{:.0}", kappa),
@@ -1161,7 +1161,7 @@ impl LadderStrategy {
 
         // [SPREAD TRACE] Phase 1: floor — capture GLFT optimal for diagnostics
         let glft_optimal_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
-        tracing::info!(
+        tracing::debug!(
             phase = "floor",
             glft_optimal_bps = %format!("{:.2}", glft_optimal_bps),
             effective_floor_bps = %format!("{:.2}", effective_floor_bps),
@@ -1207,7 +1207,7 @@ impl LadderStrategy {
         };
 
         // [SPREAD TRACE] Phase 3: GLFT depths computed
-        tracing::info!(
+        tracing::debug!(
             phase = "glft_depths",
             touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
             touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
@@ -1229,7 +1229,7 @@ impl LadderStrategy {
         }
 
         // [SPREAD TRACE] Phase 4: floor clamp applied
-        tracing::info!(
+        tracing::debug!(
             phase = "floor_clamp",
             touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
             touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
@@ -1350,7 +1350,7 @@ impl LadderStrategy {
         // filter below (which uses AS cost in bps, not unitless multipliers).
 
         // [SPREAD TRACE] Phase 6: pre-fill AS (multiplicative path deleted)
-        tracing::info!(
+        tracing::debug!(
             phase = "pre_fill_as",
             status = "deleted (E[PnL] filter handles AS)",
             touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),

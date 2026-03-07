@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use super::attribution::{CycleContributions, SignalContribution, SignalPnLAttributor};
 use super::edge_metrics::EdgeSnapshot;
-use super::persistence::AnalyticsLogger;
+use super::persistence::{AnalyticsLogger, DriftCalibrationRecord, GammaCalibrationRecord};
 use super::sharpe::{
     EquityCurveSharpe, EquityCurveSummary, PerSignalSharpeTracker, SharpeSummary, SharpeTracker,
 };
@@ -305,6 +305,20 @@ impl LiveAnalytics {
     /// Get the signal attribution report.
     pub fn attribution_report(&self) -> String {
         self.signal_attributor.format_report()
+    }
+
+    /// Log a gamma calibration record to JSONL (pass-through to persistence).
+    pub fn log_gamma_calibration(&mut self, record: &GammaCalibrationRecord) {
+        if let Some(ref mut logger) = self.logger {
+            let _ = logger.log_gamma_calibration(record);
+        }
+    }
+
+    /// Log a drift calibration record to JSONL (pass-through to persistence).
+    pub fn log_drift_calibration(&mut self, record: &DriftCalibrationRecord) {
+        if let Some(ref mut logger) = self.logger {
+            let _ = logger.log_drift_calibration(record);
+        }
     }
 }
 

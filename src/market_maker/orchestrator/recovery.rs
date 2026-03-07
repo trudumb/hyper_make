@@ -30,6 +30,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Flush analytics before shutdown
         self.live_analytics.flush();
 
+        // Finalize regime time tracking
+        self.regime_time_tracker.finalize();
+
+        // Gather and write session summary
+        let summary = self.gather_session_summary();
+        // Write JSON to data/analytics/
+        let summary_path = std::path::PathBuf::from("data/analytics/session_summary.json");
+        match serde_json::to_string_pretty(&summary) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&summary_path, &json) {
+                    warn!("Failed to write session summary: {e}");
+                } else {
+                    info!("Session summary written to {}", summary_path.display());
+                }
+            }
+            Err(e) => warn!("Failed to serialize session summary: {e}"),
+        }
+        // Print human-readable summary
+        super::super::analytics::session_summary::print_session_summary(&summary);
+
         // Log final state before cancelling
         let final_position = self.position.position();
         let final_mid = self.latest_mid;
@@ -856,5 +876,104 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         Ok(())
+    }
+
+    /// Gather all session metrics into a summary struct.
+    fn gather_session_summary(&self) -> super::super::analytics::session_summary::SessionSummary {
+        let duration_secs = self.session_start_time.elapsed().as_secs_f64();
+        let pnl = self.tier2.pnl_tracker.summary(self.latest_mid);
+        let sharpe_summary = self.live_analytics.sharpe_tracker().summary();
+        let (sharpe_all, sharpe_lo, sharpe_hi) = self
+            .live_analytics
+            .sharpe_tracker()
+            .sharpe_with_confidence(0.90);
+        let equity = self.live_analytics.equity_summary();
+        let kill_switch = self.safety.kill_switch.summary();
+        let regime_pct = self.regime_time_tracker.percentages();
+
+        let signal_marginals: Vec<(String, f64)> = self
+            .live_analytics
+            .signal_attributor()
+            .signal_names()
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    self.live_analytics.signal_attributor().marginal_value(name),
+                )
+            })
+            .collect();
+
+        let mode = if self.infra.exchange_limits.is_paper_mode() {
+            "paper"
+        } else {
+            "live"
+        };
+
+        super::super::analytics::session_summary::SessionSummary {
+            asset: self.config.asset.to_string(),
+            mode: mode.to_string(),
+            duration_secs,
+            quote_cycles: self.quote_cycle_count,
+
+            realized_pnl: pnl.realized_pnl,
+            unrealized_pnl: pnl.unrealized_pnl,
+            total_pnl: pnl.total_pnl,
+            spread_capture: pnl.spread_capture,
+            adverse_selection: pnl.adverse_selection,
+            fees: pnl.fees,
+            funding: pnl.funding,
+
+            total_fills: pnl.fill_count,
+            fill_rate_pct: if self.quote_cycle_count > 0 {
+                pnl.fill_count as f64 / self.quote_cycle_count as f64 * 100.0
+            } else {
+                0.0
+            },
+
+            sharpe_1h: sharpe_summary.sharpe_1h,
+            sharpe_all,
+            sharpe_ci_lo: sharpe_lo,
+            sharpe_ci_hi: sharpe_hi,
+            equity_sharpe: equity.sharpe_all,
+            max_drawdown_pct: kill_switch.drawdown_pct,
+
+            sigma: self.estimator.sigma_clean(),
+            kappa: self.estimator.arrival_intensity(),
+            gamma: self
+                .cached_market_params
+                .as_ref()
+                .map(|mp| mp.adaptive_gamma)
+                .unwrap_or(self.config.risk_aversion),
+            vol_regime: format!("{:?}", self.estimator.volatility_regime()),
+
+            regime_pct_low: regime_pct[0],
+            regime_pct_normal: regime_pct[1],
+            regime_pct_high: regime_pct[2],
+            regime_pct_extreme: regime_pct[3],
+
+            regime_fills: self.regime_kpi_tracker.fills,
+            regime_avg_spread_bps: [
+                self.regime_kpi_tracker.avg_spread_bps(0),
+                self.regime_kpi_tracker.avg_spread_bps(1),
+                self.regime_kpi_tracker.avg_spread_bps(2),
+                self.regime_kpi_tracker.avg_spread_bps(3),
+            ],
+            regime_avg_as_bps: [
+                self.regime_kpi_tracker.avg_as_bps(0),
+                self.regime_kpi_tracker.avg_as_bps(1),
+                self.regime_kpi_tracker.avg_as_bps(2),
+                self.regime_kpi_tracker.avg_as_bps(3),
+            ],
+
+            fill_latency_p50_ms: self.fill_latency_tracker.percentile(50.0),
+            fill_latency_p95_ms: self.fill_latency_tracker.percentile(95.0),
+            fill_latency_p99_ms: self.fill_latency_tracker.percentile(99.0),
+
+            kill_switch_triggered: kill_switch.triggered,
+            kill_switch_reasons: kill_switch.reasons,
+
+            signal_marginals,
+        }
     }
 }

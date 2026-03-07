@@ -3094,6 +3094,10 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
                 info!("Paper trading duration elapsed, extracting prior...");
+                // Run graceful shutdown (session summary, checkpoint, analytics flush)
+                if let Err(e) = market_maker.shutdown().await {
+                    warn!("Shutdown error (non-fatal): {e}");
+                }
                 let mut prior = market_maker.extract_prior();
                 // Stamp readiness assessment before saving
                 let gate = hyperliquid_rust_sdk::market_maker::calibration::gate::CalibrationGate::new(

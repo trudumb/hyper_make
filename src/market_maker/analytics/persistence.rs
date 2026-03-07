@@ -1,8 +1,9 @@
 //! JSONL file logging for analytics data.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use super::attribution::SignalPnLAttributor;
 #[cfg(test)]
@@ -11,13 +12,114 @@ use super::edge_metrics::EdgeSnapshot;
 use super::sharpe::{EquityCurveSummary, SharpeSummary};
 use super::CycleContributions;
 
+/// Date-rotating JSONL writer that creates a new file each day.
+///
+/// Files are named `{stem}_{YYYY-MM-DD}.jsonl`. Old files beyond `max_files`
+/// are automatically cleaned up on rotation.
+struct RotatingWriter {
+    dir: PathBuf,
+    stem: String,
+    current_date: String,
+    writer: BufWriter<File>,
+    max_files: usize,
+}
+
+impl RotatingWriter {
+    fn new(dir: &std::path::Path, stem: &str, max_files: usize) -> std::io::Result<Self> {
+        let date = Self::today_string();
+        let path = dir.join(format!("{stem}_{date}.jsonl"));
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            stem: stem.to_string(),
+            current_date: date,
+            writer: BufWriter::new(file),
+            max_files,
+        })
+    }
+
+    fn today_string() -> String {
+        // Use chrono-free approach: SystemTime → seconds → date string
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Convert epoch seconds to YYYY-MM-DD
+        let days = secs / 86400;
+        let (y, m, d) = Self::days_to_ymd(days);
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
+    /// Convert days since Unix epoch to (year, month, day).
+    fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+        // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+        let z = days + 719468;
+        let era = z / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        (y, m, d)
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        let today = Self::today_string();
+        if today != self.current_date {
+            self.rotate(&today)?;
+        }
+        writeln!(self.writer, "{line}")
+    }
+
+    fn rotate(&mut self, new_date: &str) -> std::io::Result<()> {
+        self.writer.flush()?;
+        let path = self.dir.join(format!("{}_{new_date}.jsonl", self.stem));
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        self.writer = BufWriter::new(file);
+        self.current_date = new_date.to_string();
+        self.cleanup()?;
+        Ok(())
+    }
+
+    fn cleanup(&self) -> std::io::Result<()> {
+        let prefix = format!("{}_", self.stem);
+        let mut files: Vec<String> = fs::read_dir(&self.dir)?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) && name.ends_with(".jsonl") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        files.sort();
+        if files.len() > self.max_files {
+            let to_remove = files.len() - self.max_files;
+            for name in files.iter().take(to_remove) {
+                let _ = fs::remove_file(self.dir.join(name));
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 /// JSONL file writer for analytics persistence.
 ///
 /// Writes one JSON object per line to separate files for each data type.
 /// Uses `BufWriter` for efficient I/O and append mode for crash safety.
+/// Signal contributions use date-rotating files to prevent unbounded growth.
 pub struct AnalyticsLogger {
     sharpe_writer: BufWriter<File>,
-    contributions_writer: BufWriter<File>,
+    contributions_writer: RotatingWriter,
     signal_pnl_writer: BufWriter<File>,
     edge_writer: BufWriter<File>,
     equity_sharpe_writer: BufWriter<File>,
@@ -28,8 +130,8 @@ pub struct AnalyticsLogger {
 impl AnalyticsLogger {
     /// Create a new analytics logger writing to the given directory.
     ///
-    /// Creates the directory if it doesn't exist. Opens four JSONL files
-    /// in append mode.
+    /// Creates the directory if it doesn't exist. Opens JSONL files
+    /// in append mode. Signal contributions use date-rotating files.
     pub fn new(output_dir: &str) -> std::io::Result<Self> {
         let dir = PathBuf::from(output_dir);
         std::fs::create_dir_all(&dir)?;
@@ -42,7 +144,7 @@ impl AnalyticsLogger {
 
         Ok(Self {
             sharpe_writer: open_append("sharpe_metrics.jsonl")?,
-            contributions_writer: open_append("signal_contributions.jsonl")?,
+            contributions_writer: RotatingWriter::new(&dir, "signal_contributions", 7)?,
             signal_pnl_writer: open_append("signal_pnl.jsonl")?,
             edge_writer: open_append("edge_validation.jsonl")?,
             equity_sharpe_writer: open_append("equity_sharpe_metrics.jsonl")?,
@@ -57,10 +159,10 @@ impl AnalyticsLogger {
         writeln!(self.sharpe_writer, "{json}")
     }
 
-    /// Log cycle contributions as one JSONL line.
+    /// Log cycle contributions as one JSONL line (date-rotating file).
     pub fn log_contributions(&mut self, cycle: &CycleContributions) -> std::io::Result<()> {
         let json = serde_json::to_string(cycle)?;
-        writeln!(self.contributions_writer, "{json}")
+        self.contributions_writer.write_line(&json)
     }
 
     /// Log a snapshot of per-signal PnL stats as one JSONL line.
@@ -236,7 +338,11 @@ mod tests {
         let _logger = AnalyticsLogger::new(dir.to_str().unwrap()).unwrap();
 
         assert!(dir.join("sharpe_metrics.jsonl").exists());
-        assert!(dir.join("signal_contributions.jsonl").exists());
+        // signal_contributions uses date-rotating files
+        let today = RotatingWriter::today_string();
+        assert!(dir
+            .join(format!("signal_contributions_{today}.jsonl"))
+            .exists());
         assert!(dir.join("signal_pnl.jsonl").exists());
         assert!(dir.join("edge_validation.jsonl").exists());
         assert!(dir.join("equity_sharpe_metrics.jsonl").exists());

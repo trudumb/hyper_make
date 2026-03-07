@@ -478,6 +478,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 } else {
                     0.0
                 };
+                // Log drift calibration record before updating (so predicted is pre-update)
+                {
+                    use crate::market_maker::analytics::persistence::DriftCalibrationRecord;
+                    let predicted_bps =
+                        self.drift_estimator.shrunken_drift_rate_per_sec() * 10_000.0 * 5.0; // Convert to bps over 5s markout
+                    let realized_bps = realized_drift_bps_per_sec * 5.0;
+                    let drift_cal_record = DriftCalibrationRecord {
+                        timestamp_ns: pending.timestamp_ms * 1_000_000,
+                        signal_name: "aggregate".to_string(),
+                        predicted_bps,
+                        realized_bps,
+                        variance_used: 0.0, // aggregate doesn't expose per-signal variance
+                        innovation_bps: predicted_bps - realized_bps,
+                        innovation_timestamp_ms: pending.timestamp_ms,
+                    };
+                    self.live_analytics.log_drift_calibration(&drift_cal_record);
+                }
                 self.drift_estimator
                     .update_parameters(realized_drift_bps_per_sec);
 
@@ -559,6 +576,36 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     self.stochastic
                         .gamma_calibrator
                         .update(&features, gamma_used, fill_pnl_bps);
+
+                    // Log gamma calibration record for offline regression.
+                    // features is [f64; 15] with indices matching RiskFeatures::as_array():
+                    // [0]=excess_vol, [1]=toxicity, [2]=inventory², [3]=excess_intensity,
+                    // [4]=depth_depletion, [5]=model_uncertainty, [6]=pos_dir_conf,
+                    // [7]=cascade, [8]=tail_risk, [9]=drawdown, [10]=regime_risk,
+                    // [11]=ghost_depletion, [12]=continuation, [13]=edge_uncertainty,
+                    // [14]=calibration_deficit
+                    use crate::market_maker::analytics::persistence::GammaCalibrationRecord;
+                    let gamma_cal_record = GammaCalibrationRecord {
+                        timestamp_ns: pending.timestamp_ms * 1_000_000,
+                        toxicity: features[1],
+                        cascade: features[7],
+                        tail_risk: features[8],
+                        gamma_used,
+                        realized_as_bps: markout_as_bps,
+                        spread_bps: pending.quoted_spread_bps,
+                        excess_volatility: features[0],
+                        inventory_fraction: features[2].sqrt(), // stored as squared
+                        excess_intensity: features[3],
+                        depth_depletion: features[4],
+                        model_uncertainty: features[5],
+                        position_direction_confidence: features[6],
+                        drawdown_fraction: features[9],
+                        regime_risk_score: features[10],
+                        ghost_depletion: features[11],
+                        continuation_probability: features[12],
+                    };
+                    self.live_analytics.log_gamma_calibration(&gamma_cal_record);
+
                     // Apply calibrated betas to the risk model every 10 fills.
                     // With min_samples=20, calibrator starts influencing gamma early.
                     if self.stochastic.gamma_calibrator.is_warmed_up()
@@ -1153,6 +1200,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.last_reducing_fill_time = Some(now);
             }
 
+            // Record order-to-fill latency (if we have tracking data for this order)
+            if let Some(tracked) = self.orders.get_order(fill.oid) {
+                let latency_ms = tracked.placed_at.elapsed().as_secs_f64() * 1000.0;
+                self.fill_latency_tracker.record(latency_ms);
+            }
+
+            // Record fill in per-regime KPI tracker
+            {
+                let regime_idx = self
+                    .cached_market_params
+                    .as_ref()
+                    .map(|mp| mp.regime_kappa_current_regime)
+                    .unwrap_or(1); // default Normal
+                let as_bps = self.tier1.adverse_selection.as_floor_bps();
+                self.regime_kpi_tracker.record_fill(regime_idx, as_bps);
+            }
+
             let fill_price = fill.px.parse().unwrap_or(0.0);
             let fill_event = WsFillEvent {
                 oid: fill.oid,
@@ -1511,6 +1575,43 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.safety
             .position_guard
             .update_position(self.position.position());
+
+        // Post-fill reduce-only gate: if clustered fills pushed position past 95%
+        // of effective max, immediately cancel all position-increasing orders.
+        // This catches the gap where pre-flight entry gates pass but fills cluster
+        // between quote cycles, bypassing the per-cycle risk_reduce_only flag.
+        {
+            let post_fill_position = self.position.position();
+            let max_pos = self.effective_max_position;
+            let reduce_only_threshold = max_pos * 0.95;
+
+            if post_fill_position.abs() >= reduce_only_threshold && max_pos > 0.0 {
+                let cancel_side = if post_fill_position > 0.0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let oids: Vec<u64> = self
+                    .orders
+                    .get_all_by_side(cancel_side)
+                    .iter()
+                    .map(|o| o.oid)
+                    .collect();
+                if !oids.is_empty() {
+                    warn!(
+                        position = %format!("{:.4}", post_fill_position),
+                        max_position = %format!("{:.4}", max_pos),
+                        threshold = %format!("{:.4}", reduce_only_threshold),
+                        cancel_count = oids.len(),
+                        side = ?cancel_side,
+                        "Post-fill reduce-only: cancelling position-increasing orders"
+                    );
+                    self.environment
+                        .cancel_bulk_orders(&self.config.asset, oids)
+                        .await;
+                }
+            }
+        }
 
         // Phase 3B: Update direction hysteresis for zero-crossing detection.
         let now_ms = std::time::SystemTime::now()

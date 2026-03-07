@@ -831,6 +831,28 @@ impl LearnedParameters {
         self.total_fills_observed = 0;
     }
 
+    /// Clamp learned parameters to valid physical ranges after checkpoint restore.
+    ///
+    /// Prevents nonsensical values (negative spread floors, sub-minimum gamma/kappa)
+    /// that can arise from Bayesian posterior drift during anomalous sessions.
+    pub fn validate_bounds(&mut self) {
+        // spread_floor_bps must be >= 0 (negative spread floor is nonsensical)
+        if self.spread_floor_bps.estimate() < 0.0 {
+            self.spread_floor_bps.posterior_param1 = 0.0;
+            tracing::warn!("Checkpoint: clamped spread_floor_bps from negative to 0.0");
+        }
+        // gamma_base must be >= 0.1 (GLFT requirement: gamma > 0)
+        if self.gamma_base.estimate() < 0.1 {
+            self.gamma_base = BayesianParam::gamma("gamma_base", 0.15, 3.0);
+            tracing::warn!("Checkpoint: reset gamma_base to default 0.15 (was below 0.1)");
+        }
+        // kappa must be >= 1.0 (GLFT formula: ln(1 + gamma/kappa) blows up at 0)
+        if self.kappa.estimate() < 1.0 {
+            self.kappa = BayesianParam::gamma("kappa", 2000.0, 4.0);
+            tracing::warn!("Checkpoint: reset kappa to default 2000 (was below 1.0)");
+        }
+    }
+
     /// Get a summary of all parameter estimates for logging.
     pub fn summary(&self) -> Vec<(&str, f64, f64, usize)> {
         vec![
@@ -1511,6 +1533,73 @@ mod tests {
         assert!((params.alpha_touch.estimate() - 0.25).abs() < 0.01);
         assert!((params.gamma_base.estimate() - 0.15).abs() < 0.01);
         assert!((params.kappa.estimate() - 2000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_validate_bounds_clamps_negative_spread_floor() {
+        let mut params = LearnedParameters::default();
+        // Force spread_floor_bps posterior mean negative (simulating drift)
+        params.spread_floor_bps.posterior_param1 = -5.3;
+        assert!(params.spread_floor_bps.estimate() < 0.0);
+
+        params.validate_bounds();
+        assert!(
+            params.spread_floor_bps.estimate() >= 0.0,
+            "spread_floor_bps must be >= 0 after validate_bounds"
+        );
+    }
+
+    #[test]
+    fn test_validate_bounds_resets_low_gamma() {
+        let mut params = LearnedParameters {
+            gamma_base: BayesianParam::gamma("gamma_base", 0.01, 3.0),
+            ..Default::default()
+        };
+        assert!(params.gamma_base.estimate() < 0.1);
+
+        params.validate_bounds();
+        assert!(
+            params.gamma_base.estimate() >= 0.1,
+            "gamma_base must be >= 0.1 after validate_bounds"
+        );
+    }
+
+    #[test]
+    fn test_validate_bounds_resets_low_kappa() {
+        let mut params = LearnedParameters {
+            kappa: BayesianParam::gamma("kappa", 0.5, 4.0),
+            ..Default::default()
+        };
+        assert!(params.kappa.estimate() < 1.0);
+
+        params.validate_bounds();
+        assert!(
+            params.kappa.estimate() >= 1.0,
+            "kappa must be >= 1.0 after validate_bounds"
+        );
+    }
+
+    #[test]
+    fn test_validate_bounds_preserves_valid_params() {
+        let mut params = LearnedParameters::default();
+        let original_floor = params.spread_floor_bps.estimate();
+        let original_gamma = params.gamma_base.estimate();
+        let original_kappa = params.kappa.estimate();
+
+        params.validate_bounds();
+
+        assert!(
+            (params.spread_floor_bps.estimate() - original_floor).abs() < 1e-10,
+            "Valid spread_floor_bps should be unchanged"
+        );
+        assert!(
+            (params.gamma_base.estimate() - original_gamma).abs() < 1e-10,
+            "Valid gamma_base should be unchanged"
+        );
+        assert!(
+            (params.kappa.estimate() - original_kappa).abs() < 1e-10,
+            "Valid kappa should be unchanged"
+        );
     }
 
     #[test]

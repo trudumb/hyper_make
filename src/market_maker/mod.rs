@@ -377,6 +377,14 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Enabled by default for both paper and live environments.
     pub live_analytics: analytics::live::LiveAnalytics,
 
+    // === Session Metrics (Phase 2/5: Infrastructure Overhaul) ===
+    /// Tracks time spent in each volatility regime.
+    regime_time_tracker: analytics::session_summary::RegimeTimeTracker,
+    /// Tracks order-to-fill latency percentiles.
+    fill_latency_tracker: analytics::session_summary::LatencyTracker,
+    /// Tracks per-regime KPIs (fills, spread, AS).
+    regime_kpi_tracker: analytics::session_summary::RegimeKPITracker,
+
     // === Phase 5: Quote Outcome Tracking ===
     /// Tracks outcomes of all quotes (filled AND unfilled) for unbiased edge estimation.
     /// Enables learning from expired quotes and computing optimal spread = argmax(edge × fill_rate).
@@ -717,6 +725,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             live_analytics: analytics::live::LiveAnalytics::new(Some(std::path::PathBuf::from(
                 "data/analytics",
             ))),
+            // Session metrics (regime time, latency, per-regime KPIs)
+            regime_time_tracker: analytics::session_summary::RegimeTimeTracker::new(),
+            fill_latency_tracker: analytics::session_summary::LatencyTracker::default(),
+            regime_kpi_tracker: analytics::session_summary::RegimeKPITracker::new(),
             // Phase 5: Quote outcome tracking for unbiased edge estimation
             quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker::new(),
             queue_value_heuristic: models::QueueValueHeuristic::new(),
@@ -1247,6 +1259,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .regime_hmm
             .restore_checkpoint(&bundle.regime_hmm);
         self.stochastic.learned_params = bundle.learned_params.clone();
+        self.stochastic.learned_params.validate_bounds();
         self.learning
             .restore_from_checkpoint(&bundle.kelly_tracker, &bundle.ensemble_weights);
         self.quote_outcome_tracker
