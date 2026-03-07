@@ -99,3 +99,144 @@ The system HAS a warmup phase (estimator waits for sigma/kappa convergence). But
 - Kill switch never auto-recovers from financial triggers
 - All checkpoint fields: `#[serde(default)]`
 - No binary side-clearing
+
+---
+
+# Experience Replay & Offline Learning: Pickup Notes (2026-03-07)
+
+## What's DONE (all 5 stages implemented, compiles, clippy+fmt clean, 34 tests pass)
+
+### Stage 1: Experience Logging ✅
+- `ExperienceRecord` extended with 6 optional fields (`drift_penalty`, `bandit_multiplier`, `vol_ratio`, `mdp_state_idx`, `bandit_arm_idx`, `inventory_risk_at_fill`)
+- `from_markout()` constructor + `MarkoutExperienceParams` struct
+- `PendingFillOutcome` extended with fill-time snapshots (MDP state, bandit arm, inv risk, vol ratio)
+- Fill-time snapshot in `handlers.rs` ~L1425, markout-time logging ~L665
+- Config: `enable_experience_logging`, `experience_dir`, in `stochastic.rs`
+- Paper validated: 12+ fills/10min, valid SARSA records in `logs/experience/*.jsonl`
+
+### Stage 2: Replay Buffer ✅
+- `src/market_maker/learning/replay_buffer.rs` — `ReplayBuffer`, `ReplayStatistics`
+- Load from dir, push with capacity eviction, deterministic LCG sampling, statistics
+- 7 unit tests
+
+### Stage 3: Fitted Q-Iteration ✅
+- `src/market_maker/learning/fqi.rs` — `FittedQIterator`, `FQIConfig`, `FQIResult`, `FQICheckpoint`
+- Double Q-learning, 45 states × 8 actions = 360 cells
+- `FQIPolicyRecommendation` with arm→delta_bps mapping
+- Checkpoint persistence via `FQICheckpoint` (to/from `FQIResult`)
+- 7 unit tests
+
+### Stage 4: Policy Feedback ✅
+- `quote_engine.rs` ~L2913: FQI blend into `rl_spread_delta_bps`
+- Gated by `fqi_blend_weight > 0.0`, `fqi_result.is_some()`, `is_warmed_up()`
+- Config: `fqi_blend_weight` (default 0.0 = disabled), `fqi_min_fills`, `fqi_refit_interval`
+
+### Stage 5: Counterfactual Analysis ✅
+- `src/market_maker/learning/counterfactual.rs` — per-fill regret, aggregate report
+- 4 unit tests
+
+### Remaining Items (implemented but NOT yet validated in paper)
+
+1. **Checkpoint save/restore for FQI** ✅ DONE
+   - `assemble_checkpoint_bundle()` now saves `fqi_result` → `fqi_q_table`
+   - `restore_from_bundle()` now restores `fqi_q_table` → `fqi_result`
+
+2. **Periodic FQI refit** ✅ DONE (code exists, BUG blocks paper validation)
+   - `handlers.rs` PHASE 7: increments `fqi_fills_since_refit`, triggers refit at interval
+   - Loads from `experience_dir`, fits FQI, stores result
+
+3. **Counterfactual JSONL on shutdown** ✅ DONE (code exists, blocked by same bug)
+   - `recovery.rs` shutdown: if `fqi_result` exists, runs counterfactual analysis, writes JSON
+
+4. **`with_experience_logging()` syncs `experience_dir`** ✅ DONE
+   - Previously `with_experience_logging("logs/experience")` didn't update `stochastic_config.experience_dir`, so FQI refit would look in wrong dir
+
+## CRITICAL BUG: TOML `[stochastic]` not wired into binary
+
+**Root cause found**: `src/bin/market_maker.rs` line 1652:
+```rust
+let stochastic_config = StochasticConfig {
+    enable_position_ramp: false,
+    enable_performance_gating: false,
+    ..Default::default()  // ← IGNORES ALL TOML [stochastic] VALUES
+};
+```
+
+The `AppConfig` struct (line 413) has `pub stochastic: StochasticConfig` and the TOML parses it correctly. But when building `MmConfig`, the binary constructs a fresh `StochasticConfig` with defaults instead of using `config.stochastic`.
+
+**Fix needed** (5 lines):
+```rust
+let stochastic_config = StochasticConfig {
+    enable_position_ramp: false,
+    enable_performance_gating: false,
+    ..config.stochastic  // ← Use TOML values as base
+};
+```
+
+This affects ALL `[stochastic]` TOML fields, not just FQI. The paper binary has the same issue at line ~2778.
+
+**After fixing**: `enable_experience_logging = true` and `fqi_refit_interval = 1` from TOML will take effect, the FQI refit will fire, counterfactual report will be written on shutdown.
+
+## TOML Config (current, in `market_maker_live.toml`)
+```toml
+[stochastic]
+enable_experience_logging = true
+fqi_refit_interval = 1    # Set low for validation, raise to 200 after
+fqi_min_fills = 3          # Set low for validation, raise to 100 after
+```
+
+## Paper Trading Validation Results (2026-03-07)
+
+### Run 1 (10 min, before FQI refit interval lowered)
+- 12 fills, valid experience records in `logs/experience/`
+- Experience logging works end-to-end
+- FQI refit did NOT trigger (interval=200, only 12 fills)
+
+### Run 2-3 (5-10 min, with low refit interval)
+- FQI refit did NOT trigger — **because `enable_experience_logging` defaults to false**
+- Bug identified: TOML `[stochastic]` section completely ignored by binary
+
+## Next Steps (in order)
+
+1. **Fix the TOML→StochasticConfig wiring** in `src/bin/market_maker.rs`:
+   - Line 1652: change `..Default::default()` → `..config.stochastic`
+   - Line ~2778 (paper mode): same fix
+   - This unblocks ALL stochastic TOML config, not just FQI
+
+2. **Paper validate FQI pipeline**:
+   - Run 10 min with `fqi_refit_interval = 5`, `fqi_min_fills = 5`
+   - Expect: "FQI refit triggered" + "FQI refit completed" in logs
+   - Expect: `data/analytics/counterfactual_report.json` written on shutdown
+   - Expect: checkpoint contains `fqi_q_table` with non-empty Q-values
+
+3. **Restore production thresholds**:
+   - `fqi_refit_interval = 200`
+   - `fqi_min_fills = 100`
+   - `fqi_blend_weight = 0.0` (keep disabled until counterfactual shows improvement)
+
+4. **Remove diagnostic logs**:
+   - `handlers.rs`: revert "FQI refit triggered" info log to debug
+   - `handlers.rs`: revert "FQI refit skipped" back to debug
+
+5. **Commit** all changes with conventional commit format
+
+## Files Modified This Session (2026-03-07)
+
+| File | Change |
+|------|--------|
+| `src/market_maker/mod.rs` | FQI checkpoint save (assemble) + restore, `with_experience_logging` syncs `experience_dir`, removed `#[allow(dead_code)]` on `fqi_fills_since_refit` |
+| `src/market_maker/orchestrator/handlers.rs` | PHASE 7: periodic FQI refit logic after markout |
+| `src/market_maker/orchestrator/recovery.rs` | Counterfactual report on shutdown |
+| `market_maker_live.toml` | Added `fqi_refit_interval`, `fqi_min_fills` |
+
+## Key Code Locations
+
+| What | Where |
+|------|-------|
+| FQI refit trigger | `handlers.rs` ~L697 (PHASE 7 in `check_pending_fill_outcomes`) |
+| Counterfactual on shutdown | `recovery.rs` ~L33 (in `shutdown()`) |
+| Checkpoint save FQI | `mod.rs` ~L1278 (`assemble_checkpoint_bundle`) |
+| Checkpoint restore FQI | `mod.rs` ~L1366 (`restore_from_bundle`) |
+| Experience dir sync | `mod.rs` ~L1031 (`with_experience_logging`) |
+| TOML stochastic wiring BUG | `src/bin/market_maker.rs` L1652 |
+| Paper mode stochastic BUG | `src/bin/market_maker.rs` ~L2778 |
