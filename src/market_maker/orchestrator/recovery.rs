@@ -30,6 +30,41 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Flush analytics before shutdown
         self.live_analytics.flush();
 
+        // Write counterfactual analysis JSONL if FQI result is available
+        if let Some(ref fqi_result) = self.fqi_result {
+            let exp_dir = &self.stochastic.stochastic_config.experience_dir;
+            let capacity = self.stochastic.stochastic_config.replay_buffer_capacity;
+            let mut buffer = crate::market_maker::learning::ReplayBuffer::new(capacity);
+            match buffer.load_from_dir(std::path::Path::new(exp_dir)) {
+                Ok(loaded) if loaded > 0 => {
+                    let report = crate::market_maker::learning::CounterfactualAnalysis::analyze(
+                        buffer.records(),
+                        fqi_result,
+                    );
+                    let out_path =
+                        std::path::PathBuf::from("data/analytics/counterfactual_report.json");
+                    match serde_json::to_string_pretty(&report) {
+                        Ok(json) => {
+                            if let Err(e) = std::fs::write(&out_path, &json) {
+                                warn!("Failed to write counterfactual report: {e}");
+                            } else {
+                                info!(
+                                    total_fills = report.total_fills,
+                                    fraction_suboptimal = %format!("{:.1}%", report.fraction_suboptimal * 100.0),
+                                    mean_improvement_bps = %format!("{:.2}", report.mean_expected_improvement),
+                                    "Counterfactual report written to {}",
+                                    out_path.display()
+                                );
+                            }
+                        }
+                        Err(e) => warn!("Failed to serialize counterfactual report: {e}"),
+                    }
+                }
+                Ok(_) => debug!("No experience records for counterfactual analysis"),
+                Err(e) => warn!("Failed to load experience for counterfactual: {e}"),
+            }
+        }
+
         // Finalize regime time tracking
         self.regime_time_tracker.finalize();
 

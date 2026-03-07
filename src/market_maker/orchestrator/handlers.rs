@@ -633,6 +633,107 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     mid_at_placement = %format!("{:.4}", pending.mid_at_placement),
                     "[EDGE RESOLVED] markout-based edge measurement"
                 );
+
+                // === Experience Replay: Log SARSA tuple at markout time ===
+                if let Some(ref mut logger) = self.experience_logger {
+                    use crate::market_maker::learning::rl_agent::{
+                        MDPStateCompact, Reward, RewardConfig,
+                    };
+                    let realized_edge_bps = resolved_snap.realized_edge_bps;
+                    let max_pos = self.config.max_position.max(0.01);
+                    let pos_now = self.position.net_position();
+                    let inv_risk_now = pos_now.abs() / max_pos;
+                    let vol_ratio_now = if self.estimator.sigma_effective() > 0.0 {
+                        self.estimator.sigma() / self.estimator.sigma_effective()
+                    } else {
+                        1.0
+                    };
+                    let next_state = MDPStateCompact::from_continuous(
+                        pos_now,
+                        max_pos,
+                        self.estimator.book_imbalance(),
+                        vol_ratio_now,
+                    );
+                    let reward = Reward::compute(
+                        &RewardConfig::default(),
+                        realized_edge_bps,
+                        inv_risk_now,
+                        vol_ratio_now,
+                        pending.inventory_risk_at_fill,
+                    );
+                    let regime_str = format!("{:?}", self.estimator.volatility_regime());
+                    let record = crate::market_maker::learning::ExperienceRecord::from_markout(
+                        crate::market_maker::learning::MarkoutExperienceParams {
+                            mdp_state_idx: pending.mdp_state_idx,
+                            bandit_arm_idx: pending.bandit_arm_idx,
+                            reward,
+                            next_mdp_state_idx: next_state.to_index(),
+                            timestamp_ms: pending.timestamp_ms,
+                            session_id: self.experience_session_id.clone(),
+                            source: if self.infra.exchange_limits.is_paper_mode() {
+                                crate::market_maker::learning::ExperienceSource::Paper
+                            } else {
+                                crate::market_maker::learning::ExperienceSource::Live
+                            },
+                            side: if pending.is_buy {
+                                "buy".to_string()
+                            } else {
+                                "sell".to_string()
+                            },
+                            fill_price: pending.fill_price,
+                            mid_price: pending.mid_at_fill,
+                            fill_size: pending.fill_size,
+                            inventory: pos_now,
+                            regime: regime_str,
+                            bandit_multiplier: pending.bandit_multiplier_at_fill,
+                            vol_ratio: pending.vol_ratio_at_fill,
+                            inventory_risk_at_fill: pending.inventory_risk_at_fill,
+                        },
+                    );
+                    let _ = logger.log(&record);
+                }
+            }
+
+            // === PHASE 7: Periodic FQI refit ===
+            self.fqi_fills_since_refit += 1;
+            let refit_interval = self.stochastic.stochastic_config.fqi_refit_interval;
+            if refit_interval > 0
+                && self.fqi_fills_since_refit >= refit_interval
+                && self.stochastic.stochastic_config.enable_experience_logging
+            {
+                let exp_dir = &self.stochastic.stochastic_config.experience_dir;
+                tracing::info!(
+                    fills_since_refit = self.fqi_fills_since_refit,
+                    refit_interval,
+                    experience_dir = exp_dir,
+                    "FQI refit triggered"
+                );
+                self.fqi_fills_since_refit = 0;
+                let capacity = self.stochastic.stochastic_config.replay_buffer_capacity;
+                let mut buffer = crate::market_maker::learning::ReplayBuffer::new(capacity);
+                match buffer.load_from_dir(std::path::Path::new(exp_dir)) {
+                    Ok(loaded) if loaded >= self.stochastic.stochastic_config.fqi_min_fills => {
+                        let fqi = crate::market_maker::learning::FittedQIterator::new();
+                        let result = fqi.fit(&buffer);
+                        tracing::info!(
+                            records = loaded,
+                            iterations = result.iterations,
+                            bellman_residual = %format!("{:.4}", result.bellman_residual),
+                            "FQI refit completed"
+                        );
+                        self.fqi_result = Some(result);
+                    }
+                    Ok(loaded) => {
+                        tracing::info!(
+                            loaded,
+                            min = self.stochastic.stochastic_config.fqi_min_fills,
+                            "FQI refit skipped: insufficient experience records"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "FQI refit failed to load experience dir");
+                    }
+                }
             }
 
             if was_adverse {
@@ -1374,6 +1475,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // === AS Outcome Queue: Record fill for 5-second markout ===
                 // After 5 seconds we check whether mid moved against us (adverse selection).
                 // Drained in handle_all_mids -> check_pending_fill_outcomes().
+                // Snapshot MDP state + bandit selection at fill time for experience logging.
+                let max_pos = self.config.max_position.max(0.01);
+                let pos_now = self.position.net_position();
+                let inv_risk_fill = pos_now.abs() / max_pos;
+                let vol_ratio_fill = if self.estimator.sigma_effective() > 0.0 {
+                    self.estimator.sigma() / self.estimator.sigma_effective()
+                } else {
+                    1.0
+                };
+                let mdp_state =
+                    crate::market_maker::learning::rl_agent::MDPStateCompact::from_continuous(
+                        pos_now,
+                        max_pos,
+                        self.estimator.book_imbalance(),
+                        vol_ratio_fill,
+                    );
+                let (bandit_arm, bandit_mult) = self.stochastic.last_bandit_selection;
+
                 self.infra.pending_fill_outcomes.push_back(
                     crate::market_maker::fills::PendingFillOutcome {
                         timestamp_ms: fill.time,
@@ -1387,6 +1506,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         // Capture gamma features at fill time — not at markout time (5s later)
                         // when last_gamma_cache would contain stale current-cycle features.
                         gamma_cache: self.stochastic.last_gamma_cache,
+                        // Experience replay fields (Stage 1)
+                        mdp_state_idx: mdp_state.to_index(),
+                        bandit_arm_idx: bandit_arm,
+                        inventory_risk_at_fill: inv_risk_fill,
+                        vol_ratio_at_fill: vol_ratio_fill,
+                        bandit_multiplier_at_fill: bandit_mult,
+                        fill_size,
                     },
                 );
 

@@ -75,6 +75,20 @@ pub struct PendingFillOutcome {
     /// Stored here so markout resolution (5s later) uses temporally-correct features,
     /// not the current cycle's stale `last_gamma_cache`.
     pub gamma_cache: Option<([f64; 15], f64)>,
+
+    // === Experience replay fields (Stage 1) ===
+    /// MDPStateCompact index at fill time (0..44) for FQI Q-table
+    pub mdp_state_idx: usize,
+    /// Bandit arm index at fill time (0..7) for action grounding
+    pub bandit_arm_idx: usize,
+    /// Inventory risk |position|/max_position at fill time
+    pub inventory_risk_at_fill: f64,
+    /// Volatility ratio (sigma/sigma_effective) at fill time
+    pub vol_ratio_at_fill: f64,
+    /// Bandit spread multiplier at fill time
+    pub bandit_multiplier_at_fill: f64,
+    /// Fill size for experience logging
+    pub fill_size: f64,
 }
 
 /// A unified fill event containing all data needed by modules.
@@ -352,6 +366,12 @@ mod tests {
             quoted_spread_bps: 0.4,
             predicted_as_bps: 2.5,
             gamma_cache: None,
+            mdp_state_idx: 0,
+            bandit_arm_idx: 3,
+            inventory_risk_at_fill: 0.0,
+            vol_ratio_at_fill: 1.0,
+            bandit_multiplier_at_fill: 1.0,
+            fill_size: 1.0,
         };
         assert!(outcome.is_buy);
         assert!((outcome.fill_price - 50_000.0).abs() < f64::EPSILON);
@@ -379,6 +399,12 @@ mod tests {
                 quoted_spread_bps: 0.0,
                 predicted_as_bps: 0.0,
                 gamma_cache: None,
+                mdp_state_idx: 0,
+                bandit_arm_idx: 3,
+                inventory_risk_at_fill: 0.0,
+                vol_ratio_at_fill: 1.0,
+                bandit_multiplier_at_fill: 1.0,
+                fill_size: 1.0,
             });
         }
         assert_eq!(queue.len(), 3);

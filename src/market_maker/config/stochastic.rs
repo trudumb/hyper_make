@@ -462,6 +462,34 @@ pub struct StochasticConfig {
     #[serde(default = "default_cascade_cancel_threshold")]
     pub cascade_cancel_threshold: f64,
 
+    // ==================== Experience Replay (Stage 1) ====================
+    /// Enable SARSA experience logging for offline learning.
+    /// When true, every fill produces an ExperienceRecord at markout time (5s after fill).
+    /// Records written to `data/learning/experience/` as JSONL.
+    /// Default: false
+    pub enable_experience_logging: bool,
+
+    /// Directory for experience JSONL files.
+    /// Default: "data/learning/experience"
+    pub experience_dir: String,
+
+    /// Maximum capacity of the replay buffer (Stage 2).
+    /// Default: 50_000
+    pub replay_buffer_capacity: usize,
+
+    /// FQI blend weight for policy feedback (Stage 4).
+    /// 0.0 = disabled, 0.10 = conservative 10% blend.
+    /// Default: 0.0
+    pub fqi_blend_weight: f64,
+
+    /// Minimum fills before FQI policy activates.
+    /// Default: 100
+    pub fqi_min_fills: usize,
+
+    /// Re-fit FQI Q-table every N fills.
+    /// Default: 200
+    pub fqi_refit_interval: usize,
+
     // ==================== Adaptive Holding Time (Phase 4.3) ====================
     /// Enable adaptive holding time based on measured fill intervals.
     /// When true, tau = blend(measured_tau, theoretical_tau) adjusted for
@@ -615,6 +643,14 @@ impl Default for StochasticConfig {
             burst_sigma_boost: 1.5,
             // Phase 2C: Cascade cancel threshold
             cascade_cancel_threshold: 0.8,
+
+            // Experience Replay (Stage 1)
+            enable_experience_logging: false,
+            experience_dir: "data/learning/experience".to_string(),
+            replay_buffer_capacity: 50_000,
+            fqi_blend_weight: 0.0,
+            fqi_min_fills: 100,
+            fqi_refit_interval: 200,
 
             // Adaptive tau (Phase 4.3)
             use_adaptive_tau: true,

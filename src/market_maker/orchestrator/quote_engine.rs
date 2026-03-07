@@ -2906,14 +2906,53 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         market_params.bandit_spread_additive_bps =
             (bandit_selection.multiplier - 1.0) * market_params.market_spread_bps;
         market_params.bandit_is_exploration = bandit_selection.is_exploration;
+        // Cache for experience logging at fill time
+        self.stochastic.last_bandit_selection =
+            (bandit_selection.arm_idx, bandit_selection.multiplier);
 
-        // Legacy RL fields — kept at defaults for backward-compatible logging
-        market_params.rl_spread_delta_bps = 0.0;
+        // === FQI Policy Feedback (Stage 4) ===
+        // Blend offline Q-learned policy into rl_spread_delta_bps.
+        // Starts at 0.0 (disabled); increase fqi_blend_weight after validation.
+        let fqi_blend = self.stochastic.stochastic_config.fqi_blend_weight;
+        if fqi_blend > 0.0 {
+            if let Some(ref fqi) = self.fqi_result {
+                if self.estimator.is_warmed_up() {
+                    let mdp_state =
+                        crate::market_maker::learning::rl_agent::MDPStateCompact::from_continuous(
+                            position_frac * self.config.max_position,
+                            self.config.max_position,
+                            market_params.book_imbalance,
+                            vol_ratio_bandit,
+                        );
+                    let min_visits = self.stochastic.stochastic_config.fqi_min_fills;
+                    let rec = crate::market_maker::learning::FittedQIterator::recommend(
+                        fqi,
+                        mdp_state.to_index(),
+                        min_visits,
+                    );
+                    // Apply with blend weight and confidence scaling
+                    market_params.rl_spread_delta_bps =
+                        fqi_blend * rec.confidence * rec.spread_delta_bps;
+                    market_params.rl_confidence = rec.confidence;
+                    market_params.rl_expected_q = rec.q_value;
+                } else {
+                    market_params.rl_spread_delta_bps = 0.0;
+                    market_params.rl_confidence = 0.0;
+                    market_params.rl_expected_q = 0.0;
+                }
+            } else {
+                market_params.rl_spread_delta_bps = 0.0;
+                market_params.rl_confidence = 0.0;
+                market_params.rl_expected_q = 0.0;
+            }
+        } else {
+            market_params.rl_spread_delta_bps = 0.0;
+            market_params.rl_confidence = 0.0;
+            market_params.rl_expected_q = 0.0;
+        }
         market_params.rl_bid_skew_bps = 0.0;
         market_params.rl_ask_skew_bps = 0.0;
-        market_params.rl_confidence = 0.0;
         market_params.rl_is_exploration = false;
-        market_params.rl_expected_q = 0.0;
 
         // === Phase 8: Competitor Model Inference ===
         // Get competitor summary and populate MarketParams

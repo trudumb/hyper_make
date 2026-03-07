@@ -194,6 +194,10 @@ pub struct CheckpointBundle {
     /// Empirical Bayes parameter registry — all learnable parameters.
     #[serde(default)]
     pub parameter_registry: crate::market_maker::calibration::ParameterRegistry,
+
+    /// FQI Q-table for offline learning persistence.
+    #[serde(default)]
+    pub fqi_q_table: crate::market_maker::learning::FQICheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -1049,6 +1053,7 @@ mod tests {
             directional_belief: DirectionalBeliefCheckpoint::default(),
             as_fills_measured: 0,
             parameter_registry: Default::default(),
+            fqi_q_table: Default::default(),
         };
 
         // Serialize to JSON
@@ -1155,6 +1160,7 @@ mod tests {
             directional_belief: DirectionalBeliefCheckpoint::default(),
             as_fills_measured: 0,
             parameter_registry: Default::default(),
+            fqi_q_table: Default::default(),
         };
 
         // Serialize to JSON
@@ -1215,6 +1221,7 @@ mod tests {
             directional_belief: DirectionalBeliefCheckpoint::default(),
             as_fills_measured: 0,
             parameter_registry: Default::default(),
+            fqi_q_table: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -1264,6 +1271,7 @@ mod tests {
             directional_belief: DirectionalBeliefCheckpoint::default(),
             as_fills_measured: 0,
             parameter_registry: Default::default(),
+            fqi_q_table: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");

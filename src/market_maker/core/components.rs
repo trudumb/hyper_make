@@ -632,6 +632,11 @@ pub struct StochasticComponents {
     /// Used to feed the gamma calibrator at markout resolution time.
     /// (features_array, gamma_used)
     pub last_gamma_cache: Option<([f64; 15], f64)>,
+
+    /// Cached bandit selection from the most recent quote cycle.
+    /// Snapshotted into PendingFillOutcome at fill time for experience logging.
+    /// (arm_idx, multiplier)
+    pub last_bandit_selection: (usize, f64),
 }
 
 impl StochasticComponents {
@@ -759,6 +764,7 @@ impl StochasticComponents {
             // Online Bayesian gamma calibration
             gamma_calibrator: OnlineBayesianGammaCalibrator::default(),
             last_gamma_cache: None,
+            last_bandit_selection: (3, 1.0), // Default arm = 1.0x multiplier
         }
     }
 

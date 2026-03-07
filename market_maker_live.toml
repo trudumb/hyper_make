@@ -64,6 +64,12 @@ min_fill_hungry_gamma = 0.3
 enable_position_ramp = false
 enable_performance_gating = false
 
+# Experience replay logging (Stage 1)
+enable_experience_logging = true
+# FQI offline learning (Stages 3-5) — low thresholds for initial validation
+fqi_refit_interval = 1
+fqi_min_fills = 3
+
 # Stochastic constraints
 use_latency_spread_floor = true
 use_book_depth_constraint = true

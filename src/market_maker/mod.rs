@@ -367,12 +367,16 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     // REMOVED — RL superseded by SpreadBandit (contextual bandit).
     // RL hot-reload infrastructure removed in feedback-loop cleanup.
 
-    // === Experience Logging ===
+    // === Experience Logging & Offline Learning ===
     /// JSONL logger for RL experience records (SARSA tuples + metadata).
-    /// Enabled via `with_experience_logging()`. Writes to `logs/experience/`.
+    /// Enabled via config `enable_experience_logging` or `with_experience_logging()`.
     experience_logger: Option<learning::experience::ExperienceLogger>,
     /// Unique session identifier for correlating experience records.
     experience_session_id: String,
+    /// FQI Q-table for offline-learned policy (loaded from checkpoint or fitted on startup).
+    fqi_result: Option<learning::fqi::FQIResult>,
+    /// Fill count since last FQI refit (triggers periodic refit at threshold).
+    fqi_fills_since_refit: usize,
     /// Live analytics bundle (Sharpe, signal attribution, persistence).
     /// Enabled by default for both paper and live environments.
     pub live_analytics: analytics::live::LiveAnalytics,
@@ -614,7 +618,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             learning::cross_asset::CrossAssetSignals::for_altcoin(&config.asset)
         };
 
-        Self {
+        let mut mm = Self {
             config,
             strategy,
             environment,
@@ -712,8 +716,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             prior_confidence: 0.0, // Updated by inject_prior
             prior_source_mode: String::new(),
             // Phase 4: RL agent control fields removed (now SpreadBandit)
-            // Experience logging (disabled by default, enabled via with_experience_logging)
-            experience_logger: None,
+            // Experience logging: auto-enabled from stochastic config
+            experience_logger: None, // Initialized below if config flag set
+            fqi_result: None,        // Loaded from checkpoint or fitted on startup
+            fqi_fills_since_refit: 0,
             experience_session_id: format!(
                 "live_{}",
                 std::time::SystemTime::now()
@@ -772,7 +778,32 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             shadow_tuner_gate: None,
             shadow_tuner_kappa: None,
             shadow_tuner_sigma: None,
+        };
+
+        // Auto-enable experience logging from stochastic config
+        if mm.stochastic.stochastic_config.enable_experience_logging {
+            let dir = &mm.stochastic.stochastic_config.experience_dir;
+            let session_id = &mm.experience_session_id;
+            match learning::experience::ExperienceLogger::new(
+                dir,
+                learning::experience::ExperienceSource::Live,
+                session_id,
+            ) {
+                Ok(logger) => {
+                    info!(
+                        session_id = %mm.experience_session_id,
+                        experience_dir = dir,
+                        "Experience logging auto-enabled from config"
+                    );
+                    mm.experience_logger = Some(logger);
+                }
+                Err(e) => {
+                    warn!("Failed to initialize experience logger: {e}");
+                }
+            }
         }
+
+        mm
     }
 
     /// Set the dynamic risk configuration.
@@ -998,6 +1029,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         ) {
             Ok(logger) => {
                 self.experience_logger = Some(logger);
+                // Keep stochastic config in sync for FQI refit
+                self.stochastic.stochastic_config.experience_dir = output_dir.to_string();
                 info!(
                     session_id = %self.experience_session_id,
                     output_dir,
@@ -1243,6 +1276,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             },
             as_fills_measured: self.tier1.adverse_selection.fills_measured(),
             parameter_registry: Default::default(),
+            fqi_q_table: self
+                .fqi_result
+                .as_ref()
+                .map(learning::FQICheckpoint::from)
+                .unwrap_or_default(),
         }
     }
 
@@ -1328,6 +1366,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             bundle.directional_belief.dir_sigma_sq,
             bundle.directional_belief.kappa_smoothed,
         );
+        // Restore FQI Q-table from checkpoint
+        if let Some(result) = bundle.fqi_q_table.to_result() {
+            info!(
+                total_records = result.total_records,
+                "FQI Q-table restored from checkpoint"
+            );
+            self.fqi_result = Some(result);
+        }
     }
 
     // =========================================================================

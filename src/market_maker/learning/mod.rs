@@ -29,12 +29,15 @@ pub mod adaptive_ensemble;
 pub mod baseline_tracker;
 pub mod competitor_model;
 pub mod confidence;
+pub mod counterfactual;
 pub mod cross_asset;
 pub mod decision;
 pub mod ensemble;
 pub mod execution;
 pub mod experience;
+pub mod fqi;
 pub mod quote_outcome;
+pub mod replay_buffer;
 pub mod rl_agent;
 pub mod spread_bandit;
 pub mod types;
@@ -49,10 +52,15 @@ pub use competitor_model::{
 pub use confidence::{
     AggregateConfidence, EdgeBiasSummary, EdgeBiasTracker, ModelConfidenceTracker,
 };
+pub use counterfactual::{CounterfactualAnalysis, CounterfactualReport, FillCounterfactual};
 pub use decision::DecisionEngine;
 pub use ensemble::{EdgeModel, ModelEnsemble};
 pub use execution::ExecutionOptimizer;
-pub use experience::{ExperienceLogger, ExperienceParams, ExperienceRecord, ExperienceSource};
+pub use experience::{
+    ExperienceLogger, ExperienceParams, ExperienceRecord, ExperienceSource, MarkoutExperienceParams,
+};
+pub use fqi::{FQICheckpoint, FQIConfig, FQIPolicyRecommendation, FQIResult, FittedQIterator};
+pub use replay_buffer::{ReplayBuffer, ReplayStatistics};
 pub use rl_agent::{
     ExplorationStrategy, MDPAction, MDPState, QLearningAgent, QLearningConfig,
     RLPolicyRecommendation, Reward, RewardConfig, SimToRealConfig,

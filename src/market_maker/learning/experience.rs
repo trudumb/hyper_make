@@ -77,6 +77,26 @@ pub struct ExperienceRecord {
     pub inventory: f64,
     /// Current market regime
     pub regime: String,
+
+    // === Extended fields (Stage 1: Experience Replay) ===
+    /// Drift opposition penalty component of reward
+    #[serde(default)]
+    pub drift_penalty: Option<f64>,
+    /// Bandit spread multiplier applied at fill time
+    #[serde(default)]
+    pub bandit_multiplier: Option<f64>,
+    /// Volatility ratio (sigma / sigma_effective) at fill time
+    #[serde(default)]
+    pub vol_ratio: Option<f64>,
+    /// MDP compact state index (0..44) for FQI Q-table
+    #[serde(default)]
+    pub mdp_state_idx: Option<usize>,
+    /// Bandit arm index (0..7) for action grounding
+    #[serde(default)]
+    pub bandit_arm_idx: Option<usize>,
+    /// Inventory risk |position|/max_position at fill time
+    #[serde(default)]
+    pub inventory_risk_at_fill: Option<f64>,
 }
 
 /// Parameters for constructing an `ExperienceRecord` from RL components.
@@ -111,6 +131,45 @@ pub struct ExperienceParams {
     pub regime: String,
 }
 
+/// Lightweight parameters for constructing an `ExperienceRecord` at markout time.
+///
+/// Uses MDPStateCompact (45 states) and bandit arm index (8 arms) directly,
+/// avoiding the heavier MDPState/MDPAction types.
+pub struct MarkoutExperienceParams {
+    /// Compact MDP state index at fill time (0..44)
+    pub mdp_state_idx: usize,
+    /// Bandit arm index at fill time (0..7)
+    pub bandit_arm_idx: usize,
+    /// Reward computed at markout
+    pub reward: Reward,
+    /// Next compact MDP state index at markout time (0..44)
+    pub next_mdp_state_idx: usize,
+    /// Timestamp in milliseconds since epoch
+    pub timestamp_ms: u64,
+    /// Session identifier
+    pub session_id: String,
+    /// Source: paper or live
+    pub source: ExperienceSource,
+    /// Fill side (buy/sell)
+    pub side: String,
+    /// Fill price
+    pub fill_price: f64,
+    /// Mid price at time of fill
+    pub mid_price: f64,
+    /// Fill size
+    pub fill_size: f64,
+    /// Current inventory position
+    pub inventory: f64,
+    /// Current market regime
+    pub regime: String,
+    /// Bandit spread multiplier at fill time
+    pub bandit_multiplier: f64,
+    /// Volatility ratio at fill time
+    pub vol_ratio: f64,
+    /// Inventory risk |position|/max_position at fill time
+    pub inventory_risk_at_fill: f64,
+}
+
 impl ExperienceRecord {
     /// Create a new experience record from RL components.
     pub fn from_params(params: ExperienceParams) -> Self {
@@ -133,6 +192,42 @@ impl ExperienceRecord {
             fill_size: params.fill_size,
             inventory: params.inventory,
             regime: params.regime,
+            drift_penalty: Some(params.reward.drift_penalty),
+            bandit_multiplier: None,
+            vol_ratio: None,
+            mdp_state_idx: None,
+            bandit_arm_idx: None,
+            inventory_risk_at_fill: None,
+        }
+    }
+
+    /// Create from markout-time parameters (compact MDP state + bandit arm).
+    pub fn from_markout(params: MarkoutExperienceParams) -> Self {
+        Self {
+            state_idx: params.mdp_state_idx,
+            action_idx: params.bandit_arm_idx,
+            reward_total: params.reward.total,
+            edge_component: params.reward.edge_component,
+            inventory_penalty: params.reward.inventory_penalty,
+            volatility_penalty: params.reward.volatility_penalty,
+            inventory_change_penalty: params.reward.inventory_change_penalty,
+            next_state_idx: params.next_mdp_state_idx,
+            done: false,
+            timestamp_ms: params.timestamp_ms,
+            session_id: params.session_id,
+            source: params.source,
+            side: params.side,
+            fill_price: params.fill_price,
+            mid_price: params.mid_price,
+            fill_size: params.fill_size,
+            inventory: params.inventory,
+            regime: params.regime,
+            drift_penalty: Some(params.reward.drift_penalty),
+            bandit_multiplier: Some(params.bandit_multiplier),
+            vol_ratio: Some(params.vol_ratio),
+            mdp_state_idx: Some(params.mdp_state_idx),
+            bandit_arm_idx: Some(params.bandit_arm_idx),
+            inventory_risk_at_fill: Some(params.inventory_risk_at_fill),
         }
     }
 }
@@ -230,6 +325,12 @@ mod tests {
             fill_size: 1.0,
             inventory: 2.5,
             regime: "normal".to_string(),
+            drift_penalty: Some(-0.1),
+            bandit_multiplier: Some(1.05),
+            vol_ratio: Some(1.2),
+            mdp_state_idx: Some(10),
+            bandit_arm_idx: Some(4),
+            inventory_risk_at_fill: Some(0.3),
         };
 
         let json = serde_json::to_string(&record).unwrap();
@@ -273,6 +374,12 @@ mod tests {
             fill_size: 1.0,
             inventory: 0.0,
             regime: "normal".to_string(),
+            drift_penalty: None,
+            bandit_multiplier: None,
+            vol_ratio: None,
+            mdp_state_idx: None,
+            bandit_arm_idx: None,
+            inventory_risk_at_fill: None,
         };
 
         logger.log(&record).unwrap();
