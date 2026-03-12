@@ -64,6 +64,10 @@ TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 LOG_DIR="logs"
 LOG_FILE="${LOG_DIR}/mm_hip3_${DEX}_${ASSET}_${SPREAD_PROFILE}_${TIMESTAMP}.log"
 
+# Resolve binary path from cargo target-dir (supports custom target-dir in .cargo/config.toml)
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['target_directory'])" 2>/dev/null || echo "./target")
+MM_BIN="${TARGET_DIR}/release/market_maker"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -207,8 +211,8 @@ fi
 # Use timeout with --foreground to ensure signals are forwarded to the child
 # The binary is run directly for proper signal handling
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-timeout --foreground "${DURATION}" ./target/release/market_maker ${MM_ARGS} \
-    2>&1 | tee -a "${LOG_FILE}.console" || true
+timeout --foreground "${DURATION}" "${MM_BIN}" ${MM_ARGS} \
+    2>&1 | (trap '' INT; tee -a "${LOG_FILE}.console") || true
 
 # Stop capture tool if started
 if [ -n "$CAPTURE_PID" ]; then

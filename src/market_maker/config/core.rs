@@ -121,6 +121,10 @@ pub struct MarketMakerConfig {
     /// Reference symbol for cross-market signals (e.g., HYPE perp for HIP-3).
     /// Auto-detected from hyna: prefix, or set via CLI --reference-symbol.
     pub reference_symbol: Option<String>,
+
+    /// Market-close remaining position during graceful shutdown.
+    /// Default: true. Override with --no-close-on-exit CLI flag.
+    pub close_on_exit: bool,
 }
 
 impl MarketMakerConfig {
@@ -253,6 +257,7 @@ mod tests {
             fee_bps: 1.5,
             cascade: CascadeConfig::default(),
             reference_symbol: None,
+            close_on_exit: true,
         }
     }
 

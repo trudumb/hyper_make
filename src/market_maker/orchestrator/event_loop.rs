@@ -829,8 +829,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Graceful shutdown with timeout to ensure completion even under load
         // We give ourselves 5 seconds to cancel orders before forced exit
-        info!("Initiating graceful shutdown (5 second timeout)...");
-        match tokio::time::timeout(Duration::from_secs(5), self.shutdown()).await {
+        info!("Initiating graceful shutdown (10 second timeout)...");
+        match tokio::time::timeout(Duration::from_secs(10), self.shutdown()).await {
             Ok(Ok(())) => {
                 info!("Graceful shutdown completed successfully");
             }
@@ -839,7 +839,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
             Err(_) => {
                 error!(
-                    "Graceful shutdown timed out after 5 seconds - orders may remain on exchange"
+                    "Graceful shutdown timed out after 10 seconds - orders may remain on exchange"
                 );
             }
         }
@@ -1206,11 +1206,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         // Graceful shutdown.
-        info!("Initiating graceful shutdown (5 second timeout)...");
-        match tokio::time::timeout(Duration::from_secs(5), self.shutdown()).await {
+        info!("Initiating graceful shutdown (10 second timeout)...");
+        match tokio::time::timeout(Duration::from_secs(10), self.shutdown()).await {
             Ok(Ok(())) => info!("Graceful shutdown completed successfully"),
             Ok(Err(e)) => error!("Graceful shutdown encountered error: {e}"),
-            Err(_) => error!("Graceful shutdown timed out after 5 seconds"),
+            Err(_) => error!("Graceful shutdown timed out after 10 seconds"),
         }
 
         info!("Market maker stopped.");

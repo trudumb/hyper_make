@@ -282,17 +282,20 @@ impl KalmanDriftEstimator {
         self.state_mean / 10_000.0
     }
 
-    /// James-Stein shrunken drift rate (fractional per second).
-    /// drift_shrunk = drift × max(0, 1 - P/drift²)
-    /// SNR < 1 → returns 0. SNR >> 1 → returns near-raw.
-    /// Prevents noisy sub-threshold drift from creating phantom skew.
+    /// Bayesian soft-shrunken drift rate (fractional per second).
+    /// drift_shrunk = drift × drift² / (drift² + P)
+    /// This is the Bayes estimator under squared loss with Gaussian prior.
+    /// SNR = 0.5 → shrinkage = 0.20 (was 0 under hard threshold)
+    /// SNR = 1.0 → shrinkage = 0.50 (was 0)
+    /// SNR = 2.0 → shrinkage = 0.80 (was 0.75)
+    /// Allows sub-threshold drift to contribute proportionally to its SNR.
     pub fn shrunken_drift_rate_per_sec(&self) -> f64 {
         let drift_bps = self.state_mean;
         let drift_sq = drift_bps * drift_bps;
         if drift_sq < 1e-12 {
             return 0.0;
         }
-        let shrinkage = (1.0 - self.state_variance / drift_sq).max(0.0);
+        let shrinkage = drift_sq / (drift_sq + self.state_variance);
         (drift_bps * shrinkage) / 10_000.0
     }
 
@@ -323,7 +326,8 @@ impl KalmanDriftEstimator {
         let score = corroboration_score.clamp(0.0, 1.0);
         let kappa = corroboration_kappa.max(0.0);
         let p_effective = self.state_variance / (1.0 + kappa * score);
-        let shrinkage = (1.0 - p_effective / drift_sq).max(0.0);
+        // Bayesian soft shrinkage: drift² / (drift² + P_eff)
+        let shrinkage = drift_sq / (drift_sq + p_effective);
         (drift_bps * shrinkage) / 10_000.0
     }
 
@@ -356,6 +360,16 @@ impl KalmanDriftEstimator {
     /// Posterior mean (for diagnostics).
     pub fn state_mean(&self) -> f64 {
         self.state_mean
+    }
+
+    /// Drift signal-to-noise ratio: μ / √P.
+    /// Positive SNR = drift in positive direction with confidence.
+    /// Used for gating HJB drift seeding and closing bias.
+    pub fn drift_snr(&self) -> f64 {
+        if self.state_variance < 1e-12 {
+            return 0.0;
+        }
+        self.state_mean / self.state_variance.sqrt()
     }
 
     /// Online parameter adaptation from realized drift.
@@ -1075,34 +1089,44 @@ mod tests {
     }
 
     #[test]
-    fn test_shrunken_drift_zeros_low_snr() {
-        // SNR < 1: drift=0.78, P=2.0 → drift²=0.608, P/drift²=3.29 → shrinkage=0
+    fn test_shrunken_drift_heavily_shrunk_at_low_snr() {
+        // SNR < 1: drift=0.78, P=2.0 → drift²=0.6084
+        // Bayesian soft shrinkage: 0.6084/(0.6084+2.0) = 0.233
+        // Result: heavily shrunken but nonzero (prevents phantom skew while allowing signal)
         let est = KalmanDriftEstimator {
             state_mean: 0.78,
             state_variance: 2.0,
             ..Default::default()
         };
-        assert_eq!(
-            est.shrunken_drift_rate_per_sec(),
-            0.0,
-            "Sub-threshold drift (SNR<1) should be shrunk to zero"
+        let shrunk = est.shrunken_drift_rate_per_sec();
+        let raw = est.drift_rate_per_sec();
+        // Nonzero (soft shrinkage)
+        assert!(shrunk.abs() > 0.0, "Soft shrinkage should be nonzero");
+        // Heavily shrunken (< 25% of raw)
+        assert!(
+            shrunk.abs() < raw.abs() * 0.25,
+            "Low SNR should be heavily shrunken: shrunk={} raw={}",
+            shrunk,
+            raw
         );
     }
 
     #[test]
     fn test_shrunken_drift_partial_at_moderate_snr() {
-        // SNR = 2: drift=2.0, P=2.0 → drift²=4.0, shrinkage=0.5 → effective=1.0 bps
+        // Bayesian: drift²/(drift² + P) = 4/(4+2) = 0.667
+        // drift=2.0, shrinkage=0.667 → effective=1.333 bps
         let est = KalmanDriftEstimator {
             state_mean: 2.0,
             state_variance: 2.0,
             ..Default::default()
         };
         let shrunk = est.shrunken_drift_rate_per_sec();
-        let expected_bps = 1.0; // 2.0 * 0.5
+        let expected_shrinkage = 4.0 / (4.0 + 2.0); // 0.667
+        let expected_bps = 2.0 * expected_shrinkage; // 1.333
         let expected_frac = expected_bps / 10_000.0;
         assert!(
             (shrunk - expected_frac).abs() < 1e-10,
-            "Moderate SNR should give partial shrinkage: got {shrunk}, expected {expected_frac}"
+            "Moderate SNR should give Bayesian shrinkage: got {shrunk}, expected {expected_frac}"
         );
     }
 
@@ -1174,61 +1198,76 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_shrinkage_snr_08_with_corroboration_survives() {
-        // SNR = 0.8: standard shrinkage zeros it. With corroboration=0.6, it survives.
-        let est = KalmanDriftEstimator {
+    fn test_soft_shrinkage_snr_scaling() {
+        // Bayesian soft shrinkage: drift × drift²/(drift² + P)
+        // Low SNR → heavily shrunken but nonzero (the whole point of Phase 1)
+        let est_low = KalmanDriftEstimator {
             state_mean: 2.0,      // 2 bps/sec drift
-            state_variance: 6.25, // P = 6.25 → SNR = 4/6.25 = 0.64 < 1 → standard zeros
+            state_variance: 6.25, // drift²=4, P=6.25 → shrinkage = 4/10.25 = 0.39
             last_update_ms: now_ms(),
             ..Default::default()
         };
 
-        // Standard shrinkage should zero it
-        assert_eq!(
-            est.shrunken_drift_rate_per_sec(),
-            0.0,
-            "Standard shrinkage should zero SNR < 1"
+        let shrunken_low = est_low.shrunken_drift_rate_per_sec();
+        // Soft shrinkage: nonzero even at SNR < 1
+        assert!(
+            shrunken_low.abs() > 1e-7,
+            "Soft shrinkage should produce nonzero drift at SNR < 1: {}",
+            shrunken_low
+        );
+        // But heavily shrunken: ~39% of raw
+        let raw_low = est_low.drift_rate_per_sec();
+        assert!(
+            shrunken_low.abs() < raw_low.abs() * 0.5,
+            "Low SNR should be heavily shrunken: shrunken={} raw={}",
+            shrunken_low,
+            raw_low
         );
 
-        // Adaptive with 3/5 corroboration should preserve it
-        let adaptive = est.adaptive_shrunken_drift(0.6, 0.5);
-        // P_effective = 6.25 / (1 + 0.5*0.6) = 6.25/1.3 = 4.81
-        // shrinkage = max(0, 1 - 4.81/4.0) = 0 — still zeroed!
-        // Need higher drift or lower variance. Let's use state_mean=3.0
-        // Actually with state_mean=2.0, drift_sq=4.0, P_eff=4.81 → still > drift_sq
-        // This is correct: SNR=0.64 is too low even with corroboration
-        // The plan says SNR ~0.8 should survive. Let's test that case.
-        let _ = adaptive;
-
-        let est2 = KalmanDriftEstimator {
-            state_mean: 3.0,      // 3 bps/sec drift
-            state_variance: 10.0, // P = 10.0 → SNR = 9/10 = 0.9 < 1
+        // High SNR → barely shrunken
+        let est_high = KalmanDriftEstimator {
+            state_mean: 10.0,    // 10 bps/sec
+            state_variance: 2.0, // drift²=100, P=2 → shrinkage = 100/102 = 0.98
             last_update_ms: now_ms(),
             ..Default::default()
         };
-        assert_eq!(est2.shrunken_drift_rate_per_sec(), 0.0);
-
-        let adaptive2 = est2.adaptive_shrunken_drift(0.6, 0.5);
-        // P_effective = 10.0 / 1.3 = 7.69
-        // shrinkage = max(0, 1 - 7.69/9.0) = max(0, 0.146) = 0.146
-        // drift = 3.0 * 0.146 / 10000 = 0.0000437
+        let shrunken_high = est_high.shrunken_drift_rate_per_sec();
+        let raw_high = est_high.drift_rate_per_sec();
         assert!(
-            adaptive2.abs() > 1e-6,
-            "Adaptive shrinkage should preserve SNR~0.9 drift with corroboration: {}",
-            adaptive2
+            shrunken_high.abs() > raw_high.abs() * 0.95,
+            "High SNR should be barely shrunken: shrunken={} raw={}",
+            shrunken_high,
+            raw_high
         );
     }
 
     #[test]
-    fn test_adaptive_shrinkage_no_corroboration_still_zeros() {
+    fn test_adaptive_shrinkage_corroboration_relaxes() {
+        // Adaptive shrinkage with corroboration should produce larger drift
+        // than without corroboration, since P_effective < P.
         let est = KalmanDriftEstimator {
-            state_mean: 1.5,     // weak drift
-            state_variance: 5.0, // SNR = 2.25/5 = 0.45 — clearly sub-threshold
+            state_mean: 3.0,      // 3 bps/sec drift
+            state_variance: 10.0, // drift²=9, P=10 → base shrinkage = 9/19 = 0.47
             last_update_ms: now_ms(),
             ..Default::default()
         };
-        let adaptive = est.adaptive_shrunken_drift(0.0, 0.5);
-        assert_eq!(adaptive, 0.0, "No corroboration should not relax threshold");
+
+        let no_corrob = est.adaptive_shrunken_drift(0.0, 0.5);
+        let with_corrob = est.adaptive_shrunken_drift(0.6, 0.5);
+
+        // Both should be nonzero (soft shrinkage)
+        assert!(
+            no_corrob.abs() > 1e-7,
+            "Soft shrinkage without corroboration should be nonzero: {}",
+            no_corrob
+        );
+        // Corroboration should produce larger drift (less shrinkage)
+        assert!(
+            with_corrob.abs() > no_corrob.abs(),
+            "Corroboration should relax shrinkage: with={} without={}",
+            with_corrob,
+            no_corrob
+        );
     }
 
     #[test]

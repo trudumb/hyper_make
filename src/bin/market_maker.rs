@@ -363,6 +363,11 @@ struct Cli {
     #[arg(long)]
     enable_shadow_tuner: bool,
 
+    /// Do NOT market-close the remaining position during graceful shutdown.
+    /// By default, the market maker closes the position with an IOC reduce-only order.
+    #[arg(long)]
+    no_close_on_exit: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -889,6 +894,13 @@ impl MarketMakerMetricsRecorder for MarketMakerMetrics {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Ignore SIGPIPE so that piping through `tee` doesn't kill us
+    // before shutdown() runs when the user presses Ctrl+C.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     // Load .env file if it exists (before parsing CLI args)
     let _ = dotenvy::dotenv();
 
@@ -1761,6 +1773,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .reference_symbol
             .clone()
             .or_else(|| auto_detect_reference(&asset)),
+        close_on_exit: !cli.no_close_on_exit,
     };
 
     // Extract values before mm_config is moved
@@ -2794,6 +2807,7 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
             .reference_symbol
             .clone()
             .or_else(|| auto_detect_reference(&asset)),
+        close_on_exit: !cli.no_close_on_exit,
     };
 
     info!(

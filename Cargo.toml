@@ -48,6 +48,9 @@ bumpalo = { version = "3.16", features = ["collections"] }
 # Compile-time assertions for thread safety
 static_assertions = "1.1"
 
+# SIGPIPE handling for graceful shutdown through pipes
+libc = "0.2"
+
 # Random number generation for stochastic allocation
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"

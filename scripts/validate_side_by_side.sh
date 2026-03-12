@@ -41,6 +41,10 @@ SNAPSHOT_DIR="${BASE_DIR}/snapshots"
 PAPER_PORT=9091
 LIVE_PORT=9090
 
+# Resolve binary path from cargo target-dir (supports custom target-dir in .cargo/config.toml)
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['target_directory'])" 2>/dev/null || echo "./target")
+MM_BIN="${TARGET_DIR}/release/market_maker"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -117,7 +121,7 @@ SNAPSHOT_PID=$!
 echo -e "${YELLOW}[3/5] Starting paper trading (background, port ${PAPER_PORT})...${NC}"
 PAPER_LOG="${PAPER_DIR}/paper_trader.log"
 RUST_LOG=hyperliquid_rust_sdk::market_maker::simulation=info,market_maker=info \
-    ./target/release/market_maker ${COMMON_ARGS} --metrics-port ${PAPER_PORT} \
+    "${MM_BIN}" ${COMMON_ARGS} --metrics-port ${PAPER_PORT} \
     paper --duration ${DURATION} \
     > "${PAPER_LOG}" 2>&1 &
 PAPER_PID=$!
@@ -150,9 +154,9 @@ cleanup() {
 trap cleanup EXIT
 
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-    timeout --foreground "${DURATION}" ./target/release/market_maker ${COMMON_ARGS} \
+    timeout --foreground "${DURATION}" "${MM_BIN}" ${COMMON_ARGS} \
     --metrics-port ${LIVE_PORT} --log-file "${LIVE_LOG}" \
-    2>&1 | tee "${LIVE_LOG}.console" || true
+    2>&1 | (trap '' INT; tee "${LIVE_LOG}.console") || true
 
 # Wait for paper to finish (it has its own duration timer)
 echo ""

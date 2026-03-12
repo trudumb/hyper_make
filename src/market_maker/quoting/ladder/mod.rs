@@ -125,10 +125,21 @@ pub struct LadderConfig {
     /// Default: 0.30 (never more than 30% of visible depth at a level).
     #[serde(default = "default_self_impact_ratio")]
     pub self_impact_max_ratio: f64,
+
+    /// Maximum closing bias in basis points.
+    /// When position opposes detected drift, reducing-side levels are shifted
+    /// closer to mid by up to this many bps. Tunable, not hardcoded.
+    /// Default: 4.0 bps. Set to 0.0 to disable.
+    #[serde(default = "default_closing_bias_max_bps")]
+    pub closing_bias_max_bps: f64,
 }
 
 fn default_self_impact_ratio() -> f64 {
     0.30
+}
+
+fn default_closing_bias_max_bps() -> f64 {
+    4.0
 }
 
 impl Default for LadderConfig {
@@ -151,6 +162,7 @@ impl Default for LadderConfig {
             dynamic_depths: None,
             max_spread_per_side_bps: 0.0, // Disabled by default
             self_impact_max_ratio: default_self_impact_ratio(),
+            closing_bias_max_bps: default_closing_bias_max_bps(),
         }
     }
 }
@@ -261,6 +273,11 @@ pub struct LadderParams {
     /// When own ladder depth is unknown (first cycle), the skew cap uses this
     /// instead of the hardcoded 8 bps fallback.
     pub effective_floor_bps: f64,
+
+    // === Closing Bias (Phase 5: Momentum-Aware Position Reduction) ===
+    /// Closing bias in bps: how much to shift reducing-side levels closer to mid.
+    /// Positive = shift closer. Computed from drift_snr and p_continuation.
+    pub closing_bias_bps: f64,
 }
 
 #[cfg(test)]
@@ -289,6 +306,7 @@ mod tests {
             dynamic_depths: None,
             max_spread_per_side_bps: 0.0,
             self_impact_max_ratio: 0.30,
+            closing_bias_max_bps: 4.0,
         };
 
         let params = LadderParams {
@@ -324,6 +342,7 @@ mod tests {
             cached_best_bid: 99.99,
             cached_best_ask: 100.01,
             effective_floor_bps: 8.0,
+            closing_bias_bps: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -381,6 +400,7 @@ mod tests {
             cached_best_bid: 999.9,
             cached_best_ask: 1000.1,
             effective_floor_bps: 8.0,
+            closing_bias_bps: 0.0,
         };
 
         let params_long = LadderParams {
@@ -412,6 +432,7 @@ mod tests {
             dynamic_depths: None,
             max_spread_per_side_bps: 0.0,
             self_impact_max_ratio: 0.30,
+            closing_bias_max_bps: 4.0,
         };
 
         // Calibrated AS model with higher AS at touch
@@ -450,6 +471,7 @@ mod tests {
             cached_best_bid: 99.99,
             cached_best_ask: 100.01,
             effective_floor_bps: 8.0,
+            closing_bias_bps: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -512,6 +534,7 @@ mod tests {
             cached_best_bid: 99.80,
             cached_best_ask: 100.20,
             effective_floor_bps: 8.0,
+            closing_bias_bps: 0.0,
         };
 
         // Same params but WITHOUT drift adjustment

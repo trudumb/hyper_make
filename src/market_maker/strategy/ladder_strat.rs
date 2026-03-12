@@ -1113,6 +1113,30 @@ impl LadderStrategy {
         // Use Bayesian floor but cap at 25 bps to prevent absurd floors
         let effective_floor_bps = physical_floor_bps.max(bayesian_floor_bps).min(25.0);
 
+        // Phase 5: Momentum-aware closing bias — when position opposes detected drift,
+        // shift reducing-side levels closer to mid so passive closing orders fill sooner.
+        // The bid at 36.87 would instead be at ~36.94-36.96, much more likely to fill.
+        let closing_bias_max = self.ladder_config.closing_bias_max_bps;
+        let closing_bias_bps = if market_params.position_opposes_momentum && closing_bias_max > 0.0
+        {
+            let drift_snr_abs = if market_params.drift_uncertainty_bps > 1e-6 {
+                let drift_bps = market_params.drift_rate_per_sec_raw * 10_000.0;
+                (drift_bps / market_params.drift_uncertainty_bps).abs()
+            } else {
+                0.0
+            };
+            let p_cont = market_params.continuation_p;
+            if drift_snr_abs > 1.0 && p_cont > 0.5 {
+                let urgency = (drift_snr_abs - 1.0).min(2.0) * p_cont;
+                // Scale by config max, default 4.0 bps
+                (urgency * closing_bias_max / 2.0).min(closing_bias_max)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
         let params = LadderParams {
             mid_price: effective_mid,
             market_mid: market_params.market_mid, // Actual exchange mid for safety checks
@@ -1157,6 +1181,7 @@ impl LadderStrategy {
             } else {
                 market_params.market_mid * (1.0 + market_params.market_spread_bps / 20000.0)
             },
+            closing_bias_bps,
         };
 
         // [SPREAD TRACE] Phase 1: floor — capture GLFT optimal for diagnostics

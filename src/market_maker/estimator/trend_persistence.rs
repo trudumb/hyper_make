@@ -343,6 +343,10 @@ impl TrendPersistenceTracker {
     }
 
     /// Calculate timeframe agreement (0.0 to 1.0).
+    ///
+    /// Weights long-window comparisons by observation density to handle early
+    /// sessions where the long window (5 min) contains stale pre-session data.
+    /// When long window is sparse, short-medium agreement dominates.
     fn calculate_agreement(&self, short_bps: f64, medium_bps: f64, long_bps: f64) -> f64 {
         // Treat near-zero as neutral (no opinion)
         const THRESHOLD: f64 = 1.0; // 1 bps minimum to count
@@ -363,10 +367,55 @@ impl TrendPersistenceTracker {
             0.0
         };
 
+        // Weight long-window comparisons by how full the long window is.
+        // At ~100ms intervals, a full 5-min window has ~3000 observations.
+        // Use 1000 as "reasonably full" threshold (conservative).
+        let long_fill_ratio = (self.long_returns.len() as f64 / 1000.0).min(1.0);
+
+        // Short-medium agreement: always full weight
+        let sm_agree = if short_sign != 0.0 && medium_sign != 0.0 {
+            if short_sign == medium_sign {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            // No opinion from one side — don't count
+            return self.fallback_agreement(short_sign, medium_sign, long_sign);
+        };
+
+        // Long-involving comparisons: weighted by fill ratio
+        let sl_agree = if short_sign != 0.0 && long_sign != 0.0 {
+            if short_sign == long_sign {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            sm_agree // neutral long → inherit short-medium consensus
+        };
+
+        let ml_agree = if medium_sign != 0.0 && long_sign != 0.0 {
+            if medium_sign == long_sign {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            sm_agree // neutral long → inherit short-medium consensus
+        };
+
+        // Weighted average: sm always counts, sl/ml scaled by long fill ratio
+        let weighted = sm_agree + long_fill_ratio * (sl_agree + ml_agree);
+        let denom = 1.0 + 2.0 * long_fill_ratio;
+        weighted / denom
+    }
+
+    /// Fallback agreement when short-medium pair can't be compared.
+    fn fallback_agreement(&self, short_sign: f64, medium_sign: f64, long_sign: f64) -> f64 {
         let mut agreements = 0;
         let mut comparisons = 0;
 
-        // Only count comparisons where both have opinions
         if short_sign != 0.0 && medium_sign != 0.0 {
             comparisons += 1;
             if short_sign == medium_sign {

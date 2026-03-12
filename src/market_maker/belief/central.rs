@@ -506,6 +506,11 @@ struct InternalState {
     /// Last cross-venue update timestamp
     cv_last_update_ms: u64,
 
+    // === Trend Autocorrelation (Phase 3: prevents 9-second belief amnesia) ===
+    /// Lag-1 return autocorrelation from TrendPersistenceTracker.
+    /// When positive (genuine trend), slows belief decay and reduces process noise.
+    trend_autocorrelation: f64,
+
     // === Statistics ===
     n_price_obs: u64,
     n_fills: u64,
@@ -656,6 +661,9 @@ impl Default for InternalState {
             cv_observation_count: 0,
             cv_last_update_ms: 0,
 
+            // Trend autocorrelation (Phase 3)
+            trend_autocorrelation: 0.0,
+
             // Stats
             n_price_obs: 0,
             n_fills: 0,
@@ -798,6 +806,13 @@ impl CentralBeliefState {
             state.kappa_smoothed = kappa_smoothed;
             state.kappa_smoothed_initialized = true;
         }
+    }
+
+    /// Update the trend autocorrelation from TrendPersistenceTracker.
+    /// When positive, slows belief decay (prevents 9-second amnesia during trends).
+    pub fn set_trend_autocorrelation(&self, autocorrelation: f64) {
+        let mut state = self.state.write().unwrap();
+        state.trend_autocorrelation = autocorrelation.clamp(-1.0, 1.0);
     }
 
     // =========================================================================
@@ -1098,7 +1113,13 @@ impl CentralBeliefState {
             return;
         }
         let dt_secs = (current_ms - state.dir_last_update_ms) as f64 / 1000.0;
-        let tau = state.acf_tracker.tau_ac().clamp(3.0, 120.0);
+        let base_tau = state.acf_tracker.tau_ac().clamp(3.0, 120.0);
+
+        // Phase 3: Trend-aware decay — when returns are positively autocorrelated
+        // (genuine trend), slow the belief decay so directional conviction persists.
+        // autocorr=0.3 → tau×1.6, autocorr=0.5 → tau×2.0
+        let trend_ac = state.trend_autocorrelation.max(0.0);
+        let tau = base_tau * (1.0 + 2.0 * trend_ac);
         let decay = (-dt_secs / tau).exp();
 
         // Mean reverts toward zero
@@ -1107,7 +1128,10 @@ impl CentralBeliefState {
         // Source-attenuated process noise: persistent sources → less variance growth
         // persistence=0.8 → q_scale=0.36 (fill: 36% of normal Q)
         // persistence=0.2 → q_scale=0.84 (price: 84% of normal Q)
-        let q_scale = 1.0 - persistence.clamp(0.0, 1.0) * 0.8;
+        let base_q_scale = 1.0 - persistence.clamp(0.0, 1.0) * 0.8;
+        // Phase 3: Reduce process noise during trends — trending markets have
+        // less surprise, so beliefs should be stickier.
+        let q_scale = base_q_scale * (1.0 - 0.4 * trend_ac);
         state.dir_sigma_sq = state.dir_sigma_sq * decay * decay
             + self.config.dir_process_noise_rate * q_scale * dt_secs;
 

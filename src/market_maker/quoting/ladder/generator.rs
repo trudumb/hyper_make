@@ -212,7 +212,19 @@ impl Ladder {
             },
         );
 
-        // 7. Enforce inviolable spread floor on total spread (best_ask - best_bid).
+        // 7. Apply closing bias: shift reducing-side levels closer to mid when
+        // position opposes momentum (Phase 5: momentum-aware passive closing).
+        if params.closing_bias_bps > 0.0 {
+            apply_closing_bias(
+                &mut ladder,
+                params.closing_bias_bps,
+                params.inventory_ratio,
+                params.mid_price,
+                params.decimals,
+            );
+        }
+
+        // 8. Enforce inviolable spread floor on total spread (best_ask - best_bid).
         // Post-hoc: preserves GLFT reservation-price skew by proportional deficit split.
         enforce_spread_floor(&mut ladder, params.mid_price, params.effective_floor_bps);
 
@@ -345,7 +357,18 @@ impl Ladder {
             },
         );
 
-        // 8. Enforce inviolable spread floor (same as symmetric path)
+        // 8. Apply closing bias (same as symmetric path)
+        if params.closing_bias_bps > 0.0 {
+            apply_closing_bias(
+                &mut ladder,
+                params.closing_bias_bps,
+                params.inventory_ratio,
+                params.mid_price,
+                params.decimals,
+            );
+        }
+
+        // 9. Enforce inviolable spread floor (same as symmetric path)
         enforce_spread_floor(&mut ladder, params.mid_price, params.effective_floor_bps);
 
         ladder
@@ -1166,6 +1189,51 @@ pub(crate) struct RlAdjustmentParams {
     /// Warmup progress [0.0, 1.0]. RL adjustments are disabled when < 0.5
     /// to prevent untrained RL policies from widening spreads during early learning.
     pub warmup_pct: f64,
+}
+
+/// Apply momentum-aware closing bias to the ladder.
+///
+/// When position opposes detected drift, shifts reducing-side levels closer to mid
+/// so passive closing orders are more likely to fill. The expanding side is NOT changed.
+///
+/// - Long position (inventory_ratio > 0): reducing side = asks → shift asks down
+/// - Short position (inventory_ratio < 0): reducing side = bids → shift bids up
+fn apply_closing_bias(
+    ladder: &mut Ladder,
+    bias_bps: f64,
+    inventory_ratio: f64,
+    mid: f64,
+    decimals: u32,
+) {
+    if bias_bps <= 0.0 || inventory_ratio.abs() < 1e-6 || mid <= 0.0 {
+        return;
+    }
+
+    let bias_frac = bias_bps / 10_000.0;
+
+    if inventory_ratio > 0.0 {
+        // Long: reducing side = asks (selling). Shift asks closer to mid (lower price).
+        for level in &mut ladder.asks {
+            let new_price = level.price * (1.0 - bias_frac);
+            // Safety: asks must stay above mid
+            level.price =
+                round_to_significant_and_decimal(new_price.max(mid + EPSILON), 5, decimals);
+        }
+    } else {
+        // Short: reducing side = bids (buying). Shift bids closer to mid (higher price).
+        for level in &mut ladder.bids {
+            let new_price = level.price * (1.0 + bias_frac);
+            // Safety: bids must stay below mid
+            level.price =
+                round_to_significant_and_decimal(new_price.min(mid - EPSILON), 5, decimals);
+        }
+    }
+
+    tracing::debug!(
+        bias_bps = %format!("{:.2}", bias_bps),
+        side = if inventory_ratio > 0.0 { "asks" } else { "bids" },
+        "Applied closing bias to reducing side"
+    );
 }
 
 /// Apply RL policy adjustments to the ladder.

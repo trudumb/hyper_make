@@ -116,6 +116,10 @@ LOG_DIR="logs"
 OUTPUT_DIR="${LOG_DIR}/paper_trading_${ASSET}_${TIMESTAMP}"
 LOG_FILE="${OUTPUT_DIR}/paper_trader.log"
 
+# Resolve binary path from cargo target-dir (supports custom target-dir in .cargo/config.toml)
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['target_directory'])" 2>/dev/null || echo "./target")
+MM_BIN="${TARGET_DIR}/release/market_maker"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -239,7 +243,7 @@ if [ "$CAPTURE" = true ]; then
 fi
 
 # Run paper trader with tee to capture output
-./target/release/market_maker ${CLI_ARGS} paper ${PAPER_ARGS} 2>&1 | tee "${LOG_FILE}" || true
+"${MM_BIN}" ${CLI_ARGS} paper ${PAPER_ARGS} 2>&1 | (trap '' INT; tee "${LOG_FILE}") || true
 
 # Stop capture tool if started
 if [ -n "$CAPTURE_PID" ]; then

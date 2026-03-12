@@ -821,6 +821,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.config.max_position,
         );
 
+        // Seed HJB with Kalman drift when Kalman has meaningful signal.
+        // The HJB controller's OU model has a 1.4s half-life (θ=0.5), which means
+        // its internal drift always mean-reverts to zero before minute-scale trends
+        // can generate urgency. Injecting the Kalman drift (which tracks multi-signal
+        // posterior) sidesteps both the OU-too-fast problem and the warmup gate.
+        let kalman_snr = self.drift_estimator.drift_snr();
+        if kalman_snr.abs() > 0.5 {
+            let kalman_drift = self.drift_estimator.drift_rate_per_sec();
+            self.stochastic
+                .hjb_controller
+                .set_drift_directly(kalman_drift);
+        }
+
         // Update HJB controller's funding-cycle horizon and terminal penalty
         {
             // Wire funding settlement time into HJB controller for natural urgency
@@ -921,6 +934,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .pre_fill_classifier
                     .update_trend(trend_signal.long_momentum_bps);
             }
+
+            // Phase 3: Wire trend autocorrelation to belief system.
+            // When returns are positively autocorrelated (genuine trend), beliefs
+            // decay slower, preventing the 9-second amnesia observed in live trading.
+            self.central_beliefs
+                .set_trend_autocorrelation(trend_signal.return_autocorrelation);
 
             // Enhanced microstructure classifier blend: inject 10-feature toxicity
             // into pre_fill_classifier as external signal (uses z-score normalized

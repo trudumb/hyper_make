@@ -1,5 +1,6 @@
 [build]
 rustc-wrapper = "sccache"
+target-dir = "/home/trudumb/build-cache/hyper_make"
 
 [target.x86_64-unknown-linux-gnu]
 linker = "gcc"

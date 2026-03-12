@@ -209,6 +209,33 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
         }
 
+        // Close remaining position via IOC reduce-only order
+        if self.config.close_on_exit {
+            let pos = self.position.position();
+            if pos.abs() > 1e-10 {
+                let is_buy = pos < 0.0; // buy to close short, sell to close long
+                let size = pos.abs();
+                info!(
+                    position = %format!("{:.6}", pos),
+                    side = if is_buy { "BUY" } else { "SELL" },
+                    "Closing position on shutdown"
+                );
+
+                let result = self
+                    .environment
+                    .place_ioc_reduce_order(&self.config.asset, size, is_buy, 50, self.latest_mid)
+                    .await;
+
+                if result.filled {
+                    info!(oid = result.oid, "Position closed on shutdown");
+                } else {
+                    warn!(error = ?result.error, "Position close failed — position remains open");
+                }
+            } else {
+                info!("No position to close on shutdown");
+            }
+        }
+
         info!("=== GRACEFUL SHUTDOWN COMPLETE ===");
         Ok(())
     }
