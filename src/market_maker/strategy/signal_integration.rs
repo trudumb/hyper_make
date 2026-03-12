@@ -1712,7 +1712,8 @@ impl SignalIntegrator {
             lead_lag_gating_weight: signals.lead_lag_gating_weight,
 
             informed_flow_spread_mult: signals.informed_flow_spread_mult,
-            informed_flow_active: self.config.use_informed_flow && signals.p_informed > 0.0,
+            informed_flow_active: self.config.use_informed_flow
+                && signals.informed_flow_spread_mult > 1.01,
             informed_flow_gating_weight: signals.informed_flow_gating_weight,
 
             regime_kappa_effective: signals.kappa_effective,
@@ -1725,7 +1726,16 @@ impl SignalIntegrator {
                     1.0
                 }
             },
-            regime_active: self.config.use_regime_kappa,
+            regime_active: self.config.use_regime_kappa && {
+                let kappa_eff = signals.kappa_effective;
+                let kappa_prior = self.regime_kappa.blended_prior();
+                let mult = if kappa_eff > 0.0 && kappa_prior > 0.0 {
+                    (kappa_prior / kappa_eff).clamp(0.5, 2.0)
+                } else {
+                    1.0
+                };
+                (mult - 1.0).abs() > 0.01
+            },
 
             cross_venue_spread_mult: signals.cross_venue_spread_mult,
             cross_venue_skew_bps,
@@ -2119,8 +2129,8 @@ mod tests {
         // Informed flow spread mult clamped to >= 1.0 (no tightening)
         assert!(contrib.informed_flow_spread_mult >= 1.0);
 
-        // Regime kappa should be active (default config enables it)
-        assert!(contrib.regime_active);
+        // Regime kappa not active without meaningful deviation from prior
+        assert!(!contrib.regime_active);
         assert!(contrib.regime_kappa_effective > 0.0);
 
         // Cross-venue not active (valid) without sufficient data
