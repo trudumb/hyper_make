@@ -514,6 +514,62 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // === CONVICTION-GATED PROACTIVE CANCEL ===
+        // When strong directional conviction flips AGAINST resting position-increasing orders,
+        // cancel them immediately to prevent stale orders from being swept in bursts.
+        // This closes the timing gap where beliefs flip between cycles but orders remain resting.
+        // Uses the same posterior_threshold (0.95) as the reduce-only gate above.
+        {
+            let posterior_threshold = self.inventory_governor.posterior_reduce_only_prob();
+            let pos = self.position.position();
+            let prob_bullish = belief_snapshot.drift_vol.prob_bullish;
+            let prob_bearish = belief_snapshot.drift_vol.prob_bearish;
+
+            // Strong bullish conviction: cancel resting asks that would INCREASE a short position
+            if prob_bullish > posterior_threshold && pos < 0.0 {
+                let cancel_oids: Vec<u64> = self
+                    .orders
+                    .get_all_by_side(Side::Sell)
+                    .iter()
+                    .map(|o| o.oid)
+                    .collect();
+                if !cancel_oids.is_empty() {
+                    warn!(
+                        prob_bullish = %format!("{:.3}", prob_bullish),
+                        position = %format!("{:.4}", pos),
+                        cancelled_count = cancel_oids.len(),
+                        threshold = %format!("{:.2}", posterior_threshold),
+                        "Conviction-gated cancel: bullish conviction against short — cancelling resting asks"
+                    );
+                    self.environment
+                        .cancel_bulk_orders(&self.config.asset, cancel_oids)
+                        .await;
+                }
+            }
+
+            // Strong bearish conviction: cancel resting bids that would INCREASE a long position
+            if prob_bearish > posterior_threshold && pos > 0.0 {
+                let cancel_oids: Vec<u64> = self
+                    .orders
+                    .get_all_by_side(Side::Buy)
+                    .iter()
+                    .map(|o| o.oid)
+                    .collect();
+                if !cancel_oids.is_empty() {
+                    warn!(
+                        prob_bearish = %format!("{:.3}", prob_bearish),
+                        position = %format!("{:.4}", pos),
+                        cancelled_count = cancel_oids.len(),
+                        threshold = %format!("{:.2}", posterior_threshold),
+                        "Conviction-gated cancel: bearish conviction against long — cancelling resting bids"
+                    );
+                    self.environment
+                        .cancel_bulk_orders(&self.config.asset, cancel_oids)
+                        .await;
+                }
+            }
+        }
+
         // HIP-3: OI cap pre-flight check (fast path for unlimited)
         // This is on the hot path, so we use pre-computed values from runtime config
         let current_position_notional = self.position.position().abs() * self.latest_mid;
@@ -3818,7 +3874,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 &reduce_only_config,
                 &self.infra.exchange_limits,
             );
-            diag_reduce_only = reduce_only_result.was_filtered;
+            diag_reduce_only = risk_reduce_only || reduce_only_result.was_filtered;
 
             // If escalation is needed, cancel all position-increasing quotes
             // This prevents the position from growing further when reduce-only can't place reducing orders
@@ -4192,7 +4248,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 &mut ask,
                 &reduce_only_config,
             );
-            diag_reduce_only = reduce_only_result.was_filtered;
+            diag_reduce_only = risk_reduce_only || reduce_only_result.was_filtered;
 
             // Close bias REMOVED (2026-02-23): Avellaneda-Stoikov reservation price
             // subsumes urgency/close bias via -q×γ(w)×σ²×τ (see signal_integration.rs).

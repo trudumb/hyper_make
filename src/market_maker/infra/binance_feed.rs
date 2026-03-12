@@ -262,8 +262,9 @@ pub fn resolve_binance_symbol(asset: &str, override_symbol: Option<&str>) -> Opt
         "CRV" => Some("crvusdt".to_string()),
         "LDO" => Some("ldousdt".to_string()),
         "BONK" => Some("bonkusdt".to_string()),
+        "HYPE" => Some("hypeusdt".to_string()),
         // Hyperliquid-native tokens — NO Binance equivalent
-        // HYPE, PURR, JEFF, and other HL-native tokens return None.
+        // PURR, JEFF, and other HL-native tokens return None.
         // Feeding BTC data for these would inject noise into the lead-lag estimator.
         _ => None,
     }
@@ -770,8 +771,11 @@ mod tests {
 
     #[test]
     fn test_resolve_binance_symbol_hl_native() {
-        // Hyperliquid-native tokens have no Binance equivalent
-        assert_eq!(resolve_binance_symbol("HYPE", None), None);
+        // Hyperliquid-native tokens have no Binance equivalent (except HYPE)
+        assert_eq!(
+            resolve_binance_symbol("HYPE", None),
+            Some("hypeusdt".to_string())
+        );
         assert_eq!(resolve_binance_symbol("PURR", None), None);
         assert_eq!(resolve_binance_symbol("JEFF", None), None);
     }
@@ -787,7 +791,10 @@ mod tests {
             resolve_binance_symbol("hyna:ETH", None),
             Some("ethusdt".to_string())
         );
-        assert_eq!(resolve_binance_symbol("hyna:HYPE", None), None);
+        assert_eq!(
+            resolve_binance_symbol("hyna:HYPE", None),
+            Some("hypeusdt".to_string())
+        );
     }
 
     #[test]
