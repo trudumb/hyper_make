@@ -1,0 +1,296 @@
+# Arbitrary Parameters and Magic Numbers Report
+This report outlines the ad hoc multipliers and arbitrary parameters discovered in the codebase.
+
+## 1. Explicit Parameter Constants (`f64`/`f32`)
+These values are hardcoded as constants, acting as arbitrary parameters:
+- `src/consts.rs:4`: `pub const EPSILON: f64 = 1e-9;`
+- `src/market_maker/adaptive/calculator.rs:658`: `const DEFAULT_ELAPSED_SECS: f64 = 1.0; // Approximate quote cycle interval`
+- `src/market_maker/adverse_selection/book_dynamics.rs:16`: `const TAU_S: f64 = 5.0;`
+- `src/market_maker/adverse_selection/book_dynamics.rs:19`: `const EPSILON: f64 = 1e-12;`
+- `src/market_maker/adverse_selection/book_dynamics.rs:68`: `const ICEBERG_ALPHA: f64 = 0.05;`
+- `src/market_maker/adverse_selection/book_dynamics.rs:71`: `const HIDDEN_SUPPORT_THRESHOLD: f64 = 0.3;`
+- `src/market_maker/adverse_selection/cancel_race.rs:158`: `const DRIFT_THRESHOLD_BPS: f64 = 5.0;`
+- `src/market_maker/adverse_selection/estimator.rs:375`: `const GM_ALPHA: f64 = 0.1;`
+- `src/market_maker/adverse_selection/estimator.rs:399`: `const AS_SEVERITY_ALPHA: f64 = 0.1;`
+- `src/market_maker/adverse_selection/estimator.rs:919`: `const MIN_THRESHOLD_BPS: f64 = 2.0;`
+- `src/market_maker/adverse_selection/estimator.rs:920`: `const MAX_THRESHOLD_BPS: f64 = 20.0;`
+- `src/market_maker/adverse_selection/estimator.rs:922`: `const K_SIGMA: f64 = 1.0;`
+- `src/market_maker/adverse_selection/microstructure_features.rs:673`: `const W_IMPACT: f64 = 0.22; // Kyle's lambda - most theoretically grounded`
+- `src/market_maker/adverse_selection/microstructure_features.rs:674`: `const W_RUN: f64 = 0.18; // Run length - strong clustering signal`
+- `src/market_maker/adverse_selection/microstructure_features.rs:675`: `const W_INTENSITY: f64 = 0.12; // Trade bursts`
+- `src/market_maker/adverse_selection/microstructure_features.rs:676`: `const W_ARRIVAL: f64 = 0.12; // Fast arrivals`
+- `src/market_maker/adverse_selection/microstructure_features.rs:677`: `const W_SPREAD: f64 = 0.08; // MM response`
+- `src/market_maker/adverse_selection/microstructure_features.rs:678`: `const W_IMBALANCE: f64 = 0.08; // Directional pressure`
+- `src/market_maker/adverse_selection/microstructure_features.rs:679`: `const W_SIZE: f64 = 0.05; // Large trades`
+- `src/market_maker/adverse_selection/microstructure_features.rs:680`: `const W_SIZE_CONC: f64 = 0.08; // Size concentration (informed = concentrated)`
+- `src/market_maker/adverse_selection/microstructure_features.rs:681`: `const W_DIR_CONC: f64 = 0.07; // Direction concentration (informed = one-sided)`
+- `src/market_maker/adverse_selection/pre_fill_classifier.rs:984`: `const BIAS_EWMA_ALPHA: f64 = 0.95;`
+- `src/market_maker/analytics/churn_tracker.rs:21`: `const HIGH_CHURN_RATIO: f64 = 10.0;`
+- `src/market_maker/analytics/edge_metrics.rs:161`: `const T_CRITICAL_95: f64 = 1.645;`
+- `src/market_maker/analytics/edge_metrics.rs:336`: `const A1: f64 = 0.254829592;`
+- `src/market_maker/analytics/edge_metrics.rs:337`: `const A2: f64 = -0.284496736;`
+- `src/market_maker/analytics/edge_metrics.rs:338`: `const A3: f64 = 1.421413741;`
+- `src/market_maker/analytics/edge_metrics.rs:339`: `const A4: f64 = -1.453152027;`
+- `src/market_maker/analytics/edge_metrics.rs:340`: `const A5: f64 = 1.061405429;`
+- `src/market_maker/analytics/edge_metrics.rs:341`: `const P: f64 = 0.3275911;`
+- `src/market_maker/analytics/sharpe.rs:6`: `const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 3600.0;`
+- `src/market_maker/belief/bayesian_fair_value.rs:634`: `const TOLERANCE: f64 = 0.01;`
+- `src/market_maker/belief/central.rs:1165`: `const INNOV_ALPHA: f64 = 0.05;`
+- `src/market_maker/belief/central.rs:2020`: `const TOXICITY_PENALTY_ALPHA: f64 = 0.7;`
+- `src/market_maker/calibration/empirical_bayes.rs:30`: `const DEFAULT_MAX_CV: f64 = 0.5;`
+- `src/market_maker/calibration/gate.rs:390`: `const S_FLOOR: f64 = 0.3;`
+- `src/market_maker/calibration/gate.rs:391`: `const K_0: f64 = 15.0;`
+- `src/market_maker/calibration/mod.rs:74`: `pub const IR_VALUE_THRESHOLD: f64 = 1.0;`
+- `src/market_maker/calibration/model_gating.rs:37`: `const MIN_SIGNAL_WEIGHT: f64 = 0.05;`
+- `src/market_maker/calibration/parameter_learner.rs:1170`: `const MIN_AS_PREDICTED_BPS: f64 = 0.01;`
+- `src/market_maker/calibration/parameter_learner.rs:1174`: `const DEFAULT_RIDGE_LAMBDA: f64 = 1.0;`
+- `src/market_maker/calibration/parameter_learner.rs:1178`: `const DEFAULT_DECAY: f64 = 0.999;`
+- `src/market_maker/calibration/parameter_learner.rs:1186`: `const CORRECTION_CLAMP_MIN: f64 = 0.2;`
+- `src/market_maker/calibration/parameter_learner.rs:1187`: `const CORRECTION_CLAMP_MAX: f64 = 5.0;`
+- `src/market_maker/calibration/parameter_learner.rs:1190`: `const RESIDUAL_EWMA_ALPHA: f64 = 0.01;`
+- `src/market_maker/config/capacity.rs:214`: `const MIN_VIABLE_DEPTH_BPS: f64 = 5.0;`
+- `src/market_maker/control/bayesian_bootstrap.rs:444`: `const EPS: f64 = 1e-10;`
+- `src/market_maker/control/bayesian_bootstrap.rs:466`: `const EPS: f64 = 1e-10;`
+- `src/market_maker/control/bayesian_bootstrap.rs:467`: `const FPMIN: f64 = 1e-30;`
+- `src/market_maker/control/mod.rs:588`: `const EMERGENCY_THRESHOLD: f64 = 0.95;`
+- `src/market_maker/control/mod.rs:589`: `const ELEVATED_THRESHOLD: f64 = 0.70;`
+- `src/market_maker/control/theoretical_edge.rs:177`: `const PRIOR_ALPHA: f64 = 2.0;`
+- `src/market_maker/control/theoretical_edge.rs:178`: `const PRIOR_BETA: f64 = 6.0;`
+- `src/market_maker/control/theoretical_edge.rs:216`: `const PRIOR_ALPHA: f64 = 2.0;`
+- `src/market_maker/control/theoretical_edge.rs:217`: `const PRIOR_BETA: f64 = 6.0;`
+- `src/market_maker/control/theoretical_edge.rs:550`: `const PRIOR_ALPHA: f64 = 3.0;`
+- `src/market_maker/control/theoretical_edge.rs:551`: `const PRIOR_BETA: f64 = 17.0;`
+- `src/market_maker/estimator/book_kappa.rs:27`: `const MAX_KAPPA: f64 = 10000.0;`
+- `src/market_maker/estimator/book_kappa.rs:30`: `const MIN_KAPPA: f64 = 50.0;`
+- `src/market_maker/estimator/calibration_coordinator.rs:69`: `const MAX_AS_RATE_FOR_TIGHTENING: f64 = 0.40;`
+- `src/market_maker/estimator/calibration_coordinator.rs:72`: `const FILL_KAPPA_ALPHA: f64 = 0.1;`
+- `src/market_maker/estimator/calibration_coordinator.rs:75`: `const AS_RATE_ALPHA: f64 = 0.05;`
+- `src/market_maker/estimator/covariance_tracker.rs:17`: `const SIGMA_RATIO_ALPHA: f64 = 0.05;`
+- `src/market_maker/estimator/covariance_tracker.rs:20`: `const SIGMA_PRIOR_MEAN: f64 = 1.0;`
+- `src/market_maker/estimator/covariance_tracker.rs:24`: `const SIGMA_PRIOR_PRECISION: f64 = 5.0;`
+- `src/market_maker/estimator/covariance_tracker.rs:28`: `const SIGMA_OBS_PRECISION: f64 = 2.0;`
+- `src/market_maker/estimator/covariance_tracker.rs:33`: `const MAX_POSTERIOR_PRECISION: f64 = 50.0;`
+- `src/market_maker/estimator/covariance_tracker.rs:37`: `const PRECISION_DECAY: f64 = 0.98;`
+- `src/market_maker/estimator/covariance_tracker.rs:45`: `const FAST_ADAPT_THRESHOLD: f64 = 0.3;`
+- `src/market_maker/estimator/cross_venue.rs:316`: `const LEAD_FAST_ALPHA: f64 = 0.2;`
+- `src/market_maker/estimator/cross_venue.rs:317`: `const LEAD_SLOW_ALPHA: f64 = 0.05;`
+- `src/market_maker/estimator/kappa_orchestrator.rs:147`: `const KAPPA_EWMA_ALPHA: f64 = 0.9;`
+- `src/market_maker/estimator/kappa_orchestrator.rs:428`: `const ROLLING_ALPHA: f64 = 0.05;`
+- `src/market_maker/estimator/market_profile.rs:102`: `const SPREAD_ALPHA: f64 = 0.05;`
+- `src/market_maker/estimator/market_profile.rs:105`: `const DEPTH_ALPHA: f64 = 0.02;`
+- `src/market_maker/estimator/market_profile.rs:108`: `const TRADE_RATE_ALPHA: f64 = 0.1;`
+- `src/market_maker/estimator/market_profile.rs:111`: `const SIGMA_ALPHA: f64 = 0.05;`
+- `src/market_maker/estimator/market_profile.rs:114`: `const REGIME_KAPPA_MULTS: [f64; 4] = [1.5, 1.0, 0.5, 0.25];`
+- `src/market_maker/estimator/market_profile.rs:87`: `const SAFETY_FACTOR: f64 = 0.7;`
+- `src/market_maker/estimator/market_profile.rs:90`: `const DEFAULT_GAMMA: f64 = 0.15;`
+- `src/market_maker/estimator/market_profile.rs:93`: `const DEFAULT_FEE_BPS: f64 = 1.5;`
+- `src/market_maker/estimator/market_profile.rs:96`: `const MIN_BBO_HALF_SPREAD_BPS: f64 = 0.5;`
+- `src/market_maker/estimator/market_profile.rs:99`: `const DEFAULT_SIGMA: f64 = 0.00025;`
+- `src/market_maker/estimator/mutual_info.rs:39`: `const EULER_GAMMA: f64 = 0.5772156649015329;`
+- `src/market_maker/estimator/regime_hmm.rs:771`: `const MIN_EFFECTIVE_N: f64 = 5.0;`
+- `src/market_maker/estimator/robust_kappa.rs:44`: `const DEFAULT_NU: f64 = 4.0;`
+- `src/market_maker/estimator/robust_kappa.rs:50`: `const IRLS_CONVERGENCE_THRESHOLD: f64 = 0.01;`
+- `src/market_maker/estimator/robust_kappa.rs:53`: `const MAX_KAPPA: f64 = 10000.0;`
+- `src/market_maker/estimator/robust_kappa.rs:56`: `const MIN_KAPPA: f64 = 50.0;`
+- `src/market_maker/estimator/robust_kappa.rs:59`: `const MIN_DISTANCE: f64 = 0.00001; // 0.1 bps`
+- `src/market_maker/estimator/soft_jump.rs:217`: `const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)`
+- `src/market_maker/estimator/trade_flow_tracker.rs:20`: `const EPSILON: f64 = 1e-12;`
+- `src/market_maker/estimator/trade_flow_tracker.rs:27`: `const ALPHA_1S: f64 = 0.20;`
+- `src/market_maker/estimator/trade_flow_tracker.rs:30`: `const ALPHA_5S: f64 = 0.05;`
+- `src/market_maker/estimator/trade_flow_tracker.rs:33`: `const ALPHA_30S: f64 = 0.01;`
+- `src/market_maker/estimator/trade_flow_tracker.rs:36`: `const ALPHA_5M: f64 = 0.002;`
+- `src/market_maker/estimator/trend_persistence.rs:352`: `const THRESHOLD: f64 = 1.0; // 1 bps minimum to count`
+- `src/market_maker/estimator/volatility_filter.rs:651`: `const BIAS_EWMA_ALPHA: f64 = 0.007;`
+- `src/market_maker/latent/edge_surface.rs:52`: `pub const DEFAULT_FEES_BPS: f64 = 1.5;`
+- `src/market_maker/learning/confidence.rs:138`: `const RECALIBRATE_THRESHOLD_BPS: f64 = 1.5;`
+- `src/market_maker/learning/decision.rs:326`: `const A1: f64 = 0.254829592;`
+- `src/market_maker/learning/decision.rs:327`: `const A2: f64 = -0.284496736;`
+- `src/market_maker/learning/decision.rs:328`: `const A3: f64 = 1.421413741;`
+- `src/market_maker/learning/decision.rs:329`: `const A4: f64 = -1.453152027;`
+- `src/market_maker/learning/decision.rs:330`: `const A5: f64 = 1.061405429;`
+- `src/market_maker/learning/decision.rs:331`: `const P: f64 = 0.3275911;`
+- `src/market_maker/learning/decision.rs:346`: `const TEST_SIGMA: f64 = 0.0001; // 10 bps per-second volatility`
+- `src/market_maker/learning/fqi.rs:26`: `const ARM_MULTIPLIERS: [f64; N_ACTIONS] = [0.85, 0.90, 0.95, 1.00, 1.05, 1.15, 1.25, 1.40];`
+- `src/market_maker/learning/fqi.rs:29`: `const ARM_DELTA_BPS: [f64; N_ACTIONS] = [-1.5, -1.0, -0.5, 0.0, 0.5, 1.5, 2.5, 4.0];`
+- `src/market_maker/learning/quote_outcome.rs:134`: `const HIERARCHICAL_TAU: f64 = 50.0;`
+- `src/market_maker/learning/quote_outcome.rs:137`: `const HIERARCHICAL_PRIOR_WEIGHT: f64 = 5.0;`
+- `src/market_maker/learning/spread_bandit.rs:53`: `const ARM_MULTIPLIERS: [f64; N_ARMS] = [0.85, 0.90, 0.95, 1.00, 1.05, 1.15, 1.25, 1.40];`
+- `src/market_maker/learning/spread_bandit.rs:63`: `const FORGETTING_FACTOR: f64 = 0.995;`
+- `src/market_maker/mod.rs:1606`: `const SESSION_DURATION_SECS: f64 = 24.0 * 60.0 * 60.0;`
+- `src/market_maker/mod.rs:1704`: `const DEFAULT_CASCADE_PULL: f64 = 0.8;`
+- `src/market_maker/mod.rs:1705`: `const DEFAULT_CASCADE_KILL: f64 = 0.95;`
+- `src/market_maker/models/queue_value.rs:20`: `const MAKER_FEE_BPS: f64 = 1.5;`
+- `src/market_maker/models/queue_value.rs:23`: `const AS_COST_BENIGN_BPS: f64 = 1.0;`
+- `src/market_maker/models/queue_value.rs:24`: `const AS_COST_NORMAL_BPS: f64 = 3.0;`
+- `src/market_maker/models/queue_value.rs:25`: `const AS_COST_TOXIC_BPS: f64 = 8.0;`
+- `src/market_maker/models/queue_value.rs:28`: `const QUEUE_PENALTY_MAX: f64 = 0.30;`
+- `src/market_maker/orchestrator/handlers.rs:1546`: `const MAKER_FEE_BPS: f64 = 1.5;`
+- `src/market_maker/orchestrator/handlers.rs:1642`: `const MAKER_FEE_BPS: f64 = 1.5;`
+- `src/market_maker/orchestrator/handlers.rs:293`: `const ADVERSE_NOISE_MULT: f64 = 2.0;`
+- `src/market_maker/orchestrator/handlers.rs:294`: `const MIN_ADVERSE_THRESHOLD_BPS: f64 = 1.0;`
+- `src/market_maker/orchestrator/handlers.rs:295`: `const MARKOUT_SECONDS: f64 = OUTCOME_DELAY_MS as f64 / 1000.0;`
+- `src/market_maker/orchestrator/handlers.rs:432`: `const MAKER_FEE_BPS: f64 = 1.5;`
+- `src/market_maker/orchestrator/order_ops.rs:18`: `const MIN_ORDER_NOTIONAL: f64 = 10.0;`
+- `src/market_maker/orchestrator/quote_engine.rs:2285`: `const MIN_PRIOR: f64 = 0.3;`
+- `src/market_maker/orchestrator/quote_engine.rs:2286`: `const WARMUP_FILLS: f64 = 50.0;`
+- `src/market_maker/orchestrator/quote_engine.rs:2296`: `const MIN_PRIOR: f64 = 0.3;`
+- `src/market_maker/orchestrator/quote_engine.rs:2297`: `const WARMUP_FILLS: f64 = 50.0;`
+- `src/market_maker/orchestrator/quote_engine.rs:2486`: `const TARGET_LIQUIDITY_MIN_FRACTION: f64 = 0.3;`
+- `src/market_maker/orchestrator/quote_engine.rs:2488`: `const TARGET_LIQUIDITY_MIN_LEVELS: f64 = 4.0;`
+- `src/market_maker/orchestrator/quote_engine.rs:2490`: `const INVENTORY_RATIO_LIQUIDITY_BOOST: f64 = 0.5;`
+- `src/market_maker/orchestrator/quote_engine.rs:28`: `pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;`
+- `src/market_maker/orchestrator/quote_engine.rs:3517`: `const TOXICITY_WIDEN_THRESHOLD: f64 = 0.75;`
+- `src/market_maker/orchestrator/quote_engine.rs:3519`: `const TOXICITY_EXTREME_WIDEN_BPS: f64 = 50.0;`
+- `src/market_maker/orchestrator/quote_engine.rs:832`: `const TRENDING_ON: f64 = 0.12;`
+- `src/market_maker/orchestrator/quote_engine.rs:833`: `const TRENDING_OFF: f64 = 0.08;`
+- `src/market_maker/orchestrator/reconcile.rs:1041`: `const MAX_ACCEPTABLE_DRIFT_BPS: f64 = 100.0;`
+- `src/market_maker/orchestrator/reconcile.rs:21`: `pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;`
+- `src/market_maker/orchestrator/reconcile.rs:2211`: `const MAX_ACCEPTABLE_DRIFT_BPS: f64 = 100.0;`
+- `src/market_maker/orchestrator/reconcile.rs:2564`: `const QUOTA_ABUNDANCE_THRESHOLD: f64 = 0.50;`
+- `src/market_maker/orchestrator/reconcile.rs:2566`: `const QUOTA_COST_BASE_BPS: f64 = 0.1;`
+- `src/market_maker/orchestrator/reconcile.rs:2568`: `const QUOTA_COST_STEEPNESS: f64 = 2.0;`
+- `src/market_maker/orchestrator/reconcile.rs:2570`: `const CANCEL_COST_DISCOUNT: f64 = 0.5;`
+- `src/market_maker/process_models/hawkes.rs:1090`: `const DENSITY_EWMA_ALPHA: f64 = 0.05;`
+- `src/market_maker/process_models/hawkes.rs:1472`: `const BAYESIAN_HAWKES_ALPHA_SHAPE_PRIOR: f64 = 2.0;`
+- `src/market_maker/process_models/hawkes.rs:1473`: `const BAYESIAN_HAWKES_ALPHA_RATE_PRIOR: f64 = 4.0;`
+- `src/market_maker/process_models/hawkes.rs:1474`: `const BAYESIAN_HAWKES_BETA_SHAPE_PRIOR: f64 = 2.0;`
+- `src/market_maker/process_models/hawkes.rs:1475`: `const BAYESIAN_HAWKES_BETA_RATE_PRIOR: f64 = 200.0;`
+- `src/market_maker/process_models/hawkes.rs:1476`: `const BAYESIAN_HAWKES_LAMBDA_0_DEFAULT: f64 = 100.0;`
+- `src/market_maker/process_models/hawkes.rs:1481`: `const BAYESIAN_HAWKES_SIGMOID_MIDPOINT: f64 = 2.0;`
+- `src/market_maker/process_models/hawkes.rs:1482`: `const BAYESIAN_HAWKES_SIGMOID_STEEPNESS: f64 = 3.0;`
+- `src/market_maker/process_models/hawkes.rs:1486`: `const BAYESIAN_HAWKES_ALPHA_EWMA: f64 = 0.2;`
+- `src/market_maker/process_models/hjb/controller.rs:177`: `const MAX_FUNDING_PERIOD_S: f64 = 28800.0; // 8 hours`
+- `src/market_maker/process_models/hjb/controller.rs:203`: `const FUNDING_PERIOD_S: f64 = 28800.0;`
+- `src/market_maker/process_models/hjb/controller.rs:451`: `const FUNDING_PERIOD_S: f64 = 28800.0;`
+- `src/market_maker/process_models/hjb/ou_drift.rs:210`: `const MIN_GATE_WEIGHT: f64 = 0.05;`
+- `src/market_maker/process_models/hjb/skew.rs:11`: `const DEFAULT_PREDICTIVE_BIAS_SENSITIVITY: f64 = 2.0;`
+- `src/market_maker/process_models/hjb/skew.rs:9`: `const DEFAULT_PREDICTIVE_BIAS_THRESHOLD: f64 = 0.3;`
+- `src/market_maker/quoting/filter.rs:118`: `const MARGIN_UTILIZATION_THRESHOLD: f64 = 0.8;`
+- `src/market_maker/quoting/filter.rs:130`: `pub const DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD: f64 = 0.3;`
+- `src/market_maker/quoting/filter.rs:585`: `const MIN_CAPACITY: f64 = 0.001;`
+- `src/market_maker/quoting/ladder/fill_probability.rs:146`: `const WIDTH_BPS: f64 = 2.0;`
+- `src/market_maker/quoting/ladder/fill_probability.rs:45`: `const A1: f64 = 0.254829592;`
+- `src/market_maker/quoting/ladder/fill_probability.rs:46`: `const A2: f64 = -0.284496736;`
+- `src/market_maker/quoting/ladder/fill_probability.rs:47`: `const A3: f64 = 1.421413741;`
+- `src/market_maker/quoting/ladder/fill_probability.rs:48`: `const A4: f64 = -1.453152027;`
+- `src/market_maker/quoting/ladder/fill_probability.rs:49`: `const A5: f64 = 1.061405429;`
+- `src/market_maker/quoting/ladder/fill_probability.rs:50`: `const P: f64 = 0.3275911;`
+- `src/market_maker/quoting/ladder/generator.rs:52`: `const MAX_SINGLE_ORDER_FRACTION: f64 = 0.25;`
+- `src/market_maker/quoting/ladder/tick_grid.rs:304`: `const A1: f64 = 0.254829592;`
+- `src/market_maker/quoting/ladder/tick_grid.rs:305`: `const A2: f64 = -0.284496736;`
+- `src/market_maker/quoting/ladder/tick_grid.rs:306`: `const A3: f64 = 1.421413741;`
+- `src/market_maker/quoting/ladder/tick_grid.rs:307`: `const A4: f64 = -1.453152027;`
+- `src/market_maker/quoting/ladder/tick_grid.rs:308`: `const A5: f64 = 1.061405429;`
+- `src/market_maker/quoting/ladder/tick_grid.rs:309`: `const P: f64 = 0.3275911;`
+- `src/market_maker/quoting/viable.rs:23`: `const MAX_DEFENSE_SPREAD_MULT: f64 = 3.0;`
+- `src/market_maker/simulation/prediction.rs:339`: `const DELTA_QUIET: f64 = 15.0; // Quiet — fills need more depth`
+- `src/market_maker/simulation/prediction.rs:340`: `const DELTA_ACTIVE: f64 = 10.0; // Active — normal`
+- `src/market_maker/simulation/prediction.rs:341`: `const DELTA_VOLATILE: f64 = 7.0; // Volatile — fills happen easier`
+- `src/market_maker/simulation/prediction.rs:342`: `const DELTA_CASCADE: f64 = 4.0; // Cascade — everything gets swept`
+- `src/market_maker/simulation/prediction.rs:353`: `const BASELINE_SIGMA: f64 = 0.0001;`
+- `src/market_maker/strategy/directional_conviction.rs:20`: `const DEFAULT_LOG_ODDS_CAP: f64 = 3.0;`
+- `src/market_maker/strategy/directional_conviction.rs:23`: `const DEFAULT_CORROBORATION_THRESHOLD: f64 = 0.3;`
+- `src/market_maker/strategy/directional_conviction.rs:30`: `const DEFAULT_CHANNEL_WEIGHTS: [f64; NUM_CHANNELS] = [1.0, 0.8, 0.6, 0.5, 0.4];`
+- `src/market_maker/strategy/drift_estimator.rs:21`: `const AUTOCORRELATION_WARMUP_PRIOR: f64 = 0.3;`
+- `src/market_maker/strategy/drift_estimator.rs:51`: `pub const BASE_MOMENTUM_VAR: f64 = 100.0;`
+- `src/market_maker/strategy/drift_estimator.rs:53`: `pub const BASE_TREND_VAR: f64 = 200.0;`
+- `src/market_maker/strategy/drift_estimator.rs:55`: `pub const BASE_LL_VAR: f64 = 50.0;`
+- `src/market_maker/strategy/drift_estimator.rs:57`: `pub const BASE_FLOW_VAR: f64 = 200.0;`
+- `src/market_maker/strategy/drift_estimator.rs:59`: `pub const BASE_BELIEF_VAR: f64 = 150.0;`
+- `src/market_maker/strategy/drift_estimator.rs:65`: `const P_MIN: f64 = 2.0;`
+- `src/market_maker/strategy/feature_store.rs:272`: `const FLOW_DIR_WEIGHT: f64 = 0.35;`
+- `src/market_maker/strategy/feature_store.rs:273`: `const FLOW_TOX_WEIGHT: f64 = 0.20;`
+- `src/market_maker/strategy/feature_store.rs:274`: `const BOOK_THIN_WEIGHT: f64 = 0.15;`
+- `src/market_maker/strategy/feature_store.rs:275`: `const FUNDING_WEIGHT: f64 = 0.10;`
+- `src/market_maker/strategy/feature_store.rs:276`: `const SYNC_WEIGHT: f64 = 0.10;`
+- `src/market_maker/strategy/feature_store.rs:277`: `const ACCEL_WEIGHT: f64 = 0.05;`
+- `src/market_maker/strategy/feature_store.rs:278`: `const BASIS_VEL_WEIGHT: f64 = 0.05;`
+- `src/market_maker/strategy/feature_store.rs:87`: `const FLOW_DIR_WEIGHT: f64 = 0.35;`
+- `src/market_maker/strategy/feature_store.rs:88`: `const FLOW_TOX_WEIGHT: f64 = 0.20;`
+- `src/market_maker/strategy/feature_store.rs:89`: `const BOOK_THIN_WEIGHT: f64 = 0.15;`
+- `src/market_maker/strategy/feature_store.rs:90`: `const FUNDING_WEIGHT: f64 = 0.10;`
+- `src/market_maker/strategy/feature_store.rs:91`: `const SYNC_WEIGHT: f64 = 0.10;`
+- `src/market_maker/strategy/feature_store.rs:92`: `const ACCEL_WEIGHT: f64 = 0.05;`
+- `src/market_maker/strategy/feature_store.rs:93`: `const BASIS_VEL_WEIGHT: f64 = 0.05;`
+- `src/market_maker/strategy/glft.rs:1246`: `const AS_HORIZON_S: f64 = 0.5; // 500ms, matching AS estimator horizon`
+- `src/market_maker/strategy/glft.rs:1750`: `const COLD_START_INVENTORY_PENALTY_BPS: f64 = 3.0;`
+- `src/market_maker/strategy/kelly.rs:38`: `const A1: f64 = 0.254829592;`
+- `src/market_maker/strategy/kelly.rs:39`: `const A2: f64 = -0.284496736;`
+- `src/market_maker/strategy/kelly.rs:40`: `const A3: f64 = 1.421413741;`
+- `src/market_maker/strategy/kelly.rs:41`: `const A4: f64 = -1.453152027;`
+- `src/market_maker/strategy/kelly.rs:42`: `const A5: f64 = 1.061405429;`
+- `src/market_maker/strategy/kelly.rs:43`: `const P: f64 = 0.3275911;`
+- `src/market_maker/strategy/ladder_strat.rs:1107`: `const P_THRESHOLD_Z: f64 = 0.674; // z for P(edge>0) ≥ 75%`
+- `src/market_maker/strategy/ladder_strat.rs:1670`: `const SNR_SCALE: f64 = 2.0; // 2-sigma drift → ~76% of q_max`
+- `src/market_maker/strategy/ladder_strat.rs:30`: `const KILL_CLEAR_INVENTORY_RATIO: f64 = 0.90;`
+- `src/market_maker/strategy/ladder_strat.rs:3299`: `const SNR_SCALE: f64 = 2.0;`
+- `src/market_maker/strategy/ladder_strat.rs:38`: `const MAX_SINGLE_ORDER_FRACTION: f64 = 0.25;`
+- `src/market_maker/strategy/ladder_strat.rs:869`: `const REGIME_BLEND_WEIGHT_FULL: f64 = 0.6;`
+- `src/market_maker/strategy/ladder_strat.rs:870`: `const REGIME_BLEND_WEIGHT_WARMUP: f64 = 0.2;`
+- `src/market_maker/strategy/ladder_strat.rs:898`: `const ALPHA_KAPPA_THRESHOLD: f64 = 0.15; // Lowered: p_informed=0.235 was below old 0.3`
+- `src/market_maker/strategy/ladder_strat.rs:899`: `const ALPHA_KAPPA_SENSITIVITY: f64 = 0.5;`
+- `src/market_maker/strategy/market_params.rs:1527`: `const EPSILON: f64 = 1e-9;`
+- `src/market_maker/strategy/market_params.rs:1554`: `const EPSILON: f64 = 1e-9;`
+- `src/market_maker/strategy/market_params.rs:2063`: `const EPSILON: f64 = 1e-9;`
+- `src/market_maker/strategy/regime_state.rs:173`: `const EWMA_WEIGHT: f64 = 0.05;`
+- `src/market_maker/strategy/regime_state.rs:316`: `const CONVICTION_MARGIN: f64 = 0.20;`
+- `src/market_maker/strategy/regime_state.rs:319`: `const KL_THRESHOLD_NATS: f64 = 0.3;`
+- `src/market_maker/strategy/regime_state.rs:322`: `const DWELL_ESCALATION_S: f64 = 30.0;`
+- `src/market_maker/strategy/regime_state.rs:325`: `const DWELL_DEESCALATION_S: f64 = 120.0;`
+- `src/market_maker/strategy/regime_state.rs:328`: `const DWELL_TO_EXTREME_S: f64 = 0.0;`
+- `src/market_maker/strategy/regime_state.rs:331`: `const DWELL_FROM_EXTREME_S: f64 = 300.0;`
+- `src/market_maker/strategy/regime_state.rs:403`: `const BLENDING_ALPHA: f64 = 0.05;`
+- `src/market_maker/strategy/regime_state.rs:771`: `const GAMMA_MULTIPLIERS: [f64; 4] = [1.0, 1.2, 2.0, 3.0];`
+- `src/market_maker/strategy/risk_config.rs:60`: `const SQRT_2_OVER_PI: f64 = 0.7978845608028654;`
+- `src/market_maker/strategy/risk_model.rs:1123`: `const GAMMA_TRACKING_ALPHA: f64 = 0.1;`
+- `src/market_maker/strategy/risk_model.rs:373`: `const MAX_GAMMA_CONTRIBUTION: f64 = 2.5; // max ~12× gamma inflation (exp(2.5))`
+- `src/market_maker/strategy/risk_model.rs:374`: `const GAMMA_REG_STEEPNESS: f64 = 2.0; // how fast sigmoid saturates`
+- `src/market_maker/strategy/risk_model.rs:462`: `const MAX_GAMMA_CONTRIBUTION: f64 = 2.5;`
+- `src/market_maker/strategy/risk_model.rs:463`: `const GAMMA_REG_STEEPNESS: f64 = 2.0;`
+- `src/market_maker/strategy/signal_integration.rs:1024`: `const DECAY: f64 = 0.95;`
+- `src/market_maker/strategy/signal_integration.rs:1045`: `const DECAY: f64 = 0.98;`
+- `src/market_maker/strategy/signal_integration.rs:1647`: `const FLOW_URGENCY_THRESHOLD: f64 = 0.4;`
+- `src/market_maker/strategy/spread_oracle.rs:154`: `const EPSILON_BPS: f64 = 0.01; // 0.01 bps tolerance`
+- `src/market_maker/strategy/spread_oracle.rs:155`: `const FEE_BPS: f64 = 1.5; // Hyperliquid maker fee`
+- `src/market_maker/tracking/order_manager/outcome_tracker.rs:148`: `const RATE_ALPHA: f64 = 0.02;`
+- `src/market_maker/tracking/order_manager/outcome_tracker.rs:232`: `const LOW_RATE: f64 = 0.3;`
+- `src/market_maker/tracking/order_manager/outcome_tracker.rs:233`: `const HIGH_RATE: f64 = 0.6;`
+- `src/market_maker/tracking/order_manager/outcome_tracker.rs:234`: `const MAX_ADJ_BPS: f64 = 1.0;`
+- `src/market_maker/tracking/order_manager/scorer.rs:29`: `const BASE_COST_LATCH_BPS: f64 = 0.0;`
+- `src/market_maker/tracking/order_manager/scorer.rs:32`: `const BASE_COST_MODIFY_BPS: f64 = 3.0;`
+- `src/market_maker/tracking/order_manager/scorer.rs:35`: `const BASE_COST_CANCEL_PLACE_BPS: f64 = 6.0;`
+- `src/market_maker/tracking/order_manager/scorer.rs:38`: `const BASE_COST_NEW_PLACE_BPS: f64 = 3.0;`
+- `src/market_maker/tracking/order_manager/scorer.rs:41`: `const BASE_COST_STALE_CANCEL_BPS: f64 = 3.0;`
+
+## 2. Files with the Highest Concentration of Magic Numbers
+Many parameters and ad hoc multipliers are used inline. Here are the files with the most magic numbers (inline floats / inline arithmetic):
+- `src/market_maker/strategy/glft.rs`: 347 inline instances
+- `src/market_maker/orchestrator/quote_engine.rs`: 307 inline instances
+- `src/market_maker/strategy/ladder_strat.rs`: 275 inline instances
+- `src/market_maker/belief/central.rs`: 214 inline instances
+- `src/market_maker/quoting/ladder/generator.rs`: 167 inline instances
+- `src/market_maker/process_models/hawkes.rs`: 147 inline instances
+- `src/market_maker/estimator/regime_hmm.rs`: 131 inline instances
+- `src/market_maker/risk/inventory_governor.rs`: 125 inline instances
+- `src/market_maker/learning/rl_agent.rs`: 124 inline instances
+- `src/market_maker/risk/kill_switch.rs`: 120 inline instances
+- `src/market_maker/strategy/risk_model.rs`: 119 inline instances
+- `src/market_maker/strategy/regime_state.rs`: 118 inline instances
+- `src/market_maker/estimator/parameter_estimator.rs`: 111 inline instances
+- `src/market_maker/calibration/information_ratio.rs`: 109 inline instances
+- `src/market_maker/control/theoretical_edge.rs`: 103 inline instances
+- `src/market_maker/strategy/signal_integration.rs`: 101 inline instances
+- `src/market_maker/strategy/mod.rs`: 100 inline instances
+- `src/market_maker/quoting/ladder/risk_budget.rs`: 97 inline instances
+- `src/market_maker/strategy/drift_estimator.rs`: 96 inline instances
+- `src/market_maker/strategy/market_params.rs`: 89 inline instances
+- `src/market_maker/tracking/order_manager/reconcile.rs`: 86 inline instances
+- `src/market_maker/process_models/hjb/skew.rs`: 83 inline instances
+- `src/market_maker/tests/integration_tests.rs`: 77 inline instances
+- `src/market_maker/adverse_selection/estimator.rs`: 75 inline instances
+- `src/market_maker/estimator/volatility/regime.rs`: 75 inline instances
+- `src/market_maker/belief/snapshot.rs`: 73 inline instances
+- `src/market_maker/calibration/parameter_learner.rs`: 72 inline instances
+- `src/market_maker/estimator/kappa_orchestrator.rs`: 72 inline instances
+- `src/market_maker/tracking/calibration.rs`: 72 inline instances
+- `src/market_maker/estimator/cross_venue.rs`: 71 inline instances
