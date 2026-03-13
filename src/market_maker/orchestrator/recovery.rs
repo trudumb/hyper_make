@@ -958,11 +958,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .signal_attributor()
             .signal_names()
             .iter()
-            .map(|name| {
-                (
-                    name.clone(),
-                    self.live_analytics.signal_attributor().marginal_value(name),
-                )
+            .filter_map(|name| {
+                self.live_analytics
+                    .signal_attributor()
+                    .marginal_value_gated(name)
+                    .map(|v| (name.clone(), v))
             })
             .collect();
 

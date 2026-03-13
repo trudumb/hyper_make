@@ -214,11 +214,16 @@ impl LiveAnalytics {
                 .signal_names()
                 .iter()
                 .map(|name| {
-                    format!(
-                        "{}={:.1}bps",
-                        name,
-                        self.signal_attributor.marginal_value(name)
-                    )
+                    let marginal = self.signal_attributor.marginal_value(name);
+                    let r2 = self.signal_attributor.signal_r_squared(name);
+                    if self.signal_attributor.signal_has_sufficient_data(name) {
+                        format!("{name}={marginal:.1}bps(R²={r2:.2})")
+                    } else {
+                        format!(
+                            "{name}=?bps(n={})",
+                            self.signal_attributor.signal_count(name)
+                        )
+                    }
                 })
                 .collect();
             info!("[ANALYTICS] Signal marginal: {}", signal_parts.join(" "));
@@ -271,7 +276,11 @@ impl LiveAnalytics {
             .signal_attributor
             .signal_names()
             .iter()
-            .map(|name| (name.clone(), self.signal_attributor.marginal_value(name)))
+            .filter_map(|name| {
+                self.signal_attributor
+                    .marginal_value_gated(name)
+                    .map(|v| (name.clone(), v))
+            })
             .collect();
 
         LiveAnalyticsSummary {

@@ -450,11 +450,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 dump.mid_price = self.latest_mid;
                 dump.cascade_severity = self.tier1.liquidation_detector.cascade_severity();
                 dump.risk_state = crate::market_maker::monitoring::RiskSnapshot {
-                    drawdown_pct: if pnl_summary.peak_pnl > 0.0 {
-                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
-                            * 100.0
-                    } else {
-                        0.0
+                    drawdown_pct: {
+                        let account_value = self.safety.kill_switch.state().account_value;
+                        if account_value > 0.0 && pnl_summary.peak_pnl > 0.0 {
+                            (pnl_summary.peak_pnl - pnl_summary.total_pnl) / account_value * 100.0
+                        } else if pnl_summary.peak_pnl > 0.0 {
+                            (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
+                                * 100.0
+                        } else {
+                            0.0
+                        }
                     },
                     margin_utilization_pct: 0.0,
                     position_utilization_pct: if self.effective_max_position > 0.0 {
@@ -937,11 +942,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 dump.mid_price = self.latest_mid;
                 dump.cascade_severity = self.tier1.liquidation_detector.cascade_severity();
                 dump.risk_state = crate::market_maker::monitoring::RiskSnapshot {
-                    drawdown_pct: if pnl_summary.peak_pnl > 0.0 {
-                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
-                            * 100.0
-                    } else {
-                        0.0
+                    drawdown_pct: {
+                        let account_value = self.safety.kill_switch.state().account_value;
+                        if account_value > 0.0 && pnl_summary.peak_pnl > 0.0 {
+                            (pnl_summary.peak_pnl - pnl_summary.total_pnl) / account_value * 100.0
+                        } else if pnl_summary.peak_pnl > 0.0 {
+                            (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
+                                * 100.0
+                        } else {
+                            0.0
+                        }
                     },
                     margin_utilization_pct: 0.0,
                     position_utilization_pct: if self.effective_max_position > 0.0 {

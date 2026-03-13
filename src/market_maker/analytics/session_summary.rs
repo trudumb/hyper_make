@@ -309,6 +309,9 @@ pub fn print_session_summary(s: &SessionSummary) {
                 name, value
             );
         }
+    } else {
+        println!("╠══════════════════════════════════════════════════════════╣");
+        println!("║ Signal Marginal Values          (insufficient data)    ║");
     }
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();

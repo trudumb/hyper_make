@@ -1248,7 +1248,10 @@ impl KillSwitch {
         let state = self.state.lock().unwrap();
         let reasons = self.trigger_reasons();
 
-        let drawdown_pct = if state.peak_pnl > 0.0 {
+        let drawdown_pct = if state.account_value > 0.0 && state.peak_pnl > 0.0 {
+            (state.peak_pnl - state.daily_pnl) / state.account_value * 100.0
+        } else if state.peak_pnl > 0.0 {
+            // Fallback when account_value unknown (e.g. tests with default state)
             (state.peak_pnl - state.daily_pnl) / state.peak_pnl * 100.0
         } else {
             0.0
@@ -1395,6 +1398,14 @@ fn is_transient_reason(reason: &str) -> bool {
         || reason.contains("stale data")
         || reason.contains("Rate limit")
         || reason.contains("Cascade")
+}
+
+#[cfg(test)]
+impl KillSwitch {
+    /// Set account_value on internal state (test-only).
+    fn set_account_value(&self, value: f64) {
+        self.state.lock().unwrap().account_value = value;
+    }
 }
 
 #[cfg(test)]
@@ -1768,6 +1779,23 @@ mod tests {
         assert_eq!(summary.daily_pnl, 80.0);
         assert!((summary.drawdown_pct - 20.0).abs() < 0.1);
         assert_eq!(summary.position_value, 25000.0);
+    }
+
+    #[test]
+    fn test_summary_drawdown_uses_account_value() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+        ks.update_pnl(100.0);
+        ks.update_pnl(-150.0); // daily_pnl = -50
+        ks.update_position(0.5, 50000.0);
+        ks.set_account_value(1000.0);
+
+        let summary = ks.summary();
+        // drawdown = (peak(100) - daily(-50)) / account_value(1000) * 100 = 15%
+        assert!(
+            (summary.drawdown_pct - 15.0).abs() < 0.1,
+            "Expected ~15% drawdown from account_value, got {}",
+            summary.drawdown_pct
+        );
     }
 
     // === Checkpoint persistence tests ===

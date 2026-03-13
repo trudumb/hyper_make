@@ -172,9 +172,10 @@ impl AnalyticsLogger {
             .into_iter()
             .map(|name| {
                 let snap = SignalPnlSnapshot {
-                    active_pnl_bps: attributor.signal_pnl(&name),
-                    inactive_pnl_bps: attributor.signal_pnl_inactive(&name),
                     marginal_value_bps: attributor.marginal_value(&name),
+                    r_squared: attributor.signal_r_squared(&name),
+                    count: attributor.signal_count(&name),
+                    sufficient_data: attributor.signal_has_sufficient_data(&name),
                 };
                 (name, snap)
             })
@@ -226,12 +227,13 @@ impl AnalyticsLogger {
     }
 }
 
-/// Serializable snapshot of per-signal PnL stats for JSONL output.
+/// Serializable snapshot of per-signal regression stats for JSONL output.
 #[derive(serde::Serialize)]
 struct SignalPnlSnapshot {
-    active_pnl_bps: f64,
-    inactive_pnl_bps: f64,
     marginal_value_bps: f64,
+    r_squared: f64,
+    count: u64,
+    sufficient_data: bool,
 }
 
 /// Per-fill record for offline gamma calibration regression.
