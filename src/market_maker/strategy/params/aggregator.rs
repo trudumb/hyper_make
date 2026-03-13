@@ -144,6 +144,27 @@ pub struct ParameterSources<'a> {
     pub tau_inventory_s: f64,
     /// Online variance of reducing-fill holding durations (seconds²).
     pub tau_variance_s2: f64,
+
+    // === Upgrade 2B: GMM Toxicity Posterior ===
+    /// GMM toxicity scores (pre-computed from GmmToxicityModel).
+    /// None when GMM is disabled or model not yet created.
+    pub gmm_toxicity: Option<GmmToxicityScores>,
+}
+
+/// Pre-computed GMM toxicity scores passed from quote engine to aggregator.
+///
+/// Decouples the GMM model from the aggregator — the model lives in quote engine,
+/// scores are extracted and passed through ParameterSources.
+#[derive(Debug, Clone, Copy)]
+pub struct GmmToxicityScores {
+    /// P(informed | markout) for buy fills [0, 1].
+    pub p_informed_buy: f64,
+    /// P(informed | markout) for sell fills [0, 1].
+    pub p_informed_sell: f64,
+    /// Aggregate toxicity score [0, 1].
+    pub toxicity_score: f64,
+    /// Whether the GMM model has enough observations.
+    pub is_warmed_up: bool,
 }
 
 /// Learned parameter values for use in quoting calculations.
@@ -321,6 +342,12 @@ impl ParameterAggregator {
                 Some(2.0) // Conservative prior: 2 bps AS until warmed up
             },
 
+            // === Tier 1: GMM Toxicity Posterior (Upgrade 2B) ===
+            gmm_p_informed_buy: sources.gmm_toxicity.map_or(0.0, |g| g.p_informed_buy),
+            gmm_p_informed_sell: sources.gmm_toxicity.map_or(0.0, |g| g.p_informed_sell),
+            gmm_toxicity_score: sources.gmm_toxicity.map_or(0.0, |g| g.toxicity_score),
+            gmm_toxicity_warmed: sources.gmm_toxicity.is_some_and(|g| g.is_warmed_up),
+
             // === Tier 1: Pre-Fill AS Classifier (Phase 3) ===
             pre_fill_toxicity_bid: sources.pre_fill_classifier.predict_toxicity(true),
             pre_fill_toxicity_ask: sources.pre_fill_classifier.predict_toxicity(false),
@@ -335,6 +362,9 @@ impl ParameterAggregator {
             // WS4: Blend liquidation cascade with BayesianHawkes score (take max for defense-first)
             cascade_intensity: (1.0 - sources.liquidation_detector.size_reduction_factor())
                 .max(sources.bayesian_hawkes_score),
+            // Phase 2: Continuous risk features (set by quote_engine, not aggregator)
+            circuit_breaker_intensity: 0.0,
+            risk_severity_score: 0.0,
 
             // === Tier 2: Hawkes Order Flow ===
             hawkes_buy_intensity: sources.hawkes.lambda_buy(),

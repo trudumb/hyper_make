@@ -54,6 +54,77 @@ impl Default for NormalizedFeature {
     }
 }
 
+/// Learned weights for directional signal aggregation (Phase 5).
+/// Initialized from theoretical priors, updated from SNR-proportional learning.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectionalSignalWeights {
+    pub flow_direction: f64,
+    pub flow_toxicity: f64,
+    pub book_thinning: f64,
+    pub funding_pressure: f64,
+    pub synchronicity: f64,
+    pub flow_acceleration: f64,
+    pub basis_velocity: f64,
+}
+
+impl Default for DirectionalSignalWeights {
+    fn default() -> Self {
+        Self {
+            flow_direction: 0.35,
+            flow_toxicity: 0.20,
+            book_thinning: 0.15,
+            funding_pressure: 0.10,
+            synchronicity: 0.10,
+            flow_acceleration: 0.05,
+            basis_velocity: 0.05,
+        }
+    }
+}
+
+impl DirectionalSignalWeights {
+    /// Normalize weights to sum to 1.0.
+    pub fn normalized(&self) -> Self {
+        let total = self.flow_direction
+            + self.flow_toxicity
+            + self.book_thinning
+            + self.funding_pressure
+            + self.synchronicity
+            + self.flow_acceleration
+            + self.basis_velocity;
+        if total < 1e-12 {
+            return Self::default();
+        }
+        Self {
+            flow_direction: self.flow_direction / total,
+            flow_toxicity: self.flow_toxicity / total,
+            book_thinning: self.book_thinning / total,
+            funding_pressure: self.funding_pressure / total,
+            synchronicity: self.synchronicity / total,
+            flow_acceleration: self.flow_acceleration / total,
+            basis_velocity: self.basis_velocity / total,
+        }
+    }
+
+    /// Create from SNR-proportional weights (from PerSignalSharpeTracker).
+    /// Maps signal names to weight fields. Falls back to default for unknown signals.
+    pub fn from_sharpe_weights(weights: &[(String, f64)]) -> Self {
+        let mut w = Self::default();
+        for (name, weight) in weights {
+            match name.as_str() {
+                "flow_direction" | "flow_dir" => w.flow_direction = *weight,
+                "flow_toxicity" | "flow_tox" => w.flow_toxicity = *weight,
+                "book_thinning" | "book_thin" => w.book_thinning = *weight,
+                "funding_pressure" | "funding" => w.funding_pressure = *weight,
+                "synchronicity" | "sync" => w.synchronicity = *weight,
+                "flow_acceleration" | "accel" => w.flow_acceleration = *weight,
+                "basis_velocity" | "basis_vel" => w.basis_velocity = *weight,
+                _ => {} // Unknown signal, skip
+            }
+        }
+        w.normalized()
+    }
+}
+
 /// Central feature vector built once per quoting cycle.
 /// Aggregates all signal sources into a unified representation.
 #[derive(Debug, Clone)]
@@ -78,27 +149,23 @@ pub struct FeatureVector {
     pub flow_acceleration: NormalizedFeature,
     /// Funding basis velocity: rate of premium change scaled by settlement proximity [-1, 1]
     pub basis_velocity: NormalizedFeature,
+    /// Directional signal weights (Phase 5). Updated from SNR-proportional learning.
+    pub signal_weights: DirectionalSignalWeights,
 }
 
 impl FeatureVector {
     /// Directional signal: weighted combination for skew computation.
     /// Positive = bullish pressure, negative = bearish.
+    /// Weights are learned from SNR-proportional Sharpe tracking (Phase 5).
     pub fn directional_signal(&self) -> f64 {
-        const FLOW_DIR_WEIGHT: f64 = 0.35;
-        const FLOW_TOX_WEIGHT: f64 = 0.20;
-        const BOOK_THIN_WEIGHT: f64 = 0.15;
-        const FUNDING_WEIGHT: f64 = 0.10;
-        const SYNC_WEIGHT: f64 = 0.10;
-        const ACCEL_WEIGHT: f64 = 0.05;
-        const BASIS_VEL_WEIGHT: f64 = 0.05;
-
-        self.flow_direction.effective(2000.0) * FLOW_DIR_WEIGHT
-            + self.flow_toxicity.effective(1000.0) * FLOW_TOX_WEIGHT
-            + self.book_thinning.effective(3000.0) * BOOK_THIN_WEIGHT
-            + self.funding_pressure.effective(10000.0) * FUNDING_WEIGHT
-            + self.synchronicity.effective(2000.0) * SYNC_WEIGHT
-            + self.flow_acceleration.effective(1500.0) * ACCEL_WEIGHT
-            + self.basis_velocity.effective(5000.0) * BASIS_VEL_WEIGHT
+        let w = &self.signal_weights;
+        self.flow_direction.effective(2000.0) * w.flow_direction
+            + self.flow_toxicity.effective(1000.0) * w.flow_toxicity
+            + self.book_thinning.effective(3000.0) * w.book_thinning
+            + self.funding_pressure.effective(10000.0) * w.funding_pressure
+            + self.synchronicity.effective(2000.0) * w.synchronicity
+            + self.flow_acceleration.effective(1500.0) * w.flow_acceleration
+            + self.basis_velocity.effective(5000.0) * w.basis_velocity
     }
 
     /// Risk signal: urgency for spread widening. Always >= 0.
@@ -121,6 +188,7 @@ impl FeatureVector {
             synchronicity: NormalizedFeature::stale(),
             flow_acceleration: NormalizedFeature::stale(),
             basis_velocity: NormalizedFeature::stale(),
+            signal_weights: DirectionalSignalWeights::default(),
         }
     }
 }
@@ -268,25 +336,66 @@ mod tests {
 
     #[test]
     fn test_directional_signal_weights_sum_to_one() {
-        // Verify weights are properly normalized
-        const FLOW_DIR_WEIGHT: f64 = 0.35;
-        const FLOW_TOX_WEIGHT: f64 = 0.20;
-        const BOOK_THIN_WEIGHT: f64 = 0.15;
-        const FUNDING_WEIGHT: f64 = 0.10;
-        const SYNC_WEIGHT: f64 = 0.10;
-        const ACCEL_WEIGHT: f64 = 0.05;
-        const BASIS_VEL_WEIGHT: f64 = 0.05;
-
-        let total = FLOW_DIR_WEIGHT
-            + FLOW_TOX_WEIGHT
-            + BOOK_THIN_WEIGHT
-            + FUNDING_WEIGHT
-            + SYNC_WEIGHT
-            + ACCEL_WEIGHT
-            + BASIS_VEL_WEIGHT;
+        let w = DirectionalSignalWeights::default();
+        let total = w.flow_direction
+            + w.flow_toxicity
+            + w.book_thinning
+            + w.funding_pressure
+            + w.synchronicity
+            + w.flow_acceleration
+            + w.basis_velocity;
         assert!(
             (total - 1.0).abs() < 1e-10,
             "Directional signal weights should sum to 1.0, got {total}"
+        );
+    }
+
+    #[test]
+    fn test_directional_signal_weights_normalized() {
+        let w = DirectionalSignalWeights {
+            flow_direction: 2.0,
+            flow_toxicity: 1.0,
+            book_thinning: 1.0,
+            funding_pressure: 0.5,
+            synchronicity: 0.5,
+            flow_acceleration: 0.5,
+            basis_velocity: 0.5,
+        };
+        let n = w.normalized();
+        let total = n.flow_direction
+            + n.flow_toxicity
+            + n.book_thinning
+            + n.funding_pressure
+            + n.synchronicity
+            + n.flow_acceleration
+            + n.basis_velocity;
+        assert!(
+            (total - 1.0).abs() < 1e-10,
+            "Normalized weights should sum to 1.0, got {total}"
+        );
+        // Largest weight should still be flow_direction
+        assert!(n.flow_direction > n.flow_toxicity);
+    }
+
+    #[test]
+    fn test_directional_signal_weights_from_sharpe() {
+        let weights = vec![
+            ("flow_dir".to_string(), 0.5),
+            ("flow_tox".to_string(), 0.3),
+            ("book_thin".to_string(), 0.2),
+        ];
+        let w = DirectionalSignalWeights::from_sharpe_weights(&weights);
+        // Should be normalized
+        let total = w.flow_direction
+            + w.flow_toxicity
+            + w.book_thinning
+            + w.funding_pressure
+            + w.synchronicity
+            + w.flow_acceleration
+            + w.basis_velocity;
+        assert!(
+            (total - 1.0).abs() < 1e-10,
+            "Sharpe-derived weights should sum to 1.0, got {total}"
         );
     }
 }

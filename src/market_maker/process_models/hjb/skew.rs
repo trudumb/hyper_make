@@ -10,6 +10,84 @@ const DEFAULT_PREDICTIVE_BIAS_THRESHOLD: f64 = 0.3;
 /// Default predictive bias sensitivity (σ multiplier).
 const DEFAULT_PREDICTIVE_BIAS_SENSITIVITY: f64 = 2.0;
 
+// === Momentum Threshold Constants ===
+/// Base momentum threshold (bps) before position scaling.
+/// Small positions need clearer signal; large positions react earlier.
+const MOMENTUM_THRESHOLD_BASE_BPS: f64 = 8.0;
+/// Position-factor slope: reduces threshold as |q| increases.
+/// At |q|=1.0: factor = 1 - 0.6 = 0.4 → threshold = 8 * 0.4 = 3.2 bps.
+const MOMENTUM_THRESHOLD_POSITION_SLOPE: f64 = 0.6;
+/// Floor for position factor (prevents threshold from reaching zero).
+const MOMENTUM_THRESHOLD_POSITION_FLOOR: f64 = 0.3;
+
+// === Soft Gate Constants ===
+/// Continuation probability below which the soft gate ramps from 0.
+const SOFT_GATE_RAMP_START: f64 = 0.2;
+/// Gate activation floor: skip drift adjustment when gate < this value.
+const SOFT_GATE_MIN_ACTIVATION: f64 = 0.01;
+
+// === Drift Urgency Constants ===
+/// Maximum time exposure cap for drift urgency (seconds, = 5 minutes).
+const MAX_DRIFT_EXPOSURE_S: f64 = 300.0;
+/// Momentum normalization for urgency score (bps).
+const URGENCY_MOMENTUM_NORM_BPS: f64 = 50.0;
+/// Maximum momentum-to-volatility ratio for variance multiplier.
+const MAX_MOMENTUM_VOL_RATIO: f64 = 3.0;
+
+// === Trend Detection Constants ===
+/// Minimum timeframe agreement to consider medium-term opposition.
+const TREND_MIN_AGREEMENT: f64 = 0.5;
+/// Medium-term momentum threshold for opposition detection (bps).
+const TREND_MEDIUM_OPPOSITION_BPS: f64 = 3.0;
+/// Long-term momentum threshold for opposition detection (bps).
+const TREND_LONG_OPPOSITION_BPS: f64 = 5.0;
+/// Strong long-term momentum threshold for drift fallback (bps).
+const TREND_STRONG_LONG_BPS: f64 = 10.0;
+/// Medium-term momentum threshold for drift fallback (bps).
+const TREND_MEDIUM_DRIFT_BPS: f64 = 5.0;
+/// Underwater severity threshold for opposition detection.
+const TREND_UNDERWATER_THRESHOLD: f64 = 0.3;
+/// Trend boost factor for drift urgency (scales with trend_confidence).
+const TREND_BOOST_FACTOR: f64 = 0.5;
+/// Short-term drift threshold (per-sec) below which trend fallback activates.
+const SHORT_DRIFT_FALLBACK_THRESHOLD: f64 = 0.0001;
+
+/// CJP signal-aware reservation price shift (Cartea-Jaimungal-Penalva 2015).
+///
+/// Computes the optimal inventory-independent price shift from a mean-reverting signal:
+///
+/// ```text
+/// signal_shift = α_t / (κ_ou + γ×κ_trade) × (1 - exp(-(κ_ou + γ×κ_trade)×(T-t)))
+/// ```
+///
+/// Properties:
+/// 1. **Self-bounding**: converges to α/(κ_ou + γ×κ_trade) as T→∞ — no manual caps needed
+/// 2. **Execution-coupled**: higher fill rate → smaller shift (conserve in low liquidity)
+/// 3. **Risk-coupled**: higher γ → smaller shift (risk-averse = conservative)
+/// 4. **Sign-preserving**: positive α → positive shift, negative α → negative shift
+///
+/// # Arguments
+/// * `alpha_t` - Current drift signal (per-second, signed)
+/// * `kappa_ou` - OU mean-reversion rate of the signal process
+/// * `gamma` - Risk aversion parameter
+/// * `kappa_trade` - Fill intensity (fills/sec)
+/// * `time_remaining` - Time to horizon (seconds)
+fn cjp_signal_shift(
+    alpha_t: f64,
+    kappa_ou: f64,
+    gamma: f64,
+    kappa_trade: f64,
+    time_remaining: f64,
+) -> f64 {
+    let denom = kappa_ou + gamma * kappa_trade;
+    if denom < 1e-10 {
+        return 0.0;
+    }
+    let asymptotic = alpha_t / denom;
+    let decay = 1.0 - (-denom * time_remaining).exp();
+    asymptotic * decay
+}
+
 impl HJBInventoryController {
     /// Compute optimal inventory skew from HJB solution.
     ///
@@ -165,6 +243,7 @@ impl HJBInventoryController {
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
+                ..Default::default()
             };
         }
 
@@ -180,6 +259,7 @@ impl HJBInventoryController {
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
+                ..Default::default()
             };
         };
 
@@ -197,23 +277,24 @@ impl HJBInventoryController {
         // - |q| = 0.1: threshold = 8 bps (small position, need clearer signal)
         // - |q| = 0.5: threshold = 5 bps (medium position)
         // - |q| = 1.0: threshold = 3 bps (max position, react to any trend)
-        let base_threshold = 8.0;
-        let position_factor = (1.0 - 0.6 * q.abs()).max(0.3); // Range: 0.3 to 1.0
-        let momentum_threshold = base_threshold * position_factor;
+        let position_factor = (1.0 - MOMENTUM_THRESHOLD_POSITION_SLOPE * q.abs())
+            .max(MOMENTUM_THRESHOLD_POSITION_FLOOR);
+        let momentum_threshold = MOMENTUM_THRESHOLD_BASE_BPS * position_factor;
         let momentum_significant = momentum_bps.abs() > momentum_threshold;
 
         // Phase 3C: Soft continuation gate replaces binary cliff at p=0.5.
         // beta_continuation=-0.5 already provides continuous scaling.
-        // Soft gate: ramp from 0 at p=0.2 to 1.0 at min_continuation_prob
+        // Soft gate: ramp from 0 at SOFT_GATE_RAMP_START to 1.0 at min_continuation_prob
         let continuation_gate = if p_continuation >= self.config.min_continuation_prob {
             1.0
-        } else if p_continuation > 0.2 {
-            (p_continuation - 0.2) / (self.config.min_continuation_prob - 0.2)
+        } else if p_continuation > SOFT_GATE_RAMP_START {
+            (p_continuation - SOFT_GATE_RAMP_START)
+                / (self.config.min_continuation_prob - SOFT_GATE_RAMP_START)
         } else {
             0.0
         };
 
-        if !is_opposed || !momentum_significant || continuation_gate < 0.01 {
+        if !is_opposed || !momentum_significant || continuation_gate < SOFT_GATE_MIN_ACTIVATION {
             // No drift adjustment needed
             return DriftAdjustedSkew {
                 total_skew: base_skew,
@@ -223,12 +304,13 @@ impl HJBInventoryController {
                 variance_multiplier: 1.0,
                 is_opposed,
                 urgency_score: 0.0,
+                ..Default::default()
             };
         }
 
         // === Compute Drift Urgency ===
         // From optimal control with drift: urgency ∝ μ × P(continue) × |q| × T
-        let time_remaining = self.time_remaining().min(300.0); // Cap at 5 min exposure
+        let time_remaining = self.time_remaining().min(MAX_DRIFT_EXPOSURE_S);
 
         // Use EWMA-smoothed drift if warmed up, otherwise compute from raw momentum
         // Smoothed drift gives more stable signals and reduces whipsawing
@@ -240,23 +322,15 @@ impl HJBInventoryController {
             (momentum_bps / 10000.0) / 0.5
         };
 
-        // Urgency formula:
-        // drift_urgency = sensitivity × drift_rate × P(continue) × |q| × T
-        let raw_urgency = self.config.opposition_sensitivity
-            * drift_rate.abs()
-            * p_continuation
-            * q.abs()
-            * time_remaining;
-
-        // Cap urgency
-        let max_base_urgency = base_skew.abs() * self.config.max_drift_urgency;
-        let drift_urgency_magnitude = raw_urgency.min(max_base_urgency);
-
-        // Sign: urgency should amplify the base skew direction
-        // If short (q < 0), base skew is negative (quotes shift up)
-        // Urgency should make it MORE negative (more aggressive buying)
-        // Phase 3C: Scale by continuation_gate for smooth ramp-in
-        let drift_urgency = drift_urgency_magnitude * q.signum() * continuation_gate;
+        // CJP signal-aware skew: self-bounding, execution-coupled
+        let raw_shift = cjp_signal_shift(
+            drift_rate.abs(),
+            self.config.cjp_kappa_ou,
+            self.config.gamma_base,
+            self.kappa_trade,
+            time_remaining,
+        );
+        let drift_urgency = raw_shift * p_continuation * q.signum() * continuation_gate;
 
         // === Compute Variance Multiplier ===
         // Use EWMA-smoothed variance multiplier if warmed up for stability
@@ -267,7 +341,9 @@ impl HJBInventoryController {
             // Compute inline during warmup
             // σ²_eff = σ² × (1 + κ × |momentum/σ| × P(continue))
             let momentum_vol_ratio = if self.sigma > 1e-10 {
-                ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+                ((momentum_bps / 10000.0) / self.sigma)
+                    .abs()
+                    .min(MAX_MOMENTUM_VOL_RATIO)
             } else {
                 0.0
             };
@@ -282,17 +358,27 @@ impl HJBInventoryController {
 
         // Compute momentum_vol_ratio for urgency_score (needed below)
         let momentum_vol_ratio = if self.sigma > 1e-10 {
-            ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+            ((momentum_bps / 10000.0) / self.sigma)
+                .abs()
+                .min(MAX_MOMENTUM_VOL_RATIO)
         } else {
             0.0
         };
 
         // Urgency score for diagnostics [0, 5]
-        let urgency_score = (momentum_bps.abs() / 50.0).min(1.0) // Momentum strength
+        let urgency_score = (momentum_bps.abs() / URGENCY_MOMENTUM_NORM_BPS).min(1.0) // Momentum strength
             + p_continuation // Continuation confidence
             + q.abs() // Position size
             + momentum_vol_ratio.min(1.0) // Vol-adjusted momentum
             + if self.is_terminal_zone() { 1.0 } else { 0.0 }; // Terminal zone boost
+
+        // CJP diagnostics
+        let cjp_denom = self.config.cjp_kappa_ou + self.config.gamma_base * self.kappa_trade;
+        let cjp_asymptotic = if cjp_denom > 1e-10 {
+            drift_rate.abs() / cjp_denom
+        } else {
+            0.0
+        };
 
         DriftAdjustedSkew {
             total_skew: base_skew + drift_urgency,
@@ -302,6 +388,9 @@ impl HJBInventoryController {
             variance_multiplier: variance_multiplier_capped,
             is_opposed,
             urgency_score: urgency_score.min(5.0),
+            cjp_signal_shift: drift_urgency.abs(),
+            cjp_asymptotic_shift: cjp_asymptotic,
+            cjp_kappa_trade: self.kappa_trade,
         }
     }
 
@@ -318,6 +407,8 @@ impl HJBInventoryController {
         result.total_skew *= 10000.0;
         result.base_skew *= 10000.0;
         result.drift_urgency *= 10000.0;
+        result.cjp_signal_shift *= 10000.0;
+        result.cjp_asymptotic_shift *= 10000.0;
         result
     }
 
@@ -358,6 +449,7 @@ impl HJBInventoryController {
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
+                ..Default::default()
             };
         }
 
@@ -373,6 +465,7 @@ impl HJBInventoryController {
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
+                ..Default::default()
             };
         };
 
@@ -383,36 +476,39 @@ impl HJBInventoryController {
         let short_opposed = q * momentum_bps < 0.0;
 
         // Medium-term opposition (30s window, requires some agreement)
-        let medium_opposed = if trend.is_warmed_up && trend.timeframe_agreement > 0.5 {
-            q * trend.medium_momentum_bps < 0.0 && trend.medium_momentum_bps.abs() > 3.0
-        } else {
-            false
-        };
+        let medium_opposed =
+            if trend.is_warmed_up && trend.timeframe_agreement > TREND_MIN_AGREEMENT {
+                q * trend.medium_momentum_bps < 0.0
+                    && trend.medium_momentum_bps.abs() > TREND_MEDIUM_OPPOSITION_BPS
+            } else {
+                false
+            };
 
         // Long-term opposition (5min window, more authoritative)
         let long_opposed = if trend.is_warmed_up {
-            q * trend.long_momentum_bps < 0.0 && trend.long_momentum_bps.abs() > 5.0
+            q * trend.long_momentum_bps < 0.0
+                && trend.long_momentum_bps.abs() > TREND_LONG_OPPOSITION_BPS
         } else {
             false
         };
 
         // Underwater opposition (position losing money in a sustained way)
-        let underwater_opposed = trend.underwater_severity > 0.3;
+        let underwater_opposed = trend.underwater_severity > TREND_UNDERWATER_THRESHOLD;
 
         // Combined opposition: any trigger counts
         let is_opposed = short_opposed || medium_opposed || long_opposed || underwater_opposed;
 
         // Position-dependent threshold (same as original)
-        let base_threshold = 8.0;
-        let position_factor = (1.0 - 0.6 * q.abs()).max(0.3);
-        let momentum_threshold = base_threshold * position_factor;
+        let position_factor = (1.0 - MOMENTUM_THRESHOLD_POSITION_SLOPE * q.abs())
+            .max(MOMENTUM_THRESHOLD_POSITION_FLOOR);
+        let momentum_threshold = MOMENTUM_THRESHOLD_BASE_BPS * position_factor;
 
         // Use the strongest momentum signal for threshold check
         let effective_momentum = if trend.is_warmed_up {
             // When long-term has a clear signal, use it
-            if trend.long_momentum_bps.abs() > 10.0 {
+            if trend.long_momentum_bps.abs() > TREND_STRONG_LONG_BPS {
                 trend.long_momentum_bps.abs()
-            } else if trend.medium_momentum_bps.abs() > 5.0 {
+            } else if trend.medium_momentum_bps.abs() > TREND_MEDIUM_DRIFT_BPS {
                 trend.medium_momentum_bps.abs()
             } else {
                 momentum_bps.abs()
@@ -428,14 +524,15 @@ impl HJBInventoryController {
         let min_prob = self.config.min_continuation_prob;
         let reduction_urgency_gate = if p_continuation >= min_prob {
             0.0 // Position healthy, no extra reduction pressure
-        } else if p_continuation > 0.2 {
-            // Ramp from 0.0 (at min_prob) to 1.0 (at 0.2)
-            (min_prob - p_continuation) / (min_prob - 0.2)
+        } else if p_continuation > SOFT_GATE_RAMP_START {
+            // Ramp from 0.0 (at min_prob) to 1.0 (at SOFT_GATE_RAMP_START)
+            (min_prob - p_continuation) / (min_prob - SOFT_GATE_RAMP_START)
         } else {
             1.0 // Position strongly opposed, max reduction pressure
         };
 
-        if !is_opposed || !momentum_significant || reduction_urgency_gate < 0.01 {
+        if !is_opposed || !momentum_significant || reduction_urgency_gate < SOFT_GATE_MIN_ACTIVATION
+        {
             return DriftAdjustedSkew {
                 total_skew: base_skew,
                 base_skew,
@@ -444,11 +541,12 @@ impl HJBInventoryController {
                 variance_multiplier: 1.0,
                 is_opposed,
                 urgency_score: 0.0,
+                ..Default::default()
             };
         }
 
         // === Compute Drift Urgency (with trend boost) ===
-        let time_remaining = self.time_remaining().min(300.0);
+        let time_remaining = self.time_remaining().min(MAX_DRIFT_EXPOSURE_S);
 
         // Use EWMA-smoothed drift if warmed up, with long-term trend fallback
         let drift_rate = if self.is_drift_warmed_up() {
@@ -457,8 +555,8 @@ impl HJBInventoryController {
             // use the long-term trend as drift signal. This prevents the MM from buying
             // into a smooth downtrend where short-term momentum oscillates near zero.
             if trend.is_warmed_up
-                && short_drift.abs() < 0.0001
-                && trend.long_momentum_bps.abs() > 5.0
+                && short_drift.abs() < SHORT_DRIFT_FALLBACK_THRESHOLD
+                && trend.long_momentum_bps.abs() > TREND_MEDIUM_DRIFT_BPS
                 && is_opposed
             {
                 // Long momentum is per 5min window, convert to per-second drift rate
@@ -466,9 +564,11 @@ impl HJBInventoryController {
                 // Also consider medium-term for faster response
                 let med_drift = (trend.medium_momentum_bps / 10000.0) / 30.0;
                 // Confidence-weighted blend: long is anchor, medium only trusted when aligned
-                let long_confidence = (trend.long_momentum_bps.abs() / 10.0).min(1.0);
-                let med_confidence =
-                    (trend.medium_momentum_bps.abs() / 5.0).min(1.0) * trend.timeframe_agreement;
+                let long_confidence =
+                    (trend.long_momentum_bps.abs() / TREND_STRONG_LONG_BPS).min(1.0);
+                let med_confidence = (trend.medium_momentum_bps.abs() / TREND_MEDIUM_DRIFT_BPS)
+                    .min(1.0)
+                    * trend.timeframe_agreement;
                 let total_confidence = long_confidence + med_confidence;
                 if total_confidence > 0.001 {
                     (long_confidence * long_drift + med_confidence * med_drift) / total_confidence
@@ -482,29 +582,31 @@ impl HJBInventoryController {
             (momentum_bps / 10000.0) / 0.5
         };
 
-        // Base urgency calculation (gate handles p_continuation scaling)
-        let raw_urgency =
-            self.config.opposition_sensitivity * drift_rate.abs() * q.abs() * time_remaining;
-
-        // Boost urgency when trend is confident (multi-timeframe agreement)
-        // trend_confidence is 0.0-1.0, boost factor is 1.0-2.0
+        // Trend boost: multi-timeframe agreement amplifies drift urgency
         let trend_boost = if trend.is_warmed_up {
-            1.0 + trend.trend_confidence // 1.0 to 2.0
+            1.0 + trend.trend_confidence * TREND_BOOST_FACTOR // 1.0 to 1.5 (conservative with CJP)
         } else {
             1.0
         };
 
-        let boosted_urgency = raw_urgency * trend_boost;
-        let max_base_urgency = base_skew.abs() * self.config.max_drift_urgency;
-        let drift_urgency_magnitude = boosted_urgency.min(max_base_urgency);
-        let drift_urgency = drift_urgency_magnitude * q.signum() * reduction_urgency_gate;
+        // CJP signal-aware skew: self-bounding, execution-coupled
+        let raw_shift = cjp_signal_shift(
+            drift_rate.abs(),
+            self.config.cjp_kappa_ou,
+            self.config.gamma_base,
+            self.kappa_trade,
+            time_remaining,
+        );
+        let drift_urgency = raw_shift * trend_boost * q.signum() * reduction_urgency_gate;
 
         // === Compute Variance Multiplier ===
         let variance_multiplier_capped = if self.is_drift_warmed_up() {
             self.variance_mult_ewma * trend_boost.min(1.5) // Additional boost, capped
         } else {
             let momentum_vol_ratio = if self.sigma > 1e-10 {
-                ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+                ((momentum_bps / 10000.0) / self.sigma)
+                    .abs()
+                    .min(MAX_MOMENTUM_VOL_RATIO)
             } else {
                 0.0
             };
@@ -518,17 +620,27 @@ impl HJBInventoryController {
 
         // Urgency score for diagnostics
         let momentum_vol_ratio = if self.sigma > 1e-10 {
-            ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+            ((momentum_bps / 10000.0) / self.sigma)
+                .abs()
+                .min(MAX_MOMENTUM_VOL_RATIO)
         } else {
             0.0
         };
 
-        let urgency_score = (momentum_bps.abs() / 50.0).min(1.0)
+        let urgency_score = (momentum_bps.abs() / URGENCY_MOMENTUM_NORM_BPS).min(1.0)
             + reduction_urgency_gate
             + q.abs()
             + momentum_vol_ratio.min(1.0)
             + if self.is_terminal_zone() { 1.0 } else { 0.0 }
             + trend.trend_confidence; // Add trend confidence to score
+
+        // CJP diagnostics
+        let cjp_denom = self.config.cjp_kappa_ou + self.config.gamma_base * self.kappa_trade;
+        let cjp_asymptotic = if cjp_denom > 1e-10 {
+            drift_rate.abs() / cjp_denom
+        } else {
+            0.0
+        };
 
         DriftAdjustedSkew {
             total_skew: base_skew + drift_urgency,
@@ -538,6 +650,9 @@ impl HJBInventoryController {
             variance_multiplier: variance_multiplier_capped,
             is_opposed,
             urgency_score: urgency_score.min(6.0), // Max now 6.0 with trend
+            cjp_signal_shift: drift_urgency.abs(),
+            cjp_asymptotic_shift: cjp_asymptotic,
+            cjp_kappa_trade: self.kappa_trade,
         }
     }
 
@@ -560,6 +675,8 @@ impl HJBInventoryController {
         result.total_skew *= 10000.0;
         result.base_skew *= 10000.0;
         result.drift_urgency *= 10000.0;
+        result.cjp_signal_shift *= 10000.0;
+        result.cjp_asymptotic_shift *= 10000.0;
         result
     }
 
@@ -972,6 +1089,216 @@ mod tests {
             "both below 0.2 should have same max urgency: p=0.15={}, p=0.1={}",
             result_extreme.drift_urgency,
             result_very_extreme.drift_urgency,
+        );
+    }
+
+    // === CJP Signal-Aware Tests ===
+
+    /// Build a CJP-enabled controller with known kappa_trade.
+    fn make_cjp_controller() -> HJBInventoryController {
+        let config = HJBConfig {
+            use_ou_drift: false,
+            use_drift_adjusted_skew: true,
+            use_cjp_signal: true,
+            cjp_kappa_trade_default: 0.5,
+            cjp_kappa_ou: 0.1,
+            gamma_base: 0.3,
+            min_continuation_prob: 0.5,
+            ..HJBConfig::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.drift_update_count = 100;
+        ctrl.drift_ewma = 0.001; // 10 bps/s drift
+        ctrl.sigma = 0.001;
+        ctrl
+    }
+
+    #[test]
+    fn test_cjp_shift_bounded_by_asymptotic() {
+        // CJP shift must be bounded by α/(κ_ou + γ×κ_trade) for any T.
+        let alpha = 0.001; // 10 bps/s
+        let kappa_ou = 0.1;
+        let gamma = 0.3;
+        let kappa_trade = 0.5;
+        let asymptotic = alpha / (kappa_ou + gamma * kappa_trade);
+
+        // Test across a wide range of time horizons
+        for &t in &[0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0] {
+            let shift = cjp_signal_shift(alpha, kappa_ou, gamma, kappa_trade, t);
+            assert!(
+                shift <= asymptotic + 1e-12,
+                "CJP shift ({}) should be bounded by asymptotic ({}) at T={}",
+                shift,
+                asymptotic,
+                t,
+            );
+            assert!(
+                shift >= 0.0,
+                "CJP shift should be non-negative for positive alpha, got {} at T={}",
+                shift,
+                t,
+            );
+        }
+    }
+
+    #[test]
+    fn test_cjp_higher_kappa_trade_reduces_shift() {
+        let alpha = 0.001;
+        let kappa_ou = 0.1;
+        let gamma = 0.3;
+        let time_remaining = 60.0;
+
+        let shift_low_kappa = cjp_signal_shift(alpha, kappa_ou, gamma, 0.1, time_remaining);
+        let shift_high_kappa = cjp_signal_shift(alpha, kappa_ou, gamma, 2.0, time_remaining);
+
+        assert!(
+            shift_low_kappa > shift_high_kappa,
+            "higher kappa_trade ({}) should reduce shift: low_k={}, high_k={}",
+            2.0,
+            shift_low_kappa,
+            shift_high_kappa,
+        );
+    }
+
+    #[test]
+    fn test_cjp_zero_drift_zero_shift() {
+        let shift = cjp_signal_shift(0.0, 0.1, 0.3, 0.5, 60.0);
+        assert!(
+            shift.abs() < 1e-15,
+            "zero drift should produce zero shift, got {}",
+            shift,
+        );
+    }
+
+    #[test]
+    fn test_cjp_positive_drift_positive_shift() {
+        let shift = cjp_signal_shift(0.001, 0.1, 0.3, 0.5, 60.0);
+        assert!(
+            shift > 0.0,
+            "positive drift should produce positive shift, got {}",
+            shift,
+        );
+    }
+
+    #[test]
+    fn test_cjp_with_reduction_gate_zero_yields_zero() {
+        let ctrl = make_cjp_controller();
+        let trend = make_trend(-20.0, -10.0, 1.0);
+
+        // p=0.6 >= min_prob=0.5 → reduction_urgency_gate = 0.0 → zero urgency
+        let result = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.6, &trend);
+        assert!(
+            result.drift_urgency.abs() < 1e-12,
+            "CJP with reduction_urgency_gate=0 should yield zero drift urgency, got {}",
+            result.drift_urgency,
+        );
+        // CJP diagnostics should also be zero when urgency is zero
+        assert!(
+            result.cjp_signal_shift.abs() < 1e-12,
+            "CJP signal shift diagnostic should be zero when gate=0, got {}",
+            result.cjp_signal_shift,
+        );
+    }
+
+    #[test]
+    fn test_cjp_diagnostics_populated_when_active() {
+        let ctrl = make_cjp_controller();
+        // p=0.3 → reduction_urgency_gate = (0.5-0.3)/(0.5-0.2) ≈ 0.667
+        // Position positive, momentum negative => opposed
+        let trend = make_trend(-20.0, -10.0, 1.0);
+        let result = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend);
+
+        assert!(
+            result.cjp_signal_shift > 0.0,
+            "CJP signal shift should be populated, got {}",
+            result.cjp_signal_shift,
+        );
+        assert!(
+            result.cjp_asymptotic_shift > 0.0,
+            "CJP asymptotic shift should be populated, got {}",
+            result.cjp_asymptotic_shift,
+        );
+        assert!(
+            result.cjp_kappa_trade > 0.0,
+            "CJP kappa_trade should be populated, got {}",
+            result.cjp_kappa_trade,
+        );
+    }
+
+    #[test]
+    fn test_cjp_diagnostics_populated() {
+        // CJP is always on — verify diagnostics are populated
+        let ctrl = make_controller();
+        let trend = make_trend(-20.0, -10.0, 1.0);
+        let result = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.3, &trend);
+
+        // CJP diagnostics should be populated (kappa_trade from default config)
+        assert!(
+            result.cjp_kappa_trade > 0.0,
+            "CJP kappa_trade should be populated, got {}",
+            result.cjp_kappa_trade,
+        );
+    }
+
+    #[test]
+    fn test_cjp_shift_convergence_at_large_t() {
+        // As T → ∞, shift should converge to α/(κ_ou + γ×κ_trade)
+        let alpha = 0.001;
+        let kappa_ou = 0.1;
+        let gamma = 0.3;
+        let kappa_trade = 0.5;
+        let asymptotic = alpha / (kappa_ou + gamma * kappa_trade);
+
+        let shift_large_t = cjp_signal_shift(alpha, kappa_ou, gamma, kappa_trade, 100000.0);
+        let relative_error = (shift_large_t - asymptotic).abs() / asymptotic;
+        assert!(
+            relative_error < 1e-6,
+            "CJP shift at large T should converge to asymptotic: shift={}, asymptotic={}, error={}",
+            shift_large_t,
+            asymptotic,
+            relative_error,
+        );
+    }
+
+    #[test]
+    fn test_cjp_degenerate_denom_returns_zero() {
+        // When κ_ou ≈ 0 and γ×κ_trade ≈ 0, should return 0 (not NaN/Inf)
+        let shift = cjp_signal_shift(0.001, 0.0, 0.0, 0.0, 60.0);
+        assert!(
+            shift.abs() < 1e-12,
+            "degenerate denominator should produce zero, got {}",
+            shift,
+        );
+        assert!(!shift.is_nan(), "should not be NaN");
+        assert!(!shift.is_infinite(), "should not be infinite");
+    }
+
+    #[test]
+    fn test_update_kappa_trade_ewma_smoothing() {
+        let mut ctrl = make_cjp_controller();
+        let initial = ctrl.kappa_trade;
+        assert!(
+            (initial - 0.5).abs() < 1e-10,
+            "initial kappa_trade should be 0.5"
+        );
+
+        // Update with a much higher value — EWMA should smooth
+        ctrl.update_kappa_trade(5.0);
+        let after_one = ctrl.kappa_trade;
+        assert!(
+            after_one > initial,
+            "kappa_trade should increase after high observation"
+        );
+        assert!(
+            after_one < 5.0,
+            "kappa_trade should be smoothed, not jump to 5.0"
+        );
+
+        // Expected: 0.05 * 5.0 + 0.95 * 0.5 = 0.25 + 0.475 = 0.725
+        assert!(
+            (after_one - 0.725).abs() < 1e-10,
+            "expected EWMA value 0.725, got {}",
+            after_one,
         );
     }
 }

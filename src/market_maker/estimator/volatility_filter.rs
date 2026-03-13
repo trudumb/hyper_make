@@ -667,6 +667,9 @@ pub struct SamplingBiasTracker {
     total_intervals: u64,
     /// Whether the tracker has enough data to be meaningful
     warmed_up: bool,
+    /// Learned EWMA alpha for bias tracking (Phase 4).
+    /// Default: 0.007 (~99-observation half-life).
+    bias_ewma_alpha: f64,
 }
 
 impl SamplingBiasTracker {
@@ -679,6 +682,7 @@ impl SamplingBiasTracker {
             nonfill_intervals: 0,
             total_intervals: 0,
             warmed_up: false,
+            bias_ewma_alpha: BIAS_EWMA_ALPHA,
         }
     }
 
@@ -695,16 +699,16 @@ impl SamplingBiasTracker {
             if self.fill_intervals == 1 {
                 self.sigma_fill_ewma = sigma;
             } else {
-                self.sigma_fill_ewma =
-                    BIAS_EWMA_ALPHA * sigma + (1.0 - BIAS_EWMA_ALPHA) * self.sigma_fill_ewma;
+                self.sigma_fill_ewma = self.bias_ewma_alpha * sigma
+                    + (1.0 - self.bias_ewma_alpha) * self.sigma_fill_ewma;
             }
         } else {
             self.nonfill_intervals += 1;
             if self.nonfill_intervals == 1 {
                 self.sigma_nonfill_ewma = sigma;
             } else {
-                self.sigma_nonfill_ewma =
-                    BIAS_EWMA_ALPHA * sigma + (1.0 - BIAS_EWMA_ALPHA) * self.sigma_nonfill_ewma;
+                self.sigma_nonfill_ewma = self.bias_ewma_alpha * sigma
+                    + (1.0 - self.bias_ewma_alpha) * self.sigma_nonfill_ewma;
             }
         }
 
@@ -769,6 +773,11 @@ impl SamplingBiasTracker {
         self.nonfill_intervals = nonfill_intervals;
         self.total_intervals = fill_intervals + nonfill_intervals;
         self.warmed_up = fill_intervals >= 10 && nonfill_intervals >= 10;
+    }
+
+    /// Set EWMA alpha from learned half-life.
+    pub fn set_bias_ewma_alpha(&mut self, alpha: f64) {
+        self.bias_ewma_alpha = alpha.clamp(0.001, 0.1);
     }
 }
 

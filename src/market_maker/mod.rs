@@ -446,6 +446,12 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Bayesian drift estimator: fuses all directional signals into posterior μ.
     drift_estimator: strategy::drift_estimator::KalmanDriftEstimator,
 
+    // === Upgrade 2A: Cox Process Fill Updates ===
+    /// Cox process model for principled fill-to-drift inference.
+    /// Replaces heuristic distance_sigma scaling with Bayesian score function.
+    /// Enabled via `config.stochastic.use_cox_fill_updates`.
+    cox_fill_model: strategy::cox_fill_model::CoxFillModel,
+
     // === Trend Echo Attenuation (Fix 13) ===
     /// Hysteresis gate for trend feeding drift Kalman.
     /// Must earn past return_autocorrelation > 0.12 before activating.
@@ -469,6 +475,12 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Tracks adverse selection from cancel-race events (cancel sent, fill arrived first).
     /// Excess race AS feeds into spread floor to protect against latency disadvantage.
     pub cancel_race_tracker: adverse_selection::CancelRaceTracker,
+
+    // === Upgrade 2B: GMM Toxicity Posterior ===
+    /// Gaussian Mixture Model for principled fill toxicity classification.
+    /// Replaces heuristic AS weights with Bayesian posterior P(informed | markout).
+    /// Updated on each markout observation, feeds into gamma via RiskFeatures.
+    gmm_toxicity: adverse_selection::GmmToxicityModel,
 
     // === Bayesian Sigma Correction (CovarianceTracker) ===
     /// Tracks realized vs predicted sigma via markout feedback.
@@ -609,6 +621,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let mut fill_cascade_tracker = FillCascadeTracker::new_with_config(&config.cascade);
         // Phase 2B: Wire configurable sigma boost from stochastic config
         fill_cascade_tracker.set_sigma_boost(config.stochastic.burst_sigma_boost);
+
+        // Capture Cox beta prior before config is moved (Upgrade 2A)
+        let cox_beta_prior = config.stochastic.cox_beta_prior;
 
         // Capture asset name before config is moved (Sprint 4.1)
         // BTC has no lead-lag against itself — use for_btc() to avoid self-referential model
@@ -756,6 +771,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             reference_perp_drift_ema: 0.0,
             reference_perp_last_update_ms: 0,
             drift_estimator: strategy::drift_estimator::KalmanDriftEstimator::default(),
+            cox_fill_model: strategy::cox_fill_model::CoxFillModel::new(cox_beta_prior),
             trend_gate_active: false,
             echo_estimator: strategy::echo_estimator::EchoEstimator::default(),
             last_toxicity_cancel_bid: None,
@@ -765,6 +781,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             cycle_timer:
                 crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer::new(),
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),
+            // Upgrade 2B: GMM toxicity posterior
+            gmm_toxicity: adverse_selection::GmmToxicityModel::default(),
             // Bayesian sigma correction from markout feedback
             covariance_tracker: estimator::covariance_tracker::CovarianceTracker::new(),
             // Q18: Vol sampling bias tracker (diagnostics Phase 1)
@@ -1281,6 +1299,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .as_ref()
                 .map(learning::FQICheckpoint::from)
                 .unwrap_or_default(),
+            gmm_toxicity: self.gmm_toxicity.to_checkpoint(),
+            cox_fill: self.cox_fill_model.to_checkpoint(),
         }
     }
 
@@ -1366,6 +1386,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             bundle.directional_belief.dir_sigma_sq,
             bundle.directional_belief.kappa_smoothed,
         );
+        // Restore GMM toxicity model from checkpoint
+        if bundle.gmm_toxicity.n_observations > 0 {
+            self.gmm_toxicity = adverse_selection::GmmToxicityModel::from_checkpoint(
+                &bundle.gmm_toxicity,
+                adverse_selection::GmmToxicityConfig::default(),
+            );
+            tracing::info!(
+                n_observations = bundle.gmm_toxicity.n_observations,
+                pi = %format!("{:.3}", bundle.gmm_toxicity.pi),
+                "GMM toxicity model restored from checkpoint"
+            );
+        }
         // Restore FQI Q-table from checkpoint
         if let Some(result) = bundle.fqi_q_table.to_result() {
             info!(
@@ -1373,6 +1405,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 "FQI Q-table restored from checkpoint"
             );
             self.fqi_result = Some(result);
+        }
+        // Restore Cox fill model from checkpoint (Upgrade 2A)
+        if bundle.cox_fill.n_buy + bundle.cox_fill.n_sell > 0 {
+            self.cox_fill_model =
+                strategy::cox_fill_model::CoxFillModel::from_checkpoint(&bundle.cox_fill);
+            info!(
+                n_buy = bundle.cox_fill.n_buy,
+                n_sell = bundle.cox_fill.n_sell,
+                beta = %format!("{:.4}", bundle.cox_fill.beta),
+                "Cox fill model restored from checkpoint"
+            );
         }
     }
 
@@ -2141,6 +2184,7 @@ mod fill_cascade_tests {
             burst_count_threshold: 4,
             burst_count_window_secs: 2,
             burst_cancel_cooldown_secs: 5,
+            use_hawkes_burst: true,
         }
     }
 

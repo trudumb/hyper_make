@@ -3,6 +3,7 @@
 //! This module provides different quoting strategies that implement the
 //! `QuotingStrategy` trait.
 
+pub mod cox_fill_model;
 pub mod directional_conviction;
 pub mod drift_estimator;
 pub mod dynamic_params;
@@ -32,6 +33,7 @@ pub use position_manager::*;
 // regime_state types are used via qualified paths (strategy::regime_state::*)
 // to avoid name conflicts with control::changepoint::MarketRegime and
 // infra::metrics::dashboard::RegimeState.
+pub use cox_fill_model::{CoxFillCheckpoint, CoxFillModel};
 pub use dynamic_params::DynamicParams;
 pub use risk_config::*;
 pub use risk_model::*;

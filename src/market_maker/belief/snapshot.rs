@@ -177,6 +177,12 @@ pub struct DriftVolatilityBeliefs {
     pub lr_sum_as: f64,
     /// Cumulative log-likelihood ratio from flow evidence
     pub lr_sum_flow: f64,
+
+    // === Adaptive Observation Noise Diagnostics (Phase 1: Bayesian Posteriors) ===
+    /// Noise correction ratios per signal source (innovation_var / prior_R).
+    /// Values near 1.0 mean well-calibrated. > 1.0 means R is underestimated.
+    /// Order: [price, fill, as, flow, burst].
+    pub noise_correction_ratios: [f64; 5],
 }
 
 impl Default for DriftVolatilityBeliefs {
@@ -198,6 +204,8 @@ impl Default for DriftVolatilityBeliefs {
             lr_sum_fill: 0.0,
             lr_sum_as: 0.0,
             lr_sum_flow: 0.0,
+            // Adaptive noise diagnostics: 1.0 = well-calibrated
+            noise_correction_ratios: [1.0; 5],
         }
     }
 }

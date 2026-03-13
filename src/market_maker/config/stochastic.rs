@@ -17,6 +17,9 @@ fn default_strategic_penalty_max_hours() -> f64 {
 fn default_adaptive_tau_measured_weight() -> f64 {
     0.7
 }
+fn default_cox_beta_prior() -> f64 {
+    0.2
+}
 
 /// Method for calculating Kelly time horizon for first-passage fill probability.
 ///
@@ -449,6 +452,35 @@ pub struct StochasticConfig {
     /// Default: 4.0
     pub learned_param_staleness_hours: f64,
 
+    /// Enable GMM toxicity posterior for fill classification (Upgrade 2B).
+    /// When true and GMM is warmed up, uses Bayesian GMM toxicity_score
+    /// instead of heuristic soft_toxicity_score in gamma computation.
+    /// Default: false (opt-in after paper trading validation).
+    #[serde(default)]
+    pub use_gmm_toxicity: bool,
+
+    /// Enable Cox process fill-to-drift updates (Upgrade 2A).
+    /// When true, replaces heuristic distance_sigma fill scaling with
+    /// Cox process score function: K = 1/(1+beta^2), update proportional to Sigma.
+    /// Default: false (opt-in after paper trading validation).
+    #[serde(default)]
+    pub use_cox_fill_updates: bool,
+
+    /// Cox process beta prior sensitivity (1/bps).
+    /// Controls how much each fill shifts the drift estimate.
+    /// Self-calibrates via online MLE after 50 fills.
+    /// Default: 0.2
+    #[serde(default = "default_cox_beta_prior")]
+    pub cox_beta_prior: f64,
+
+    // ==================== Continuous Risk Overlay (Phase 2) ====================
+    /// Route discrete risk_overlay_mult multipliers through log-additive gamma.
+    /// When true: circuit breaker, drawdown, risk severity → continuous gamma features.
+    /// When false: legacy discrete risk_overlay_mult *= N behavior.
+    /// Default: true
+    #[serde(default = "default_true_flag")]
+    pub use_continuous_risk_overlay: bool,
+
     /// Sigma multiplier during fill burst detection.
     /// With BayesianHawkes feeding gamma, the vol path needs less boost.
     /// Default: 1.5 (reduced from hardcoded 2.0).
@@ -638,6 +670,14 @@ impl Default for StochasticConfig {
             learned_param_min_observations: 100, // Power analysis: N for IR CI width < 0.2
             learned_param_max_cv: 0.5,           // 50% CV acceptable
             learned_param_staleness_hours: 24.0, // Extended for 24h autonomous operation
+            use_gmm_toxicity: true,
+
+            // Upgrade 2A: Cox process fill-to-drift updates
+            use_cox_fill_updates: true,
+            cox_beta_prior: 0.2, // Prior sensitivity, self-calibrates after 50 fills
+
+            // Phase 2: Continuous Risk Overlay (routes discrete multipliers through gamma)
+            use_continuous_risk_overlay: true,
 
             // Phase 2B: Configurable sigma boost (reduced from hardcoded 2.0)
             burst_sigma_boost: 1.5,

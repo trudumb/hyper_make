@@ -70,6 +70,11 @@ pub struct Observation {
     /// Liquidation pressure indicator: combines OI drop + extreme funding
     /// High values indicate forced selling pressure
     pub liquidation_pressure: f64,
+
+    /// Hawkes intensity ratio: lambda_total / mu_baseline.
+    /// 1.0 = baseline activity, >1 = clustering/burst, <1 = quiet.
+    /// Replaces count-based burst detection with principled self-exciting process.
+    pub hawkes_intensity_ratio: f64,
 }
 
 impl Default for Observation {
@@ -78,9 +83,10 @@ impl Default for Observation {
             volatility: 0.00025,
             spread_bps: 5.0,
             flow_imbalance: 0.0,
-            oi_level: 1.0,             // Average
-            oi_velocity: 0.0,          // No change
-            liquidation_pressure: 0.0, // No pressure
+            oi_level: 1.0,               // Average
+            oi_velocity: 0.0,            // No change
+            liquidation_pressure: 0.0,   // No pressure
+            hawkes_intensity_ratio: 1.0, // Baseline activity
         }
     }
 }
@@ -95,6 +101,7 @@ impl Observation {
             oi_level: 1.0,
             oi_velocity: 0.0,
             liquidation_pressure: 0.0,
+            hawkes_intensity_ratio: 1.0,
         }
     }
 
@@ -114,12 +121,38 @@ impl Observation {
             oi_level: oi_level.max(0.0),
             oi_velocity,
             liquidation_pressure: liquidation_pressure.clamp(0.0, 1.0),
+            hawkes_intensity_ratio: 1.0,
+        }
+    }
+
+    /// Full constructor with Hawkes intensity ratio.
+    ///
+    /// Use when Hawkes estimator is warmed up and providing intensity data.
+    /// The intensity ratio replaces count-based burst detection with a principled
+    /// self-exciting process observation for the HMM.
+    pub fn new_with_hawkes(
+        volatility: f64,
+        spread_bps: f64,
+        flow_imbalance: f64,
+        hawkes_intensity_ratio: f64,
+    ) -> Self {
+        Self {
+            volatility,
+            spread_bps,
+            flow_imbalance: flow_imbalance.clamp(-1.0, 1.0),
+            oi_level: 1.0,
+            oi_velocity: 0.0,
+            liquidation_pressure: 0.0,
+            hawkes_intensity_ratio: hawkes_intensity_ratio.clamp(0.0, 50.0),
         }
     }
 
     /// Check if this observation has leading indicator data
     pub fn has_leading_indicators(&self) -> bool {
-        self.oi_level != 1.0 || self.oi_velocity != 0.0 || self.liquidation_pressure != 0.0
+        self.oi_level != 1.0
+            || self.oi_velocity != 0.0
+            || self.liquidation_pressure != 0.0
+            || self.hawkes_intensity_ratio != 1.0
     }
 }
 
@@ -154,6 +187,12 @@ pub struct EmissionParams {
     /// Weight for liquidation pressure signal (0-1)
     /// Higher weight in cascade regime
     pub liquidation_weight: f64,
+
+    /// Mean Hawkes intensity ratio for this regime.
+    /// 1.0 = baseline, higher = more trade clustering.
+    pub mean_hawkes_intensity: f64,
+    /// Standard deviation of Hawkes intensity ratio.
+    pub std_hawkes_intensity: f64,
 }
 
 impl EmissionParams {
@@ -170,6 +209,9 @@ impl EmissionParams {
             mean_oi_velocity: 0.0,
             std_oi_velocity: 0.05,
             liquidation_weight: 0.0,
+            // Hawkes defaults: baseline intensity, moderate spread
+            mean_hawkes_intensity: 1.0,
+            std_hawkes_intensity: 0.5,
         }
     }
 
@@ -189,6 +231,8 @@ impl EmissionParams {
         // mean_oi_velocity has no constraint (can be negative)
         self.std_oi_velocity = self.std_oi_velocity.max(0.01);
         self.liquidation_weight = self.liquidation_weight.clamp(0.0, 1.0);
+        self.mean_hawkes_intensity = self.mean_hawkes_intensity.max(0.1);
+        self.std_hawkes_intensity = self.std_hawkes_intensity.max(0.05);
         self
     }
 
@@ -227,8 +271,18 @@ impl EmissionParams {
             0.0
         };
 
+        // Log-likelihood of Hawkes intensity ratio (Gaussian) - only if non-default
+        let ll_hawkes = if (obs.hawkes_intensity_ratio - 1.0).abs() > 1e-6 {
+            let hawkes_z = (obs.hawkes_intensity_ratio - self.mean_hawkes_intensity)
+                / self.std_hawkes_intensity;
+            -0.5 * hawkes_z * hawkes_z - self.std_hawkes_intensity.ln()
+        } else {
+            0.0 // No contribution if at default (Hawkes not warmed up)
+        };
+
         // Combine (treating as independent features)
-        ll_vol + ll_spread + ll_oi * 0.5 + ll_oi_vel * 0.5 + ll_liq
+        // Hawkes weighted at 0.5 like OI — informative but not dominant
+        ll_vol + ll_spread + ll_oi * 0.5 + ll_oi_vel * 0.5 + ll_liq + ll_hawkes * 0.5
     }
 
     /// Compute likelihood (not log) of observation.
@@ -251,7 +305,7 @@ impl EmissionParams {
 /// - Liquidation pressure: High in cascade, low otherwise
 fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
     [
-        // Low regime: quiet market, stable OI
+        // Low regime: quiet market, stable OI, below-baseline Hawkes
         EmissionParams {
             mean_volatility: 0.001,
             std_volatility: 0.0005,
@@ -262,9 +316,11 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: 0.0,
             std_oi_velocity: 0.02,
             liquidation_weight: 0.0,
+            mean_hawkes_intensity: 0.5,
+            std_hawkes_intensity: 0.2,
         }
         .validated(),
-        // Normal regime: standard conditions
+        // Normal regime: standard conditions, baseline Hawkes
         EmissionParams {
             mean_volatility: 0.0025,
             std_volatility: 0.001,
@@ -275,9 +331,11 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: 0.0,
             std_oi_velocity: 0.03,
             liquidation_weight: 0.0,
+            mean_hawkes_intensity: 1.0,
+            std_hawkes_intensity: 0.3,
         }
         .validated(),
-        // High regime: elevated vol, OI starting to drop
+        // High regime: elevated vol, OI starting to drop, clustering trades
         EmissionParams {
             mean_volatility: 0.01,
             std_volatility: 0.005,
@@ -288,9 +346,11 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: -0.02,
             std_oi_velocity: 0.05,
             liquidation_weight: 0.2,
+            mean_hawkes_intensity: 2.5,
+            std_hawkes_intensity: 0.8,
         }
         .validated(),
-        // Extreme/Cascade regime: crisis conditions, OI dropping fast
+        // Extreme/Cascade regime: crisis conditions, OI dropping fast, intense clustering
         EmissionParams {
             mean_volatility: 0.05,
             std_volatility: 0.025,
@@ -301,6 +361,8 @@ fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
             mean_oi_velocity: -0.1,
             std_oi_velocity: 0.08,
             liquidation_weight: 0.8,
+            mean_hawkes_intensity: 5.0,
+            std_hawkes_intensity: 2.0,
         }
         .validated(),
     ]
@@ -425,6 +487,10 @@ pub struct RegimeHMM {
     emission_vol_sq_sum: [f64; NUM_REGIMES],
     /// Soft emission sufficient statistics: per-regime running variance of spread.
     emission_spread_sq_sum: [f64; NUM_REGIMES],
+    /// Soft emission sufficient statistics: per-regime running mean of Hawkes intensity.
+    emission_hawkes_sum: [f64; NUM_REGIMES],
+    /// Soft emission sufficient statistics: per-regime running variance of Hawkes intensity.
+    emission_hawkes_sq_sum: [f64; NUM_REGIMES],
     /// Effective sample count per regime (sum of soft assignments).
     emission_effective_n: [f64; NUM_REGIMES],
 }
@@ -464,6 +530,8 @@ impl RegimeHMM {
             emission_spread_sum: [0.0; NUM_REGIMES],
             emission_vol_sq_sum: [0.0; NUM_REGIMES],
             emission_spread_sq_sum: [0.0; NUM_REGIMES],
+            emission_hawkes_sum: [0.0; NUM_REGIMES],
+            emission_hawkes_sq_sum: [0.0; NUM_REGIMES],
             emission_effective_n: [0.0; NUM_REGIMES],
         }
     }
@@ -570,6 +638,8 @@ impl RegimeHMM {
             self.emission_spread_sum[k] = self.emission_params[k].mean_spread;
             self.emission_vol_sq_sum[k] = self.emission_params[k].std_volatility.powi(2);
             self.emission_spread_sq_sum[k] = self.emission_params[k].std_spread.powi(2);
+            self.emission_hawkes_sum[k] = self.emission_params[k].mean_hawkes_intensity;
+            self.emission_hawkes_sq_sum[k] = self.emission_params[k].std_hawkes_intensity.powi(2);
             // Start effective_n at 0 — prior dominates until enough soft counts
             self.emission_effective_n[k] = 0.0;
         }
@@ -719,6 +789,18 @@ impl RegimeHMM {
                 let spread_dev = observation.spread_bps - self.emission_params[k].mean_spread;
                 self.emission_spread_sq_sum[k] = (1.0 - eff_alpha) * self.emission_spread_sq_sum[k]
                     + eff_alpha * spread_dev * spread_dev;
+
+                // Update Hawkes intensity running statistics (only if non-default)
+                if (observation.hawkes_intensity_ratio - 1.0).abs() > 1e-6 {
+                    self.emission_hawkes_sum[k] = (1.0 - eff_alpha) * self.emission_hawkes_sum[k]
+                        + eff_alpha * observation.hawkes_intensity_ratio;
+
+                    let hawkes_dev = observation.hawkes_intensity_ratio
+                        - self.emission_params[k].mean_hawkes_intensity;
+                    self.emission_hawkes_sq_sum[k] = (1.0 - eff_alpha)
+                        * self.emission_hawkes_sq_sum[k]
+                        + eff_alpha * hawkes_dev * hawkes_dev;
+                }
             }
 
             // Soft transition counts: P(z_{t-1}=i, z_t=j | y_{1:t})
@@ -803,6 +885,18 @@ impl RegimeHMM {
 
             params.std_volatility = new_vol_std.max(vol_std_floor).max(1e-9);
             params.std_spread = new_spread_std.max(spread_std_floor).max(0.1);
+
+            // Update Hawkes intensity emission params (only if EM has accumulated data)
+            if self.emission_hawkes_sum[k] > 0.0 {
+                let new_hawkes_mean = blend * self.emission_hawkes_sum[k]
+                    + (1.0 - blend) * params.mean_hawkes_intensity;
+                params.mean_hawkes_intensity = new_hawkes_mean.max(0.1);
+
+                let hawkes_std_floor = params.mean_hawkes_intensity * 0.3;
+                let new_hawkes_std = blend * self.emission_hawkes_sq_sum[k].sqrt()
+                    + (1.0 - blend) * params.std_hawkes_intensity;
+                params.std_hawkes_intensity = new_hawkes_std.max(hawkes_std_floor).max(0.05);
+            }
         }
 
         // Enforce minimum regime separation after EM update
@@ -1005,6 +1099,8 @@ impl RegimeHMM {
         self.emission_spread_sum = [0.0; NUM_REGIMES];
         self.emission_vol_sq_sum = [0.0; NUM_REGIMES];
         self.emission_spread_sq_sum = [0.0; NUM_REGIMES];
+        self.emission_hawkes_sum = [0.0; NUM_REGIMES];
+        self.emission_hawkes_sq_sum = [0.0; NUM_REGIMES];
         self.emission_effective_n = [0.0; NUM_REGIMES];
     }
 
@@ -1169,6 +1265,7 @@ impl RegimeHMM {
             emission_effective_n: self.emission_effective_n,
             emission_vol_sum: self.emission_vol_sum,
             emission_spread_sum: self.emission_spread_sum,
+            emission_hawkes_sum: self.emission_hawkes_sum,
         }
     }
 
@@ -1184,6 +1281,7 @@ impl RegimeHMM {
         self.emission_effective_n = cp.emission_effective_n;
         self.emission_vol_sum = cp.emission_vol_sum;
         self.emission_spread_sum = cp.emission_spread_sum;
+        self.emission_hawkes_sum = cp.emission_hawkes_sum;
         self.prev_belief = self.belief;
     }
 }
@@ -1879,5 +1977,208 @@ mod tests {
             );
         }
         assert_eq!(hmm.observation_count, hmm2.observation_count);
+    }
+
+    // =========================================================================
+    // Hawkes Intensity Integration Tests (Upgrade 2C)
+    // =========================================================================
+
+    #[test]
+    fn test_hawkes_observation_backward_compat() {
+        // Observation::new() should set hawkes_intensity_ratio to 1.0 (baseline)
+        let obs = Observation::new(0.001, 5.0, 0.0);
+        assert!(
+            (obs.hawkes_intensity_ratio - 1.0).abs() < 1e-9,
+            "Default Hawkes intensity should be 1.0, got {}",
+            obs.hawkes_intensity_ratio
+        );
+
+        // new_full() should also default to 1.0
+        let obs_full = Observation::new_full(0.001, 5.0, 0.0, 1.0, 0.0, 0.0);
+        assert!(
+            (obs_full.hawkes_intensity_ratio - 1.0).abs() < 1e-9,
+            "new_full() Hawkes intensity should be 1.0, got {}",
+            obs_full.hawkes_intensity_ratio
+        );
+
+        // Default should be 1.0
+        let obs_default = Observation::default();
+        assert!(
+            (obs_default.hawkes_intensity_ratio - 1.0).abs() < 1e-9,
+            "Default Hawkes intensity should be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_new_with_hawkes_clamping() {
+        // Should clamp negative to 0.0
+        let obs_neg = Observation::new_with_hawkes(0.001, 5.0, 0.0, -1.0);
+        assert!(
+            (obs_neg.hawkes_intensity_ratio - 0.0).abs() < 1e-9,
+            "Negative Hawkes should clamp to 0.0, got {}",
+            obs_neg.hawkes_intensity_ratio
+        );
+
+        // Should clamp above 50.0
+        let obs_high = Observation::new_with_hawkes(0.001, 5.0, 0.0, 100.0);
+        assert!(
+            (obs_high.hawkes_intensity_ratio - 50.0).abs() < 1e-9,
+            "Excessive Hawkes should clamp to 50.0, got {}",
+            obs_high.hawkes_intensity_ratio
+        );
+
+        // Valid values should pass through
+        let obs_valid = Observation::new_with_hawkes(0.001, 5.0, 0.0, 3.5);
+        assert!(
+            (obs_valid.hawkes_intensity_ratio - 3.5).abs() < 1e-9,
+            "Valid Hawkes should pass through, got {}",
+            obs_valid.hawkes_intensity_ratio
+        );
+    }
+
+    #[test]
+    fn test_hawkes_shifts_hmm_toward_high_extreme() {
+        // Elevated Hawkes intensity (ratio=5.0) should shift HMM toward High/Extreme
+        let mut hmm = RegimeHMM::new();
+
+        // Establish normal baseline
+        for _ in 0..10 {
+            hmm.forward_update(&Observation::new(0.0025, 5.0, 0.0));
+        }
+        let pre_high = hmm.belief[regime_idx::HIGH];
+        let pre_extreme = hmm.belief[regime_idx::EXTREME];
+
+        // Feed observations with elevated Hawkes intensity (trade clustering)
+        // Use vol/spread consistent with High regime to avoid emission conflict
+        for _ in 0..15 {
+            hmm.forward_update(&Observation::new_with_hawkes(0.008, 9.0, 0.3, 5.0));
+        }
+
+        let post_combined = hmm.belief[regime_idx::HIGH] + hmm.belief[regime_idx::EXTREME];
+        let pre_combined = pre_high + pre_extreme;
+
+        assert!(
+            post_combined > pre_combined,
+            "High+Extreme prob ({:.4}) should increase with elevated Hawkes intensity (was {:.4})",
+            post_combined,
+            pre_combined
+        );
+    }
+
+    #[test]
+    fn test_hawkes_baseline_keeps_normal() {
+        // Baseline Hawkes intensity (ratio=1.0) should not disturb Normal regime
+        let mut hmm = RegimeHMM::new();
+
+        // Feed normal observations with baseline Hawkes
+        for _ in 0..30 {
+            hmm.forward_update(&Observation::new_with_hawkes(0.0025, 5.0, 0.0, 1.0));
+        }
+
+        // Normal should still dominate
+        assert!(
+            hmm.belief[regime_idx::NORMAL] > 0.3,
+            "Normal prob ({:.4}) should remain elevated with baseline Hawkes",
+            hmm.belief[regime_idx::NORMAL]
+        );
+
+        // Should be higher than Extreme
+        assert!(
+            hmm.belief[regime_idx::NORMAL] > hmm.belief[regime_idx::EXTREME],
+            "Normal ({:.4}) should exceed Extreme ({:.4}) at baseline Hawkes",
+            hmm.belief[regime_idx::NORMAL],
+            hmm.belief[regime_idx::EXTREME]
+        );
+    }
+
+    #[test]
+    fn test_hawkes_low_intensity_supports_low_regime() {
+        // Very low Hawkes intensity should support Low regime detection
+        let mut hmm = RegimeHMM::new();
+
+        // Feed quiet observations with low Hawkes intensity
+        for _ in 0..30 {
+            hmm.forward_update(&Observation::new_with_hawkes(0.0005, 2.0, 0.0, 0.3));
+        }
+
+        // Low regime should be elevated
+        assert!(
+            hmm.belief[regime_idx::LOW] > hmm.belief[regime_idx::EXTREME],
+            "Low ({:.4}) should exceed Extreme ({:.4}) with quiet Hawkes",
+            hmm.belief[regime_idx::LOW],
+            hmm.belief[regime_idx::EXTREME]
+        );
+    }
+
+    #[test]
+    fn test_hawkes_emission_params_per_regime() {
+        let hmm = RegimeHMM::new();
+        let params = hmm.emission_params();
+
+        // Low: mean=0.5, quiet market
+        assert!(
+            params[regime_idx::LOW].mean_hawkes_intensity < 1.0,
+            "Low regime Hawkes mean ({}) should be < 1.0",
+            params[regime_idx::LOW].mean_hawkes_intensity
+        );
+
+        // Normal: mean=1.0, baseline
+        assert!(
+            (params[regime_idx::NORMAL].mean_hawkes_intensity - 1.0).abs() < 0.01,
+            "Normal regime Hawkes mean ({}) should be ~1.0",
+            params[regime_idx::NORMAL].mean_hawkes_intensity
+        );
+
+        // High: mean=2.5, elevated clustering
+        assert!(
+            params[regime_idx::HIGH].mean_hawkes_intensity > 2.0,
+            "High regime Hawkes mean ({}) should be > 2.0",
+            params[regime_idx::HIGH].mean_hawkes_intensity
+        );
+
+        // Extreme: mean=5.0, intense clustering
+        assert!(
+            params[regime_idx::EXTREME].mean_hawkes_intensity > 4.0,
+            "Extreme regime Hawkes mean ({}) should be > 4.0",
+            params[regime_idx::EXTREME].mean_hawkes_intensity
+        );
+
+        // Monotonic ordering
+        assert!(
+            params[regime_idx::LOW].mean_hawkes_intensity
+                < params[regime_idx::NORMAL].mean_hawkes_intensity
+        );
+        assert!(
+            params[regime_idx::NORMAL].mean_hawkes_intensity
+                < params[regime_idx::HIGH].mean_hawkes_intensity
+        );
+        assert!(
+            params[regime_idx::HIGH].mean_hawkes_intensity
+                < params[regime_idx::EXTREME].mean_hawkes_intensity
+        );
+    }
+
+    #[test]
+    fn test_hawkes_checkpoint_roundtrip() {
+        let mut hmm = RegimeHMM::new().with_baseline_volatility(0.001, 5.0);
+
+        // Feed observations with Hawkes data to populate EM sums
+        for _ in 0..100 {
+            hmm.forward_update(&Observation::new_with_hawkes(0.001, 5.0, 0.0, 2.0));
+        }
+
+        let cp = hmm.to_checkpoint();
+        let mut hmm2 = RegimeHMM::new();
+        hmm2.restore_checkpoint(&cp);
+
+        for k in 0..NUM_REGIMES {
+            assert!(
+                (hmm.emission_hawkes_sum[k] - hmm2.emission_hawkes_sum[k]).abs() < 1e-9,
+                "emission_hawkes_sum[{}] mismatch: {} vs {}",
+                k,
+                hmm.emission_hawkes_sum[k],
+                hmm2.emission_hawkes_sum[k]
+            );
+        }
     }
 }

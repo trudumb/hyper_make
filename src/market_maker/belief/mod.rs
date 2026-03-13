@@ -83,7 +83,7 @@ mod snapshot;
 pub use bayesian_fair_value::{
     BayesianFairValue, BayesianFairValueCheckpoint, BayesianFairValueConfig, FairValueBeliefs,
 };
-pub use central::{CentralBeliefConfig, CentralBeliefState};
+pub use central::{ewma_alpha_from_half_life, CentralBeliefConfig, CentralBeliefState};
 pub use messages::{BeliefUpdate, PredictionLog, PredictionType};
 pub use publisher::{BeliefPublisher, PublishError, PublisherHandle};
 pub use snapshot::{

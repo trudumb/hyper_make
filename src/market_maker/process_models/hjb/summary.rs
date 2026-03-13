@@ -29,6 +29,15 @@ pub struct DriftAdjustedSkew {
 
     /// Urgency score [0, 5] for diagnostics.
     pub urgency_score: f64,
+
+    /// CJP signal shift magnitude (0.0 if CJP disabled).
+    pub cjp_signal_shift: f64,
+
+    /// CJP asymptotic bound α/(κ_ou + γ×κ_trade) (0.0 if CJP disabled).
+    pub cjp_asymptotic_shift: f64,
+
+    /// Fill intensity used in CJP computation (0.0 if CJP disabled).
+    pub cjp_kappa_trade: f64,
 }
 
 /// Summary of HJB controller state for diagnostics.

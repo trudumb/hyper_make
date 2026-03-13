@@ -198,6 +198,14 @@ pub struct CheckpointBundle {
     /// FQI Q-table for offline learning persistence.
     #[serde(default)]
     pub fqi_q_table: crate::market_maker::learning::FQICheckpoint,
+
+    /// GMM toxicity model learned parameters (online EM state).
+    #[serde(default)]
+    pub gmm_toxicity: crate::market_maker::adverse_selection::GmmToxicityCheckpoint,
+
+    /// Cox process fill model learned parameters (Upgrade 2A).
+    #[serde(default)]
+    pub cox_fill: crate::market_maker::strategy::cox_fill_model::CoxFillCheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -456,6 +464,9 @@ pub struct RegimeHMMCheckpoint {
     /// Soft EM running mean of spread per regime
     #[serde(default)]
     pub emission_spread_sum: [f64; 4],
+    /// Soft EM running mean of Hawkes intensity per regime
+    #[serde(default)]
+    pub emission_hawkes_sum: [f64; 4],
 }
 
 impl Default for RegimeHMMCheckpoint {
@@ -468,6 +479,7 @@ impl Default for RegimeHMMCheckpoint {
             emission_effective_n: [0.0; 4],
             emission_vol_sum: [0.0; 4],
             emission_spread_sum: [0.0; 4],
+            emission_hawkes_sum: [0.0; 4],
         }
     }
 }
@@ -1054,6 +1066,8 @@ mod tests {
             as_fills_measured: 0,
             parameter_registry: Default::default(),
             fqi_q_table: Default::default(),
+            gmm_toxicity: Default::default(),
+            cox_fill: Default::default(),
         };
 
         // Serialize to JSON
@@ -1161,6 +1175,8 @@ mod tests {
             as_fills_measured: 0,
             parameter_registry: Default::default(),
             fqi_q_table: Default::default(),
+            gmm_toxicity: Default::default(),
+            cox_fill: Default::default(),
         };
 
         // Serialize to JSON
@@ -1222,6 +1238,8 @@ mod tests {
             as_fills_measured: 0,
             parameter_registry: Default::default(),
             fqi_q_table: Default::default(),
+            gmm_toxicity: Default::default(),
+            cox_fill: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -1272,6 +1290,8 @@ mod tests {
             as_fills_measured: 0,
             parameter_registry: Default::default(),
             fqi_q_table: Default::default(),
+            gmm_toxicity: Default::default(),
+            cox_fill: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");

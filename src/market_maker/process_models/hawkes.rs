@@ -363,6 +363,19 @@ impl HawkesOrderFlowEstimator {
         Some((z, r))
     }
 
+    /// Update Hawkes parameters from online calibration.
+    ///
+    /// Clamps to enforce stationarity: alpha < 0.95 * beta.
+    /// All parameters have floors to prevent degenerate behavior.
+    pub fn update_params(&mut self, mu: f64, alpha: f64, beta: f64) {
+        let new_beta = beta.clamp(0.01, 5.0);
+        let new_alpha = alpha.clamp(0.0, 0.95 * new_beta);
+        let new_mu = mu.clamp(0.01, 10.0);
+        self.config.mu = new_mu;
+        self.config.alpha = new_alpha;
+        self.config.beta = new_beta;
+    }
+
     /// Reset the estimator.
     pub fn reset(&mut self) {
         self.events.clear();
@@ -2983,6 +2996,70 @@ mod tests {
             score_a,
             score_b,
             score_c
+        );
+    }
+
+    // =========================================================================
+    // update_params tests (Upgrade 2C)
+    // =========================================================================
+
+    #[test]
+    fn test_update_params_basic() {
+        let mut est = HawkesOrderFlowEstimator::new(HawkesConfig::default());
+        est.update_params(0.8, 0.05, 0.2);
+        assert!((est.config.mu - 0.8).abs() < 1e-9);
+        assert!((est.config.alpha - 0.05).abs() < 1e-9);
+        assert!((est.config.beta - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_update_params_clamps_stationarity() {
+        let mut est = HawkesOrderFlowEstimator::new(HawkesConfig::default());
+        // alpha = 1.0 > 0.95 * beta (0.19), so should clamp alpha to 0.19
+        est.update_params(0.5, 1.0, 0.2);
+        assert!(
+            est.config.alpha <= 0.95 * est.config.beta + 1e-9,
+            "alpha ({}) should be <= 0.95 * beta ({})",
+            est.config.alpha,
+            est.config.beta
+        );
+    }
+
+    #[test]
+    fn test_update_params_clamps_mu() {
+        let mut est = HawkesOrderFlowEstimator::new(HawkesConfig::default());
+        // mu below floor
+        est.update_params(0.001, 0.05, 0.1);
+        assert!(
+            est.config.mu >= 0.01,
+            "mu ({}) should be >= 0.01",
+            est.config.mu
+        );
+        // mu above ceiling
+        est.update_params(100.0, 0.05, 0.1);
+        assert!(
+            est.config.mu <= 10.0,
+            "mu ({}) should be <= 10.0",
+            est.config.mu
+        );
+    }
+
+    #[test]
+    fn test_update_params_clamps_beta() {
+        let mut est = HawkesOrderFlowEstimator::new(HawkesConfig::default());
+        // beta below floor
+        est.update_params(0.5, 0.001, 0.001);
+        assert!(
+            est.config.beta >= 0.01,
+            "beta ({}) should be >= 0.01",
+            est.config.beta
+        );
+        // beta above ceiling
+        est.update_params(0.5, 0.05, 10.0);
+        assert!(
+            est.config.beta <= 5.0,
+            "beta ({}) should be <= 5.0",
+            est.config.beta
         );
     }
 }

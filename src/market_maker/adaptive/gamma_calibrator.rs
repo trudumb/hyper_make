@@ -18,6 +18,32 @@ use crate::market_maker::strategy::BETA_NAMES;
 /// Number of beta coefficients in CalibratedRiskModel.
 pub const NUM_BETAS: usize = 15;
 
+/// Learning rate for negative edge: strong push to widen when losing.
+const NEGATIVE_EDGE_LEARNING_RATE: f64 = 0.5;
+/// Learning rate for positive edge: gentle push to tighten when winning.
+const POSITIVE_EDGE_LEARNING_RATE: f64 = -0.1;
+/// Maximum edge magnitude used in gradient computation (bps).
+const MAX_EDGE_GRADIENT_BPS: f64 = 5.0;
+
+/// Default beta coefficients matching CalibratedRiskModel::default().
+const DEFAULT_BETAS: [f64; NUM_BETAS] = [
+    1.0,  // beta_volatility
+    0.5,  // beta_toxicity
+    4.0,  // beta_inventory
+    0.4,  // beta_hawkes
+    0.3,  // beta_book_depth
+    0.2,  // beta_uncertainty
+    -0.4, // beta_confidence (negative)
+    1.2,  // beta_cascade
+    0.7,  // beta_tail_risk
+    1.4,  // beta_drawdown
+    1.0,  // beta_regime
+    0.5,  // beta_ghost
+    -0.5, // beta_continuation (negative)
+    1.5,  // beta_edge_uncertainty
+    0.8,  // beta_calibration
+];
+
 /// Online Bayesian gamma calibrator using diagonal Recursive Least Squares.
 ///
 /// Learns from fill outcomes to improve gamma (risk aversion) coefficient selection.
@@ -90,12 +116,13 @@ impl OnlineBayesianGammaCalibrator {
         // - Negative edge → push gamma up (widen). Losing is expensive.
         // - Positive edge → gently push gamma down (tighten). Capture more edge.
         let edge_gradient = if realized_edge_bps < 0.0 {
-            0.5 // Strong push to widen when losing
+            NEGATIVE_EDGE_LEARNING_RATE
         } else {
-            -0.1 // Gentle push to tighten when winning
+            POSITIVE_EDGE_LEARNING_RATE
         };
         // Target: log-gamma that would have been better
-        let target = log_gamma_used + edge_gradient * realized_edge_bps.abs().min(5.0);
+        let target =
+            log_gamma_used + edge_gradient * realized_edge_bps.abs().min(MAX_EDGE_GRADIENT_BPS);
 
         // Diagonal RLS update
         // prediction = β^T × features
@@ -196,6 +223,23 @@ impl OnlineBayesianGammaCalibrator {
         }
     }
 
+    /// Sync calibrator state with ParameterRegistry (bidirectional).
+    ///
+    /// 1. Clamp betas to registry hard bounds (safety first)
+    /// 2. Observe clamped betas to registry (posterior update)
+    ///
+    /// Clamp-then-observe ordering ensures only safe values reach the registry,
+    /// avoiding credible interval inversion when betas drift beyond hard bounds.
+    ///
+    /// Call every 50 fills for smooth convergence without excessive overhead.
+    pub fn sync_with_registry(&mut self, registry: &mut ParameterRegistry) {
+        // Step 1: Clamp to registry bounds (prevents drift beyond safety limits)
+        self.clamp_to_registry_bounds(registry);
+
+        // Step 2: Push clamped betas to registry
+        self.observe_to_registry(registry);
+    }
+
     /// Whether the calibrator has enough data to influence gamma computation.
     pub fn is_warmed_up(&self) -> bool {
         self.n_samples >= self.min_samples
@@ -209,25 +253,7 @@ impl OnlineBayesianGammaCalibrator {
 
 impl Default for OnlineBayesianGammaCalibrator {
     fn default() -> Self {
-        // Default betas matching CalibratedRiskModel::default()
-        let defaults = [
-            1.0,  // beta_volatility
-            0.5,  // beta_toxicity
-            4.0,  // beta_inventory
-            0.4,  // beta_hawkes
-            0.3,  // beta_book_depth
-            0.2,  // beta_uncertainty
-            -0.4, // beta_confidence (negative)
-            1.2,  // beta_cascade
-            0.7,  // beta_tail_risk
-            1.4,  // beta_drawdown
-            1.0,  // beta_regime
-            0.5,  // beta_ghost
-            -0.5, // beta_continuation (negative)
-            1.5,  // beta_edge_uncertainty
-            0.8,  // beta_calibration
-        ];
-        Self::new(&defaults)
+        Self::new(&DEFAULT_BETAS)
     }
 }
 
@@ -413,6 +439,37 @@ mod tests {
                 cal.beta_prior[i]
             );
         }
+    }
+
+    #[test]
+    fn test_gamma_calibrator_sync_with_registry() {
+        let mut registry = crate::market_maker::calibration::create_default_registry();
+        let mut cal = OnlineBayesianGammaCalibrator::default();
+
+        // Update with some data to move betas away from defaults
+        let features = vec![0.05; NUM_BETAS];
+        for _ in 0..30 {
+            cal.update(&features, 0.15, 2.0);
+        }
+
+        // Force one beta extreme to test clamping
+        cal.beta[0] = 100.0;
+
+        cal.sync_with_registry(&mut registry);
+
+        // After sync: beta[0] should be clamped to registry bounds
+        if let Some((_, hi)) = registry.get_bounds("beta_volatility") {
+            assert!(
+                cal.beta[0] <= hi,
+                "sync should clamp beta_volatility: {} > {}",
+                cal.beta[0],
+                hi
+            );
+        }
+
+        // Registry should have observed values from learned betas
+        let vol_val = registry.get_value("beta_volatility").unwrap();
+        assert!(vol_val.is_finite(), "Registry value should be finite");
     }
 
     #[test]

@@ -29,7 +29,7 @@ use super::MarketParams;
 
 /// Beta name constants for ParameterRegistry lookups.
 /// Matches entries registered in `create_default_registry()`.
-pub const BETA_NAMES: [&str; 16] = [
+pub const BETA_NAMES: [&str; 18] = [
     "beta_volatility",
     "beta_toxicity",
     "beta_inventory",
@@ -46,6 +46,8 @@ pub const BETA_NAMES: [&str; 16] = [
     "beta_edge_uncertainty",
     "beta_calibration",
     "beta_as_ratio",
+    "beta_circuit_breaker",
+    "beta_risk_severity",
 ];
 
 fn default_beta_cascade() -> f64 {
@@ -81,6 +83,14 @@ fn default_beta_calibration() -> f64 {
 }
 fn default_beta_as_ratio() -> f64 {
     0.8 // At ratio=0.5: e^(0.8×0.5) = 1.49× gamma. At ratio=1.0: e^0.8 = 2.23×
+}
+
+fn default_beta_circuit_breaker() -> f64 {
+    1.61 // ln(5.0) — matches old 5x multiplicative circuit breaker penalty
+}
+
+fn default_beta_risk_severity() -> f64 {
+    0.69 // ln(2.0) — matches old 2x multiplicative risk emergency penalty
 }
 
 /// Decomposition of gamma computation for diagnostic logging.
@@ -208,6 +218,18 @@ pub struct CalibratedRiskModel {
     #[serde(default = "default_beta_as_ratio")]
     pub beta_as_ratio: f64,
 
+    /// Per unit circuit_breaker_intensity [0, 1].
+    /// Circuit breaker severity → gamma: PauseTrading → intensity=1.0, exp(1.61) ≈ 5x (matches old 5x mult).
+    /// WidenSpreads(2.0) → intensity=ln(2)/ln(5) ≈ 0.43.
+    #[serde(default = "default_beta_circuit_breaker")]
+    pub beta_circuit_breaker: f64,
+
+    /// Per unit risk_severity_score [0, 1].
+    /// Risk level from stochastic controller: Emergency → 1.0, exp(0.69) ≈ 2x (matches old 2x mult).
+    /// Elevated → multiplier-based scoring through risk_overlay.spread_multiplier.
+    #[serde(default = "default_beta_risk_severity")]
+    pub beta_risk_severity: f64,
+
     // === Bounds ===
     /// Minimum gamma (floor)
     pub gamma_min: f64,
@@ -271,6 +293,8 @@ impl Default for CalibratedRiskModel {
             beta_edge_uncertainty: 0.5, // edge_uncertainty=0.5 cold-start → exp(0.25) = 1.28× (was 2.12×)
             beta_calibration: 0.3,      // calibration_deficit=0.25 → exp(0.075) = 1.08× (was 1.22×)
             beta_as_ratio: 0.8,
+            beta_circuit_breaker: 1.61, // ln(5.0) — circuit breaker
+            beta_risk_severity: 0.69,   // ln(2.0) — risk emergency
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -320,6 +344,8 @@ impl CalibratedRiskModel {
             beta_continuation: -0.25,   // Less confident in continuation during warmup
             beta_edge_uncertainty: 0.8, // Slightly more conservative during warmup (vs 0.5 default)
             beta_calibration: 0.5,      // Slightly more conservative during warmup (vs 0.3 default)
+            beta_circuit_breaker: 2.0,  // More conservative during warmup
+            beta_risk_severity: 1.0,    // More conservative during warmup
             ..Default::default()
         }
     }
@@ -364,7 +390,10 @@ impl CalibratedRiskModel {
             + self.beta_edge_uncertainty * features.edge_uncertainty
             + self.beta_calibration * features.calibration_deficit
             // Standalone AS-informed ratio term (not in 15-element calibration array)
-            + self.beta_as_ratio * features.as_informed_ratio;
+            + self.beta_as_ratio * features.as_informed_ratio
+            // Phase 2: Continuous Bayesian routing of discrete risk overlays
+            + self.beta_circuit_breaker * features.circuit_breaker_intensity
+            + self.beta_risk_severity * features.risk_severity_score;
 
         // Sigmoid "skeptic" regularization — prevents any single noisy feature from dominating.
         // WS1: Increased from 1.5 to 2.5 to accommodate wider feature range (12 features now).
@@ -381,7 +410,7 @@ impl CalibratedRiskModel {
             "[GAMMA DECOMP] vol={:.3}×{:.3}={:.3} tox={:.3}×{:.3} inv={:.3}×{:.3} hawk={:.3}×{:.3} \
              depth={:.3}×{:.3} unc={:.3}×{:.3} conf={:.3}×{:.3} casc={:.3}×{:.3} tail={:.3}×{:.3} \
              dd={:.3}×{:.3} reg={:.3}×{:.3} ghost={:.3}×{:.3} cont={:.3}×{:.3} edge={:.3}×{:.3} \
-             cal={:.3}×{:.3} as={:.3}×{:.3} | raw={:.4} reg={:.4} gamma_base={:.3}",
+             cal={:.3}×{:.3} as={:.3}×{:.3} cb={:.3}×{:.3} rsev={:.3}×{:.3} | raw={:.4} reg={:.4} gamma_base={:.3}",
             self.beta_volatility, features.excess_volatility, self.beta_volatility * features.excess_volatility,
             self.beta_toxicity, features.toxicity_score,
             self.beta_inventory, inventory_pressure,
@@ -398,6 +427,8 @@ impl CalibratedRiskModel {
             self.beta_edge_uncertainty, features.edge_uncertainty,
             self.beta_calibration, features.calibration_deficit,
             self.beta_as_ratio, features.as_informed_ratio,
+            self.beta_circuit_breaker, features.circuit_breaker_intensity,
+            self.beta_risk_severity, features.risk_severity_score,
             raw_sum, regulated_sum, self.log_gamma_base.exp(),
         );
 
@@ -455,6 +486,14 @@ impl CalibratedRiskModel {
                 self.beta_calibration * features.calibration_deficit,
             ),
             ("as_ratio", self.beta_as_ratio * features.as_informed_ratio),
+            (
+                "circuit_breaker",
+                self.beta_circuit_breaker * features.circuit_breaker_intensity,
+            ),
+            (
+                "risk_severity",
+                self.beta_risk_severity * features.risk_severity_score,
+            ),
         ];
 
         let raw_sum: f64 = contributions.iter().map(|(_, v)| v).sum();
@@ -603,6 +642,8 @@ impl CalibratedRiskModel {
             beta_edge_uncertainty: registry.get_value_or("beta_edge_uncertainty", 0.5),
             beta_calibration: registry.get_value_or("beta_calibration", 0.3),
             beta_as_ratio: registry.get_value_or("beta_as_ratio", 0.8),
+            beta_circuit_breaker: registry.get_value_or("beta_circuit_breaker", 1.61),
+            beta_risk_severity: registry.get_value_or("beta_risk_severity", 0.69),
             gamma_min: 0.05,
             gamma_max: 5.0,
             n_samples: 0,
@@ -630,13 +671,15 @@ impl CalibratedRiskModel {
             };
             registry.observe_normal(name, value, obs_var);
         }
-        // Also observe beta_as_ratio
+        // Also observe standalone betas (not in 15-element calibration array)
         let obs_var = if self.n_samples > 0 {
             (1.0 / (self.n_samples as f64).sqrt()).clamp(0.01, 1.0)
         } else {
             1.0
         };
         registry.observe_normal("beta_as_ratio", self.beta_as_ratio, obs_var);
+        registry.observe_normal("beta_circuit_breaker", self.beta_circuit_breaker, obs_var);
+        registry.observe_normal("beta_risk_severity", self.beta_risk_severity, obs_var);
     }
 
     /// Clamp all betas to the ParameterRegistry's hard bounds.
@@ -662,6 +705,8 @@ impl CalibratedRiskModel {
             &mut self.beta_edge_uncertainty,
             &mut self.beta_calibration,
             &mut self.beta_as_ratio,
+            &mut self.beta_circuit_breaker,
+            &mut self.beta_risk_severity,
         ];
         for (name, beta) in names.iter().zip(betas.into_iter()) {
             if let Some((lo, hi)) = registry.get_bounds(name) {
@@ -702,6 +747,10 @@ impl CalibratedRiskModel {
             beta_calibration: self.beta_calibration * (1.0 - alpha)
                 + defaults.beta_calibration * alpha,
             beta_as_ratio: self.beta_as_ratio * (1.0 - alpha) + defaults.beta_as_ratio * alpha,
+            beta_circuit_breaker: self.beta_circuit_breaker * (1.0 - alpha)
+                + defaults.beta_circuit_breaker * alpha,
+            beta_risk_severity: self.beta_risk_severity * (1.0 - alpha)
+                + defaults.beta_risk_severity * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -789,6 +838,16 @@ pub struct RiskFeatures {
     /// 0.0 = all noise fills, 1.0 = all informed fills. Default 0.0 (no AS data).
     /// NOT part of the 15-element calibration array — standalone fixed-beta term.
     pub as_informed_ratio: f64,
+
+    /// Circuit breaker intensity [0, 1].
+    /// 0 = no circuit breaker active, 1 = PauseTrading/CancelAll active.
+    /// Intermediate values for WidenSpreads: intensity = ln(multiplier) / ln(5.0).
+    pub circuit_breaker_intensity: f64,
+
+    /// Risk severity score [0, 1].
+    /// From stochastic controller risk_assessment.
+    /// 0 = Normal, proportional to severity for Elevated, 1.0 for Emergency.
+    pub risk_severity_score: f64,
 }
 
 impl RiskFeatures {
@@ -831,12 +890,15 @@ impl RiskFeatures {
         };
 
         // === Toxicity Score ===
-        // Use the soft toxicity score from mixture model, or derive from jump_ratio
-        let toxicity_score = if params.toxicity_score > 0.0 {
+        // Prefer GMM posterior when warmed up (principled Bayesian classification).
+        // Fall back to soft toxicity score or jump_ratio heuristic.
+        let toxicity_score = if params.gmm_toxicity_warmed && params.gmm_toxicity_score > 0.0 {
+            params.gmm_toxicity_score.clamp(0.0, 1.0)
+        } else if params.toxicity_score > 0.0 {
             params.toxicity_score.clamp(0.0, 1.0)
         } else {
             // Fallback: convert jump_ratio to [0, 1] score
-            // jump_ratio=1 → 0, jump_ratio=2 → 0.5, jump_ratio=3+ → 1.0
+            // jump_ratio=1 -> 0, jump_ratio=2 -> 0.5, jump_ratio=3+ -> 1.0
             ((params.jump_ratio - 1.0) / 2.0).clamp(0.0, 1.0)
         };
 
@@ -916,6 +978,8 @@ impl RiskFeatures {
             edge_uncertainty: params.edge_uncertainty.clamp(0.0, 1.0),
             calibration_deficit: params.calibration_deficit.clamp(0.0, 1.0),
             as_informed_ratio: params.as_informed_ratio.clamp(0.0, 1.0),
+            circuit_breaker_intensity: params.circuit_breaker_intensity.clamp(0.0, 1.0),
+            risk_severity_score: params.risk_severity_score.clamp(0.0, 1.0),
         }
     }
 
@@ -938,6 +1002,8 @@ impl RiskFeatures {
             edge_uncertainty: 0.5,         // Maximum ignorance — no data
             calibration_deficit: 0.0,      // Assume calibrated until proven otherwise
             as_informed_ratio: 0.0,        // No AS data
+            circuit_breaker_intensity: 0.0, // No breaker active
+            risk_severity_score: 0.0,      // Normal risk level
         }
     }
 
@@ -953,13 +1019,15 @@ impl RiskFeatures {
             position_direction_confidence: 0.0, // No confidence → high gamma
             cascade_intensity: 1.0,
             tail_risk_intensity: 1.0,
-            drawdown_fraction: 0.5,        // 50% drawdown
-            regime_risk_score: 0.59,       // ln(1.8) — extreme regime
-            ghost_depletion: 1.0,          // Full ghost depletion
-            continuation_probability: 0.0, // No continuation -> higher gamma
-            edge_uncertainty: 0.95,        // Strong negative edge signal
-            calibration_deficit: 0.5,      // Poorly calibrated
-            as_informed_ratio: 0.8,        // High informed flow
+            drawdown_fraction: 0.5,         // 50% drawdown
+            regime_risk_score: 0.59,        // ln(1.8) — extreme regime
+            ghost_depletion: 1.0,           // Full ghost depletion
+            continuation_probability: 0.0,  // No continuation -> higher gamma
+            edge_uncertainty: 0.95,         // Strong negative edge signal
+            calibration_deficit: 0.5,       // Poorly calibrated
+            as_informed_ratio: 0.8,         // High informed flow
+            circuit_breaker_intensity: 1.0, // Full circuit breaker
+            risk_severity_score: 1.0,       // Maximum risk severity
         }
     }
 
@@ -983,6 +1051,8 @@ impl RiskFeatures {
             self.edge_uncertainty,
             self.calibration_deficit,
             self.as_informed_ratio,
+            self.circuit_breaker_intensity,
+            self.risk_severity_score,
         ]
     }
 
@@ -1046,15 +1116,17 @@ impl RiskFeatures {
             depth_depletion,
             model_uncertainty,
             position_direction_confidence,
-            cascade_intensity: 0.0,        // Not available from MarketState
-            tail_risk_intensity: 0.0,      // Not available from MarketState
-            drawdown_fraction: 0.0,        // Not available from MarketState
-            regime_risk_score: 0.0,        // Not available from MarketState
-            ghost_depletion: 0.0,          // Not available from MarketState
-            continuation_probability: 0.5, // Not available from MarketState, use neutral
-            edge_uncertainty: 0.5,         // Not available from MarketState, use maximum ignorance
-            as_informed_ratio: 0.0,        // Not available from MarketState
-            calibration_deficit: 0.0,      // Not available from MarketState
+            cascade_intensity: 0.0,         // Not available from MarketState
+            tail_risk_intensity: 0.0,       // Not available from MarketState
+            drawdown_fraction: 0.0,         // Not available from MarketState
+            regime_risk_score: 0.0,         // Not available from MarketState
+            ghost_depletion: 0.0,           // Not available from MarketState
+            continuation_probability: 0.5,  // Not available from MarketState, use neutral
+            edge_uncertainty: 0.5,          // Not available from MarketState, use maximum ignorance
+            as_informed_ratio: 0.0,         // Not available from MarketState
+            calibration_deficit: 0.0,       // Not available from MarketState
+            circuit_breaker_intensity: 0.0, // Not available from MarketState
+            risk_severity_score: 0.0,       // Not available from MarketState
         }
     }
 }
@@ -1713,11 +1785,13 @@ mod tests {
             edge_uncertainty: 0.5,
             calibration_deficit: 0.3,
             as_informed_ratio: 0.3,
+            circuit_breaker_intensity: 0.5, // Moderate breaker
+            risk_severity_score: 0.5,       // Moderate severity
         };
 
         let gamma = model.compute_gamma(&everything);
 
-        // Sigmoid should prevent explosion even with all 12 features firing
+        // Sigmoid should prevent explosion even with all features firing
         assert!(
             gamma < 5.0,
             "All features firing should stay within gamma_max: got {gamma:.3}"

@@ -23,6 +23,7 @@ mod cancel_race;
 mod depth_decay;
 mod enhanced_classifier;
 mod estimator;
+pub mod gmm_toxicity;
 pub mod microstructure_features;
 mod pre_fill_classifier;
 pub mod toxicity_regime;
@@ -34,6 +35,9 @@ pub use enhanced_classifier::{
     EnhancedASClassifier, EnhancedClassifierConfig, EnhancedClassifierDiagnostics,
 };
 pub use estimator::{AdverseSelectionEstimator, AdverseSelectionSummary};
+pub use gmm_toxicity::{
+    GmmToxicityCheckpoint, GmmToxicityConfig, GmmToxicityDiagnostics, GmmToxicityModel,
+};
 pub use microstructure_features::{
     MicrostructureConfig, MicrostructureDiagnostics, MicrostructureExtractor,
     MicrostructureFeatures, TradeObservation,

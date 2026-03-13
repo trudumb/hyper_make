@@ -7,6 +7,11 @@ use super::config::HJBConfig;
 use super::ou_drift::{OUDriftConfig, OUDriftEstimator, OUUpdateResult};
 use super::summary::MomentumStats;
 
+/// Default EWMA alpha for kappa_trade smoothing (~20-cycle half-life).
+fn default_kappa_trade_alpha() -> f64 {
+    0.05
+}
+
 /// HJB-derived optimal inventory controller.
 ///
 /// Computes optimal inventory skew using the closed-form solution to the
@@ -81,6 +86,13 @@ pub struct HJBInventoryController {
 
     /// Calibrated terminal penalty from market spread (overrides config when set).
     pub(super) calibrated_terminal_penalty: Option<f64>,
+
+    /// Fill intensity for CJP signal term (EWMA-smoothed from arrival_intensity).
+    pub(super) kappa_trade: f64,
+
+    /// Learned EWMA alpha for kappa_trade smoothing (Phase 4).
+    /// Default: 0.05 (~20-cycle half-life). Updated from EB registry.
+    pub(super) kappa_trade_alpha: f64,
 }
 
 impl HJBInventoryController {
@@ -106,6 +118,7 @@ impl HJBInventoryController {
         };
         let ou_drift = OUDriftEstimator::new(ou_config);
 
+        let kappa_trade_default = config.cjp_kappa_trade_default;
         Self {
             config,
             session_start: Instant::now(),
@@ -128,6 +141,9 @@ impl HJBInventoryController {
             time_to_funding_settlement_s: None,
             funding_settlement_last_updated: None,
             calibrated_terminal_penalty: None,
+            // CJP fill intensity
+            kappa_trade: kappa_trade_default,
+            kappa_trade_alpha: default_kappa_trade_alpha(),
         }
     }
 
@@ -335,6 +351,27 @@ impl HJBInventoryController {
         if self.drift_update_count < self.config.min_warmup_observations as u64 {
             self.drift_update_count = self.config.min_warmup_observations as u64;
         }
+    }
+
+    /// Update fill intensity for CJP signal term from observed arrival rate.
+    ///
+    /// Uses EWMA smoothing with ~20-cycle half-life to avoid jerky response
+    /// while tracking liquidity regime changes.
+    ///
+    /// # Arguments
+    /// * `arrival_intensity` - Observed fill intensity (fills/sec)
+    pub fn update_kappa_trade(&mut self, arrival_intensity: f64) {
+        let clamped = arrival_intensity.clamp(0.01, 100.0);
+        self.kappa_trade =
+            self.kappa_trade_alpha * clamped + (1.0 - self.kappa_trade_alpha) * self.kappa_trade;
+    }
+
+    /// Set EWMA alpha for kappa_trade smoothing (from EB registry).
+    ///
+    /// Clamped to [0.005, 0.5] — 0.005 = ~140-cycle half-life (very slow),
+    /// 0.5 = ~1-cycle half-life (very reactive).
+    pub fn set_kappa_trade_alpha(&mut self, alpha: f64) {
+        self.kappa_trade_alpha = alpha.clamp(0.005, 0.5);
     }
 
     /// Get smoothed variance multiplier.

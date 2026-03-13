@@ -237,6 +237,9 @@ impl CoefficientEstimator {
                 beta_edge_uncertainty: 1.5,
                 beta_calibration: 0.8,
                 beta_as_ratio: 0.8, // Not learned from AS data - use default
+                // Phase 2: New continuous risk overlay betas - not learned from AS data
+                beta_circuit_breaker: 1.61, // ln(5.0) — matches old 5x mult
+                beta_risk_severity: 0.69,   // ln(2.0) — matches old 2x mult
                 gamma_min: 0.05,
                 gamma_max: 5.0,
                 n_samples: self.samples.len(),

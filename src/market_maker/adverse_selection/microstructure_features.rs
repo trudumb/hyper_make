@@ -263,6 +263,66 @@ impl MicrostructureFeatures {
     }
 }
 
+/// Learned weights for microstructure toxicity scoring (Phase 5).
+/// Initialized from hardcoded defaults, updated from EB registry or SNR tracker.
+#[derive(Debug, Clone)]
+pub struct MicrostructureWeights {
+    pub impact: f64,
+    pub run_length: f64,
+    pub intensity: f64,
+    pub arrival: f64,
+    pub spread: f64,
+    pub imbalance: f64,
+    pub size: f64,
+    pub size_concentration: f64,
+    pub direction_concentration: f64,
+}
+
+impl Default for MicrostructureWeights {
+    fn default() -> Self {
+        Self {
+            impact: 0.22,
+            run_length: 0.18,
+            intensity: 0.12,
+            arrival: 0.12,
+            spread: 0.08,
+            imbalance: 0.08,
+            size: 0.05,
+            size_concentration: 0.08,
+            direction_concentration: 0.07,
+        }
+    }
+}
+
+impl MicrostructureWeights {
+    /// Normalize weights to sum to 1.0.
+    pub fn normalized(&self) -> Self {
+        let total = self.impact
+            + self.run_length
+            + self.intensity
+            + self.arrival
+            + self.spread
+            + self.imbalance
+            + self.size
+            + self.size_concentration
+            + self.direction_concentration;
+        if total < 1e-12 {
+            return Self::default();
+        }
+        Self {
+            impact: self.impact / total,
+            run_length: self.run_length / total,
+            intensity: self.intensity / total,
+            arrival: self.arrival / total,
+            spread: self.spread / total,
+            imbalance: self.imbalance / total,
+            size: self.size / total,
+            size_concentration: self.size_concentration / total,
+            direction_concentration: self.direction_concentration / total,
+        }
+    }
+}
+
 /// Microstructure feature extractor
 /// Microstructure inputs for toxicity score computation.
 struct ToxicityInputs {
@@ -283,6 +343,9 @@ struct ToxicityInputs {
 #[derive(Debug, Clone)]
 pub struct MicrostructureExtractor {
     config: MicrostructureConfig,
+
+    /// Learned toxicity weights (Phase 5). Default: theory-driven values.
+    weights: MicrostructureWeights,
 
     // Trade tracking
     trades: VecDeque<TradeObservation>,
@@ -336,6 +399,8 @@ impl MicrostructureExtractor {
         let ewma_samples = config.ewma_half_life_s * 10.0; // Assume ~10 trades/sec baseline
 
         Self {
+            weights: MicrostructureWeights::default(),
+
             trades: VecDeque::with_capacity(config.intensity_window),
             last_trade_time_ms: 0,
 
@@ -660,38 +725,24 @@ impl MicrostructureExtractor {
         }
     }
 
-    /// Compute combined toxicity score using theory-driven weights
+    /// Compute combined toxicity score using learned weights (Phase 5).
+    ///
+    /// Weights initialized from microstructure theory defaults, can be
+    /// updated via `set_weights()` from EB registry or SNR tracker.
     fn compute_toxicity_score(&self, inputs: &ToxicityInputs) -> f64 {
-        // Weights based on microstructure theory importance:
-        // - Price impact (Kyle's λ) is the gold standard for information
-        // - Run length is strong evidence of informed trading
-        // - Intensity and arrival speed indicate information events
-        // - Spread widening is MM's response to detected info
-        // - Volume imbalance and size are supporting signals
-        // - Entropy features indicate informed vs noise trading
-
-        const W_IMPACT: f64 = 0.22; // Kyle's lambda - most theoretically grounded
-        const W_RUN: f64 = 0.18; // Run length - strong clustering signal
-        const W_INTENSITY: f64 = 0.12; // Trade bursts
-        const W_ARRIVAL: f64 = 0.12; // Fast arrivals
-        const W_SPREAD: f64 = 0.08; // MM response
-        const W_IMBALANCE: f64 = 0.08; // Directional pressure
-        const W_SIZE: f64 = 0.05; // Large trades
-        const W_SIZE_CONC: f64 = 0.08; // Size concentration (informed = concentrated)
-        const W_DIR_CONC: f64 = 0.07; // Direction concentration (informed = one-sided)
-
         // Convert z-scores to [0, 1] probabilities using sigmoid
         let sigmoid = |z: f64| 1.0 / (1.0 + (-z).exp());
 
-        let score = W_IMPACT * sigmoid(inputs.impact)
-            + W_RUN * sigmoid(inputs.run_length)
-            + W_INTENSITY * sigmoid(inputs.intensity)
-            + W_ARRIVAL * sigmoid(inputs.arrival_speed)
-            + W_SPREAD * sigmoid(inputs.spread_widen * 2.0) // Scale spread signal
-            + W_IMBALANCE * sigmoid(inputs.vol_imbalance.abs() * 2.0)
-            + W_SIZE * sigmoid(inputs.size)
-            + W_SIZE_CONC * inputs.size_concentration  // Already [0, 1]
-            + W_DIR_CONC * inputs.direction_concentration; // Already [0, 1]
+        let w = &self.weights;
+        let score = w.impact * sigmoid(inputs.impact)
+            + w.run_length * sigmoid(inputs.run_length)
+            + w.intensity * sigmoid(inputs.intensity)
+            + w.arrival * sigmoid(inputs.arrival_speed)
+            + w.spread * sigmoid(inputs.spread_widen * 2.0) // Scale spread signal
+            + w.imbalance * sigmoid(inputs.vol_imbalance.abs() * 2.0)
+            + w.size * sigmoid(inputs.size)
+            + w.size_concentration * inputs.size_concentration // Already [0, 1]
+            + w.direction_concentration * inputs.direction_concentration; // Already [0, 1]
 
         score.clamp(0.0, 1.0)
     }
@@ -715,6 +766,12 @@ impl MicrostructureExtractor {
     /// Reset all state
     pub fn reset(&mut self) {
         *self = Self::new(self.config.clone());
+    }
+
+    /// Set learned toxicity weights (Phase 5).
+    /// Weights are normalized to sum to 1.0.
+    pub fn set_weights(&mut self, weights: MicrostructureWeights) {
+        self.weights = weights.normalized();
     }
 }
 

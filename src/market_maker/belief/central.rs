@@ -67,6 +67,38 @@ enum DirSource {
     Burst,
 }
 
+/// Observation noise priors from the EB registry, updated periodically (~30s).
+///
+/// Each field holds the current posterior mean of the InverseGamma prior
+/// for the corresponding signal source's observation noise variance R.
+/// When `use_adaptive_observation_noise` is true, these replace the
+/// hardcoded `dir_noise_*` config values as the prior R in `adapted_dir_noise()`.
+#[derive(Debug, Clone)]
+pub struct ObservationNoisePriors {
+    /// R prior for price z-score observations
+    pub price: f64,
+    /// R prior for fill-side evidence
+    pub fill: f64,
+    /// R prior for AS-direction evidence
+    pub as_dir: f64,
+    /// R prior for order flow direction
+    pub flow: f64,
+    /// R prior for burst/cascade events
+    pub burst: f64,
+}
+
+impl Default for ObservationNoisePriors {
+    fn default() -> Self {
+        Self {
+            price: 1.0,
+            fill: 16.0,
+            as_dir: 2.5,
+            flow: 1.0,
+            burst: 0.5,
+        }
+    }
+}
+
 /// Configuration for CentralBeliefState.
 #[derive(Debug, Clone)]
 pub struct CentralBeliefConfig {
@@ -157,6 +189,12 @@ pub struct CentralBeliefConfig {
     /// Configuration for the Bayesian fair value model.
     /// Set to None to disable the model entirely.
     pub bayesian_fv_config: Option<BayesianFairValueConfig>,
+
+    // === Adaptive Observation Noise ===
+    /// Use adaptive observation noise from EB registry instead of hardcoded dir_noise_*.
+    /// When true, adapted_dir_noise() reads its prior R from the registry snapshot.
+    /// Default: true
+    pub use_adaptive_observation_noise: bool,
 }
 
 impl Default for CentralBeliefConfig {
@@ -188,6 +226,7 @@ impl Default for CentralBeliefConfig {
             medium_retention: 0.30,
             structural_retention: 0.70,
             bayesian_fv_config: Some(BayesianFairValueConfig::default()),
+            use_adaptive_observation_noise: true,
         }
     }
 }
@@ -350,6 +389,17 @@ impl AutocorrelationTracker {
     }
 }
 
+/// Convert an EWMA half-life (in observations) to the EWMA alpha parameter.
+///
+/// `alpha = 1 - 2^(-1/half_life)` — the fraction of weight on the new observation.
+/// For example, half_life=14 gives alpha≈0.048 (close to 0.05), half_life=1 gives alpha≈1.0.
+pub fn ewma_alpha_from_half_life(half_life_obs: f64) -> f64 {
+    if half_life_obs <= 0.0 {
+        return 1.0; // Instant response
+    }
+    1.0 - (-1.0_f64 / half_life_obs).exp2()
+}
+
 /// Internal state (mutable, protected by RwLock).
 struct InternalState {
     // === Bayesian Fair Value ===
@@ -391,6 +441,19 @@ struct InternalState {
     innovation_var_as: f64,
     innovation_var_flow: f64,
     innovation_var_burst: f64,
+
+    // === EB Registry Noise Priors (Phase 1: Adaptive Observation Noise) ===
+    /// Observation noise priors from EB registry, updated from registry every ~30s.
+    /// When Some, adapted_dir_noise() uses these as the prior R instead of config.dir_noise_*.
+    registry_noise_priors: Option<ObservationNoisePriors>,
+
+    // === Phase 4: EB-Learned EWMA Alphas ===
+    /// Learned EWMA alpha for innovation variance tracking.
+    /// Default: 0.05 (14-obs half-life). Updated from EB registry.
+    innovation_ewma_alpha: f64,
+    /// Learned EWMA alpha for kappa smoothing (overrides config when Some).
+    /// Default: None (falls back to config.kappa_ewma_alpha = 0.9).
+    kappa_ewma_alpha_override: Option<f64>,
 
     // === Kappa (fill intensity) ===
     kappa_smoothed: f64,
@@ -664,6 +727,13 @@ impl Default for InternalState {
             // Trend autocorrelation (Phase 3)
             trend_autocorrelation: 0.0,
 
+            // Phase 1: Adaptive observation noise (registry priors)
+            registry_noise_priors: None,
+
+            // Phase 4: EB-learned EWMA alphas
+            innovation_ewma_alpha: 0.05, // 14-obs half-life default
+            kappa_ewma_alpha_override: None,
+
             // Stats
             n_price_obs: 0,
             n_fills: 0,
@@ -813,6 +883,63 @@ impl CentralBeliefState {
     pub fn set_trend_autocorrelation(&self, autocorrelation: f64) {
         let mut state = self.state.write().unwrap();
         state.trend_autocorrelation = autocorrelation.clamp(-1.0, 1.0);
+    }
+
+    /// Update observation noise priors from EB registry snapshot.
+    ///
+    /// Called periodically (~30s) by the orchestrator with values read from
+    /// the ParameterRegistry's `dir_noise_*` entries. When
+    /// `config.use_adaptive_observation_noise` is true, `adapted_dir_noise()`
+    /// uses these as the prior R instead of the hardcoded config defaults.
+    pub fn set_registry_noise_priors(&self, priors: ObservationNoisePriors) {
+        let mut state = self.state.write().unwrap();
+        state.registry_noise_priors = Some(priors);
+    }
+
+    /// Update EB-learned EWMA alphas for innovation variance and kappa smoothing (Phase 4).
+    ///
+    /// Called periodically by the orchestrator with half-lives learned from the
+    /// ParameterRegistry. Converts half-lives to alpha parameters internally.
+    ///
+    /// - `innovation_alpha`: EWMA alpha for innovation variance tracking (default 0.05).
+    /// - `kappa_alpha`: Optional override for kappa smoothing alpha (default: config value 0.9).
+    pub fn set_learned_ewma_alphas(&self, innovation_alpha: f64, kappa_alpha: Option<f64>) {
+        let mut state = self.state.write().unwrap();
+        state.innovation_ewma_alpha = innovation_alpha.clamp(0.001, 0.5);
+        state.kappa_ewma_alpha_override = kappa_alpha.map(|a| a.clamp(0.5, 0.999));
+    }
+
+    /// Get current innovation variances for feeding back to the EB registry.
+    ///
+    /// Returns `(registry_key, innovation_variance, n_observations)` tuples.
+    /// The caller should feed `innovation_variance` as a squared-residual
+    /// observation to the corresponding `dir_noise_*` InverseGamma entry
+    /// in the ParameterRegistry.
+    pub fn innovation_variances(&self) -> Vec<(&'static str, f64, u64)> {
+        let state = self.state.read().unwrap();
+        vec![
+            (
+                "dir_noise_price",
+                state.innovation_var_price,
+                state.dir_n_price,
+            ),
+            (
+                "dir_noise_fill",
+                state.innovation_var_fill,
+                state.dir_n_fill,
+            ),
+            ("dir_noise_as", state.innovation_var_as, state.dir_n_as),
+            (
+                "dir_noise_flow",
+                state.innovation_var_flow,
+                state.dir_n_flow,
+            ),
+            (
+                "dir_noise_burst",
+                state.innovation_var_burst,
+                state.dir_n_burst,
+            ),
+        ]
     }
 
     // =========================================================================
@@ -1160,30 +1287,31 @@ impl CentralBeliefState {
     ) {
         // Track innovation BEFORE update (innovation = obs - prior_mean)
         let innovation = obs - state.dir_mu;
-        // EWMA of squared innovations: α=0.05 → half-life ≈ 14 observations.
+        // EWMA of squared innovations: default α=0.05 → half-life ≈ 14 observations.
         // Tracks regime-level noise changes without overreacting to single outliers.
-        const INNOV_ALPHA: f64 = 0.05;
+        // Phase 4: alpha is now EB-learnable via set_learned_ewma_alphas().
+        let innov_alpha = state.innovation_ewma_alpha;
         let innov_sq = innovation * innovation;
         match source {
             DirSource::Price => {
                 state.innovation_var_price =
-                    (1.0 - INNOV_ALPHA) * state.innovation_var_price + INNOV_ALPHA * innov_sq;
+                    (1.0 - innov_alpha) * state.innovation_var_price + innov_alpha * innov_sq;
             }
             DirSource::Fill => {
                 state.innovation_var_fill =
-                    (1.0 - INNOV_ALPHA) * state.innovation_var_fill + INNOV_ALPHA * innov_sq;
+                    (1.0 - innov_alpha) * state.innovation_var_fill + innov_alpha * innov_sq;
             }
             DirSource::As => {
                 state.innovation_var_as =
-                    (1.0 - INNOV_ALPHA) * state.innovation_var_as + INNOV_ALPHA * innov_sq;
+                    (1.0 - innov_alpha) * state.innovation_var_as + innov_alpha * innov_sq;
             }
             DirSource::Flow => {
                 state.innovation_var_flow =
-                    (1.0 - INNOV_ALPHA) * state.innovation_var_flow + INNOV_ALPHA * innov_sq;
+                    (1.0 - innov_alpha) * state.innovation_var_flow + innov_alpha * innov_sq;
             }
             DirSource::Burst => {
                 state.innovation_var_burst =
-                    (1.0 - INNOV_ALPHA) * state.innovation_var_burst + INNOV_ALPHA * innov_sq;
+                    (1.0 - innov_alpha) * state.innovation_var_burst + innov_alpha * innov_sq;
             }
         }
 
@@ -1217,32 +1345,54 @@ impl CentralBeliefState {
     ///
     /// Returns the adapted BASE noise before regime/calibration modifiers are applied.
     fn adapted_dir_noise(&self, state: &InternalState, source: DirSource) -> f64 {
+        // Select the prior R: from EB registry (adaptive) or hardcoded config (fallback).
+        // When use_adaptive_observation_noise is true AND registry priors are available,
+        // the EB posterior mean replaces the config default. This lets the system learn
+        // observation noise online while still falling back gracefully.
+        let use_eb = self.config.use_adaptive_observation_noise;
+        let eb = state.registry_noise_priors.as_ref();
+
         let (prior_r, innov_var, n_obs) = match source {
-            DirSource::Price => (
-                self.config.dir_noise_price,
-                state.innovation_var_price,
-                state.dir_n_price,
-            ),
-            DirSource::Fill => (
-                self.config.dir_noise_fill,
-                state.innovation_var_fill,
-                state.dir_n_fill,
-            ),
-            DirSource::As => (
-                self.config.dir_noise_as,
-                state.innovation_var_as,
-                state.dir_n_as,
-            ),
-            DirSource::Flow => (
-                self.config.dir_noise_flow,
-                state.innovation_var_flow,
-                state.dir_n_flow,
-            ),
-            DirSource::Burst => (
-                self.config.dir_noise_burst,
-                state.innovation_var_burst,
-                state.dir_n_burst,
-            ),
+            DirSource::Price => {
+                let base_r = if use_eb {
+                    eb.map(|p| p.price).unwrap_or(self.config.dir_noise_price)
+                } else {
+                    self.config.dir_noise_price
+                };
+                (base_r, state.innovation_var_price, state.dir_n_price)
+            }
+            DirSource::Fill => {
+                let base_r = if use_eb {
+                    eb.map(|p| p.fill).unwrap_or(self.config.dir_noise_fill)
+                } else {
+                    self.config.dir_noise_fill
+                };
+                (base_r, state.innovation_var_fill, state.dir_n_fill)
+            }
+            DirSource::As => {
+                let base_r = if use_eb {
+                    eb.map(|p| p.as_dir).unwrap_or(self.config.dir_noise_as)
+                } else {
+                    self.config.dir_noise_as
+                };
+                (base_r, state.innovation_var_as, state.dir_n_as)
+            }
+            DirSource::Flow => {
+                let base_r = if use_eb {
+                    eb.map(|p| p.flow).unwrap_or(self.config.dir_noise_flow)
+                } else {
+                    self.config.dir_noise_flow
+                };
+                (base_r, state.innovation_var_flow, state.dir_n_flow)
+            }
+            DirSource::Burst => {
+                let base_r = if use_eb {
+                    eb.map(|p| p.burst).unwrap_or(self.config.dir_noise_burst)
+                } else {
+                    self.config.dir_noise_burst
+                };
+                (base_r, state.innovation_var_burst, state.dir_n_burst)
+            }
         };
 
         // Need sufficient observations before adapting
@@ -1350,8 +1500,11 @@ impl CentralBeliefState {
             state.kappa_smoothed = raw_kappa;
             state.kappa_smoothed_initialized = true;
         } else {
-            state.kappa_smoothed = self.config.kappa_ewma_alpha * state.kappa_smoothed
-                + (1.0 - self.config.kappa_ewma_alpha) * raw_kappa;
+            let kappa_alpha = state
+                .kappa_ewma_alpha_override
+                .unwrap_or(self.config.kappa_ewma_alpha);
+            state.kappa_smoothed =
+                kappa_alpha * state.kappa_smoothed + (1.0 - kappa_alpha) * raw_kappa;
         }
 
         // Update continuation posterior (Beta-Binomial)
@@ -1750,6 +1903,28 @@ impl CentralBeliefState {
             lr_sum_fill: state.dir_evidence_fill,
             lr_sum_as: state.dir_evidence_as,
             lr_sum_flow: state.dir_evidence_flow,
+            // Phase 1: Noise correction ratios (innovation_var / prior_R)
+            noise_correction_ratios: {
+                let prior_r = [
+                    self.config.dir_noise_price,
+                    self.config.dir_noise_fill,
+                    self.config.dir_noise_as,
+                    self.config.dir_noise_flow,
+                    self.config.dir_noise_burst,
+                ];
+                let innov = [
+                    state.innovation_var_price,
+                    state.innovation_var_fill,
+                    state.innovation_var_as,
+                    state.innovation_var_flow,
+                    state.innovation_var_burst,
+                ];
+                let mut ratios = [1.0; 5];
+                for i in 0..5 {
+                    ratios[i] = (innov[i] / prior_r[i].max(0.01)).clamp(0.1, 10.0);
+                }
+                ratios
+            },
         }
     }
 

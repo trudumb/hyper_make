@@ -243,14 +243,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This runs BEFORE any other logic to ensure position safety is structural.
         let position_assessment = self.inventory_governor.assess(self.position.position());
 
-        // === PHASE 7: Graduated risk overlay multipliers ===
-        // Track additive spread and size multipliers from all risk sources.
+        // === PHASE 7: Graduated risk overlay ===
+        // Continuous risk features route through CalibratedRiskModel gamma.
         // Only the kill switch can actually cancel all quotes — everything else
-        // applies graduated spread widening and size reduction.
+        // applies graduated spread widening and size reduction via gamma.
         // Declared BEFORE governor check so KILL zone can set reduce-only.
-        let mut risk_overlay_mult = 1.0_f64;
         let mut risk_size_reduction = 1.0_f64;
         let mut risk_reduce_only = false;
+        // Continuous features for gamma routing (Phase 2: replaces risk_overlay_mult)
+        let mut circuit_breaker_intensity = 0.0_f64;
+        let mut risk_severity_score = 0.0_f64;
+        // Legacy fallback when use_continuous_risk_overlay is false
+        let mut risk_overlay_mult = 1.0_f64;
+        let use_continuous_overlay = self
+            .stochastic
+            .stochastic_config
+            .use_continuous_risk_overlay;
 
         if position_assessment.zone == crate::market_maker::risk::PositionZone::Kill {
             // Cancel position-INCREASING orders only, keep reducing-side alive
@@ -338,50 +346,86 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
-        // === Circuit Breaker Checks (Phase 7: graduated) ===
+        // === Circuit Breaker Checks (Phase 2: continuous gamma routing) ===
         let breaker_action = self.tier1.circuit_breaker.most_severe_action();
         match breaker_action {
             Some(CircuitBreakerAction::PauseTrading) => {
-                // Phase 7: PauseTrading → 5x spread + 10% size, continue (don't cancel)
-                risk_overlay_mult *= 5.0;
-                risk_size_reduction *= 0.1;
-                warn!("Circuit breaker: PauseTrading → graduated 5x spread + 10% size");
+                if use_continuous_overlay {
+                    // PauseTrading → intensity=1.0 → exp(beta_cb × 1.0) ≈ 5x gamma
+                    circuit_breaker_intensity = 1.0;
+                    // Continuous size: 1 - intensity² = 0.0 → 10% floor applied downstream
+                    risk_size_reduction *= (1.0 - 1.0_f64.powi(2)).max(0.1);
+                } else {
+                    risk_overlay_mult *= 5.0;
+                    risk_size_reduction *= 0.1;
+                }
+                warn!(
+                    cb_intensity = %format!("{:.2}", circuit_breaker_intensity),
+                    "Circuit breaker: PauseTrading → continuous gamma + size reduction"
+                );
             }
             Some(CircuitBreakerAction::CancelAllQuotes) => {
-                // Phase 7: CancelAllQuotes → 5x spread, continue (don't cancel)
-                risk_overlay_mult *= 5.0;
-                warn!("Circuit breaker: CancelAllQuotes → graduated 5x spread (continuing)");
+                if use_continuous_overlay {
+                    circuit_breaker_intensity = 1.0;
+                } else {
+                    risk_overlay_mult *= 5.0;
+                }
+                warn!(
+                    cb_intensity = %format!("{:.2}", circuit_breaker_intensity),
+                    "Circuit breaker: CancelAllQuotes → continuous gamma (continuing)"
+                );
             }
             Some(CircuitBreakerAction::WidenSpreads { multiplier }) => {
-                risk_overlay_mult *= multiplier;
+                if use_continuous_overlay {
+                    // Map multiplier to [0,1] intensity: ln(mult)/ln(5) so mult=5→1.0
+                    circuit_breaker_intensity =
+                        (multiplier.max(1.0).ln() / 5.0_f64.ln()).clamp(0.0, 1.0);
+                } else {
+                    risk_overlay_mult *= multiplier;
+                }
                 info!(
                     multiplier = %format!("{:.2}x", multiplier),
+                    cb_intensity = %format!("{:.2}", circuit_breaker_intensity),
                     "Circuit breaker: widening spreads"
                 );
             }
             None => {}
         }
 
-        // === Risk Limit Checks (Phase 7: graduated) ===
+        // === Risk Limit Checks (Phase 2: gamma routing via beta_inventory) ===
+        // Hard position limit is already handled by beta_inventory × utilization² in CalibratedRiskModel.
+        // At utilization=1.0: exp(4.0 × 1.0²) = 55× gamma — far exceeds old 3x mult.
+        // We only need to set reduce-only and log.
         let position_notional = self.position.position().abs() * self.latest_mid;
         let position_check = self.safety.risk_checker.check_position(position_notional);
         if matches!(position_check, RiskCheckResult::HardLimitBreached { .. }) {
-            // Hard limit → 3x spread + reduce-only, continue
-            risk_overlay_mult *= 3.0;
             risk_reduce_only = true;
-            error!("Hard position limit breached → graduated 3x spread + reduce-only");
+            if !use_continuous_overlay {
+                risk_overlay_mult *= 3.0;
+            }
+            error!("Hard position limit breached → reduce-only (gamma handled by beta_inventory)");
         }
 
-        // === Drawdown Check (Phase 7: graduated) ===
+        // === Drawdown Check (Phase 2: continuous gamma via beta_drawdown) ===
+        // beta_drawdown(1.4) × drawdown_fraction is already wired into CalibratedRiskModel.
+        // Emergency drawdown still sets reduce-only and continuous size reduction.
         if self.safety.drawdown_tracker.should_pause() {
-            // Drawdown pause → 3x spread + 10% size, continue
-            risk_overlay_mult *= 3.0;
-            risk_size_reduction *= 0.1;
-            warn!("Emergency drawdown → graduated 3x spread + 10% size");
+            if use_continuous_overlay {
+                // Continuous size: 1 - drawdown_frac² (smoother than binary 0.1)
+                let dd_frac = self.safety.drawdown_tracker.drawdown_pct().clamp(0.0, 1.0);
+                risk_size_reduction *= (1.0 - dd_frac.powi(2)).max(0.1);
+            } else {
+                risk_overlay_mult *= 3.0;
+                risk_size_reduction *= 0.1;
+            }
+            warn!(
+                drawdown_pct = %format!("{:.3}", self.safety.drawdown_tracker.drawdown_pct()),
+                size_reduction = %format!("{:.2}", risk_size_reduction),
+                "Emergency drawdown → continuous gamma + size reduction"
+            );
         }
 
-        // Cap risk_overlay_mult at 3x (single overlay) to prevent infinite widening
-        // The global spread cap downstream handles total composition
+        // Legacy: cap risk_overlay_mult at 3x (only used when continuous overlay is off)
         risk_overlay_mult = risk_overlay_mult.min(3.0);
 
         // === CENTRALIZED BELIEF SYSTEM: Update with price observations ===
@@ -494,23 +538,58 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This replaces scattered reads from beliefs_builder, regime_hmm, and changepoint.
         let belief_snapshot: BeliefSnapshot = self.central_beliefs.snapshot();
 
-        // Posterior-driven reduce-only: graduated conviction defense replaces binary 0.95.
-        // The conviction system (computed later in the cycle) populates conviction_reduce_only.
-        // As a fallback, keep the legacy posterior check for extreme cases.
+        // Posterior-driven defense: continuous probability-weighted sizing (Phase 3).
+        // Instead of binary reduce-only at threshold, scale increasing-side size by (1 - p_adverse).
+        // Still triggers hard reduce-only at extreme posterior (>0.98) as safety fallback.
         {
-            let posterior_threshold = self.inventory_governor.posterior_reduce_only_prob();
             let pos = self.position.position();
-            if (belief_snapshot.drift_vol.prob_bearish > posterior_threshold && pos > 0.0)
-                || (belief_snapshot.drift_vol.prob_bullish > posterior_threshold && pos < 0.0)
-            {
-                risk_reduce_only = true;
-                info!(
-                    prob_bearish = %format!("{:.3}", belief_snapshot.drift_vol.prob_bearish),
-                    prob_bullish = %format!("{:.3}", belief_snapshot.drift_vol.prob_bullish),
-                    position = %format!("{:.4}", pos),
-                    threshold = %format!("{:.2}", posterior_threshold),
-                    "Posterior reduce-only (legacy fallback): strong directional belief against position"
-                );
+            let p_bearish = belief_snapshot.drift_vol.prob_bearish;
+            let p_bullish = belief_snapshot.drift_vol.prob_bullish;
+
+            if use_continuous_overlay {
+                // Continuous sizing: increasing-side shrinks proportionally
+                // Long + bearish → bid_size × (1 - p_bearish).max(0.05)
+                // Short + bullish → ask_size × (1 - p_bullish).max(0.05)
+                let adverse_prob = if pos > 0.0 {
+                    p_bearish
+                } else if pos < 0.0 {
+                    p_bullish
+                } else {
+                    0.0
+                };
+                // Scale size reduction: 0.5 prob → 50% size, 0.9 → 10%, 0.95 → 5% (floor)
+                if adverse_prob > 0.3 {
+                    let posterior_size_mult = (1.0 - adverse_prob).max(0.05);
+                    risk_size_reduction *= posterior_size_mult;
+                }
+                // Hard reduce-only still triggers at extreme (safety)
+                if adverse_prob > 0.98 {
+                    risk_reduce_only = true;
+                }
+                if adverse_prob > 0.5 {
+                    info!(
+                        p_bearish = %format!("{:.3}", p_bearish),
+                        p_bullish = %format!("{:.3}", p_bullish),
+                        position = %format!("{:.4}", pos),
+                        posterior_size = %format!("{:.2}", (1.0 - adverse_prob).max(0.05)),
+                        "Posterior defense: continuous sizing (Phase 3)"
+                    );
+                }
+            } else {
+                // Legacy binary threshold
+                let posterior_threshold = self.inventory_governor.posterior_reduce_only_prob();
+                if (p_bearish > posterior_threshold && pos > 0.0)
+                    || (p_bullish > posterior_threshold && pos < 0.0)
+                {
+                    risk_reduce_only = true;
+                    info!(
+                        prob_bearish = %format!("{:.3}", p_bearish),
+                        prob_bullish = %format!("{:.3}", p_bullish),
+                        position = %format!("{:.4}", pos),
+                        threshold = %format!("{:.2}", posterior_threshold),
+                        "Posterior reduce-only (legacy): strong directional belief against position"
+                    );
+                }
             }
         }
 
@@ -877,6 +956,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.config.max_position,
         );
 
+        // Update CJP fill intensity from previous cycle's arrival rate
+        if let Some(ref mp) = self.cached_market_params {
+            if mp.arrival_intensity > 0.0 {
+                self.stochastic
+                    .hjb_controller
+                    .update_kappa_trade(mp.arrival_intensity);
+            }
+        }
+
         // Seed HJB with Kalman drift when Kalman has meaningful signal.
         // The HJB controller's OU model has a 1.4s half-life (θ=0.5), which means
         // its internal drift always mean-reverts to zero before minute-scale trends
@@ -1116,6 +1204,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             } else {
                 None
             },
+            // GMM toxicity posterior scores (Bayesian fill classification)
+            gmm_toxicity: Some(super::super::GmmToxicityScores {
+                p_informed_buy: self.gmm_toxicity.p_informed_buy(),
+                p_informed_sell: self.gmm_toxicity.p_informed_sell(),
+                toxicity_score: self.gmm_toxicity.toxicity_score(),
+                is_warmed_up: self.gmm_toxicity.is_warmed_up(),
+            }),
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
@@ -1981,9 +2076,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
-        // === CONTROLLER RISK OVERLAY (Phase 4: unified pipeline) ===
-        // Risk assessment replaces binary Quote/NoQuote with continuous multipliers.
-        // Called early so risk_overlay_mult and size can be adjusted.
+        // === CONTROLLER RISK OVERLAY (Phase 2E: continuous gamma routing) ===
+        // Risk assessment feeds continuous risk_severity_score into CalibratedRiskModel.
+        // KillSwitch still cancels all quotes (hard safety limit).
         let risk_overlay = self.stochastic.controller.risk_assessment();
         let risk_level = risk_overlay.risk_level;
         match risk_level {
@@ -1994,11 +2089,27 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             crate::market_maker::control::RiskLevel::Emergency => {
                 info!(reason = %risk_overlay.reason, "Risk overlay: emergency — position-reducing only");
                 risk_reduce_only = true;
-                risk_overlay_mult *= 2.0;
+                if use_continuous_overlay {
+                    // Emergency → severity=1.0 → exp(beta_risk_severity × 1.0) ≈ 2x gamma
+                    risk_severity_score = 1.0;
+                } else {
+                    risk_overlay_mult *= 2.0;
+                }
             }
             crate::market_maker::control::RiskLevel::Elevated => {
-                debug!(reason = %risk_overlay.reason, "Risk overlay: elevated risk");
-                risk_overlay_mult *= risk_overlay.spread_multiplier.max(1.0);
+                if use_continuous_overlay {
+                    // Elevated → proportional severity from spread_multiplier
+                    // Map multiplier to [0,1]: ln(mult)/ln(2) so mult=2→1.0
+                    let mult = risk_overlay.spread_multiplier.max(1.0);
+                    risk_severity_score = (mult.ln() / 2.0_f64.ln()).clamp(0.0, 1.0);
+                } else {
+                    risk_overlay_mult *= risk_overlay.spread_multiplier.max(1.0);
+                }
+                debug!(
+                    reason = %risk_overlay.reason,
+                    risk_severity = %format!("{:.2}", risk_severity_score),
+                    "Risk overlay: elevated risk → continuous gamma"
+                );
             }
             crate::market_maker::control::RiskLevel::Normal => {}
         }
@@ -2079,13 +2190,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         market_params.total_risk_premium_bps = total_risk_premium;
 
         // === Compose final risk overlay ===
-        // Phase 7: risk_overlay_mult → additive premium, capped at 3x excess
-        let spread_multiplier = risk_overlay_mult.min(3.0);
-        if spread_multiplier > 1.01 {
-            // Convert multiplicative excess to additive bps (assuming ~5 bps base)
-            let overlay_premium_bps = (spread_multiplier - 1.0) * 5.0;
-            market_params.total_risk_premium_bps += overlay_premium_bps;
-        }
+        // When continuous overlay is enabled, circuit breaker / drawdown / risk severity
+        // route through CalibratedRiskModel gamma (no additive premium conversion needed).
+        // Legacy path: convert multiplicative excess to additive bps.
+        let spread_multiplier = if use_continuous_overlay {
+            1.0 // Gamma handles it — no additive premium from risk_overlay_mult
+        } else {
+            let mult = risk_overlay_mult.min(3.0);
+            if mult > 1.01 {
+                let overlay_premium_bps = (mult - 1.0) * 5.0;
+                market_params.total_risk_premium_bps += overlay_premium_bps;
+            }
+            mult
+        };
 
         if total_risk_premium > 0.1 || spread_multiplier > 1.01 {
             debug!(
@@ -2188,6 +2305,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         market_params.calibration_deficit = self.quote_outcome_tracker.calibration_error();
+
+        // Phase 2: Wire continuous risk features for gamma routing
+        market_params.circuit_breaker_intensity = circuit_breaker_intensity;
+        market_params.risk_severity_score = risk_severity_score;
 
         // Issue 3: Wire calibration quality to central beliefs for observation noise modulation.
         // Poor calibration → inflate observation R → posteriors become more diffuse → wider spreads.
@@ -4700,29 +4821,39 @@ fn compute_continuous_inventory_pressure(
 ///
 /// Compute spread widening multiplier for stale data.
 ///
-/// When book or exchange limit data goes stale, spreads widen automatically
-/// to compensate for increased uncertainty. This converts staleness warnings
-/// into an automatic defensive response.
+/// Uses smooth sigmoid transitions instead of step functions:
+///   penalty(age) = max_penalty × sigmoid((age - threshold) / sharpness)
 ///
-/// Returns 1.0 (no penalty) when data is fresh, up to 3.0 when very stale.
+/// Book data:     threshold = 5s, sharpness = 2s, max_penalty = 1.0
+/// Exchange limits: threshold = 30s, sharpness = 10s, max_penalty = 1.0
+/// Total additive penalty capped at 2.0 (so multiplier ∈ [1.0, 3.0]).
+///
+/// Hard kill: book > 30s or limits > 5min handled upstream (not here).
 fn compute_staleness_spread_penalty(book_age_ms: u64, exchange_limits_age_ms: u64) -> f64 {
-    let mut mult: f64 = 1.0;
-
-    // Book data stale: widens at 5s, more at 15s
-    if book_age_ms > 15_000 {
-        mult *= 2.0;
-    } else if book_age_ms > 5_000 {
-        mult *= 1.5;
+    /// Sigmoid helper: 1 / (1 + exp(-x))
+    fn sigmoid(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
     }
 
-    // Exchange limits stale: widens at 30s, more at 2min
-    if exchange_limits_age_ms > 120_000 {
-        mult *= 2.0;
-    } else if exchange_limits_age_ms > 30_000 {
-        mult *= 1.5;
-    }
+    // Book staleness: smooth ramp centered at 5s, steepness controlled by 2s sharpness
+    // At 0s → sigmoid(-2.5) ≈ 0.08, at 5s → 0.5, at 10s → sigmoid(2.5) ≈ 0.92
+    const BOOK_THRESHOLD_MS: f64 = 5_000.0;
+    const BOOK_SHARPNESS_MS: f64 = 2_000.0;
+    const BOOK_MAX_PENALTY: f64 = 1.0;
+    let book_penalty =
+        BOOK_MAX_PENALTY * sigmoid((book_age_ms as f64 - BOOK_THRESHOLD_MS) / BOOK_SHARPNESS_MS);
 
-    mult.min(3.0) // Cap at 3x to avoid extreme widening
+    // Exchange limits staleness: smooth ramp centered at 30s
+    // At 0s → ≈0, at 30s → 0.5, at 60s → sigmoid(3) ≈ 0.95
+    const LIMITS_THRESHOLD_MS: f64 = 30_000.0;
+    const LIMITS_SHARPNESS_MS: f64 = 10_000.0;
+    const LIMITS_MAX_PENALTY: f64 = 1.0;
+    let limits_penalty = LIMITS_MAX_PENALTY
+        * sigmoid((exchange_limits_age_ms as f64 - LIMITS_THRESHOLD_MS) / LIMITS_SHARPNESS_MS);
+
+    // Additive penalties, capped at 2.0 total → multiplier ∈ [1.0, 3.0]
+    let total_penalty = (book_penalty + limits_penalty).min(2.0);
+    1.0 + total_penalty
 }
 
 /// This replaces the hardcoded `tick_size_bps: 10.0` which caused spreads
@@ -5134,41 +5265,64 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Stale data circuit breaker tests
+    // Stale data circuit breaker tests (sigmoid-based)
     // ---------------------------------------------------------------
     #[test]
     fn test_staleness_penalty_fresh_data() {
-        // Fresh data: no penalty
-        assert!((compute_staleness_spread_penalty(100, 1000) - 1.0).abs() < f64::EPSILON);
+        // Fresh data: penalty near 1.0 (tiny sigmoid tail)
+        let p = compute_staleness_spread_penalty(100, 1000);
+        assert!(p < 1.15, "Fresh data should be near 1.0, got {p}");
+        assert!(p >= 1.0, "Penalty must be >= 1.0, got {p}");
     }
 
     #[test]
     fn test_staleness_penalty_stale_book() {
-        // Book stale at 5s: 1.5x
-        let p = compute_staleness_spread_penalty(6_000, 1_000);
-        assert!((p - 1.5).abs() < f64::EPSILON, "Expected 1.5, got {p}");
+        // Book at threshold (5s): ~0.5 penalty → mult ≈ 1.5
+        let p = compute_staleness_spread_penalty(5_000, 100);
+        assert!(
+            (p - 1.5).abs() < 0.15,
+            "At book threshold expected ~1.5, got {p}"
+        );
 
-        // Book very stale at 15s: 2.0x
-        let p = compute_staleness_spread_penalty(16_000, 1_000);
-        assert!((p - 2.0).abs() < f64::EPSILON, "Expected 2.0, got {p}");
+        // Book well past threshold (15s): near-max book penalty → mult ≈ 2.0
+        let p = compute_staleness_spread_penalty(15_000, 100);
+        assert!(p > 1.85, "Book 15s should be near 2.0, got {p}");
+        assert!(p < 2.15, "Book 15s should not exceed ~2.1, got {p}");
     }
 
     #[test]
     fn test_staleness_penalty_stale_limits() {
-        // Exchange limits stale at 30s: 1.5x
-        let p = compute_staleness_spread_penalty(100, 35_000);
-        assert!((p - 1.5).abs() < f64::EPSILON, "Expected 1.5, got {p}");
+        // Limits at threshold (30s): ~0.5 penalty → mult ≈ 1.5
+        let p = compute_staleness_spread_penalty(100, 30_000);
+        assert!(
+            (p - 1.5).abs() < 0.15,
+            "At limits threshold expected ~1.5, got {p}"
+        );
 
-        // Exchange limits very stale at 2min: 2.0x
-        let p = compute_staleness_spread_penalty(100, 130_000);
-        assert!((p - 2.0).abs() < f64::EPSILON, "Expected 2.0, got {p}");
+        // Limits well past threshold (2min): near-max limits penalty → mult ≈ 2.0
+        let p = compute_staleness_spread_penalty(100, 120_000);
+        assert!(p > 1.85, "Limits 2min should be near 2.0, got {p}");
     }
 
     #[test]
     fn test_staleness_penalty_capped_at_3x() {
-        // Both very stale: 2.0 * 2.0 = 4.0, capped at 3.0
+        // Both very stale: sigmoid penalties both ≈ 1.0, total capped at 2.0 → mult = 3.0
         let p = compute_staleness_spread_penalty(20_000, 200_000);
-        assert!((p - 3.0).abs() < f64::EPSILON, "Expected 3.0 cap, got {p}");
+        assert!((p - 3.0).abs() < 0.05, "Expected ~3.0 cap, got {p}");
+    }
+
+    #[test]
+    fn test_staleness_penalty_monotonic() {
+        // Verify monotonically increasing with book age
+        let p1 = compute_staleness_spread_penalty(1_000, 100);
+        let p2 = compute_staleness_spread_penalty(3_000, 100);
+        let p3 = compute_staleness_spread_penalty(5_000, 100);
+        let p4 = compute_staleness_spread_penalty(10_000, 100);
+        let p5 = compute_staleness_spread_penalty(20_000, 100);
+        assert!(p1 < p2, "Staleness penalty must be monotonic: {p1} < {p2}");
+        assert!(p2 < p3, "Staleness penalty must be monotonic: {p2} < {p3}");
+        assert!(p3 < p4, "Staleness penalty must be monotonic: {p3} < {p4}");
+        assert!(p4 < p5, "Staleness penalty must be monotonic: {p4} < {p5}");
     }
 
     // ---------------------------------------------------------------

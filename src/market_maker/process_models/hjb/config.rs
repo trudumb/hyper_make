@@ -91,6 +91,21 @@ pub struct HJBConfig {
     /// When false, uses the static `terminal_penalty` value.
     pub calibrate_terminal_penalty: bool,
 
+    // === CJP Signal-Aware Reservation Price ===
+    /// Enable CJP signal-aware reservation price shift (Cartea-Jaimungal-Penalva 2015).
+    /// Replaces linear drift_urgency with self-bounding closed-form:
+    ///   signal_shift = α_t / (κ_ou + γ×κ_trade) × (1 - exp(-(κ_ou + γ×κ_trade)×(T-t)))
+    pub use_cjp_signal: bool,
+
+    /// Default fill intensity for CJP (fills/sec). Updated from arrival_intensity each cycle.
+    /// Range: [0.01, 100.0], Default: 0.5
+    pub cjp_kappa_trade_default: f64,
+
+    /// OU mean-reversion rate for signal process (CJP κ_ou).
+    /// NOT the same as ou_theta — this controls how quickly the drift signal mean-reverts.
+    /// Range: [0.01, 1.0], Default: 0.1
+    pub cjp_kappa_ou: f64,
+
     // === Queue Value Parameters ===
     /// Enable HJB queue value preservation.
     /// When true, considers queue position value before cancelling orders.
@@ -137,6 +152,10 @@ impl Default for HJBConfig {
             // Funding horizon (enabled by default — perpetuals settle every 8h)
             use_funding_horizon: true,
             calibrate_terminal_penalty: true,
+            // CJP signal-aware reservation price (Cartea-Jaimungal-Penalva 2015)
+            use_cjp_signal: true,
+            cjp_kappa_trade_default: 0.5,
+            cjp_kappa_ou: 0.1,
             // Queue value parameters
             use_queue_value: true,
             queue_alpha: 0.1,

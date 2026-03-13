@@ -401,6 +401,28 @@ impl ParameterRegistry {
             .collect()
     }
 
+    /// Get a summary of parameters for a specific category.
+    pub fn summary_by_category(&self, category: &str) -> Vec<ParamSummary> {
+        self.params
+            .iter()
+            .filter(|(_, p)| p.category == category)
+            .map(|(name, p)| {
+                let (lo_95, hi_95) = p.bounds();
+                ParamSummary {
+                    name: name.clone(),
+                    category: p.category.clone(),
+                    family: p.param.family,
+                    value: p.value(),
+                    prior_mean: p.prior_mean(),
+                    ci_95_lower: lo_95,
+                    ci_95_upper: hi_95,
+                    ess: p.effective_sample_size(),
+                    is_calibrated: p.is_calibrated(),
+                }
+            })
+            .collect()
+    }
+
     /// Reset all parameters to their priors.
     pub fn reset_all(&mut self) {
         for p in self.params.values_mut() {
@@ -587,6 +609,24 @@ pub fn create_default_registry() -> ParameterRegistry {
             .with_hard_bounds(0.0, 3.0),
     );
 
+    // === Phase 2: Continuous Risk Overlay Betas ===
+    reg.register(
+        EBParam::normal("beta_circuit_breaker", 1.61, 0.25)
+            .with_category("risk_model")
+            .with_description(
+                "Log-gamma per unit circuit breaker intensity. ln(5)≈1.61 matches old 5x mult",
+            )
+            .with_hard_bounds(0.0, 4.0),
+    );
+    reg.register(
+        EBParam::normal("beta_risk_severity", 0.69, 0.09)
+            .with_category("risk_model")
+            .with_description(
+                "Log-gamma per unit risk severity score. ln(2)≈0.69 matches old 2x mult",
+            )
+            .with_hard_bounds(0.0, 3.0),
+    );
+
     // === Signal Weights (Phase 3) ===
     reg.register(
         EBParam::gamma("signal_precision_price", 1.0, 10.0)
@@ -644,6 +684,69 @@ pub fn create_default_registry() -> ParameterRegistry {
             .with_description("Half-life in seconds for 5m EWMA")
             .with_hard_bounds(120.0, 600.0),
     );
+
+    // === EWMA Half-Lives — Specific (Phase 4) ===
+    // Each alpha has a corresponding half-life entry.
+    // Utility: alpha = 1 - 2^(-1/half_life_obs)
+    reg.register(
+        EBParam::gamma("ewma_hl_innovation", 14.0, 15.0)
+            .with_category("ewma")
+            .with_description(
+                "Half-life (observations) for innovation variance EWMA. Default alpha=0.05",
+            )
+            .with_hard_bounds(3.0, 100.0),
+    );
+    reg.register(
+        EBParam::gamma("ewma_hl_kappa", 1.0, 15.0)
+            .with_category("ewma")
+            .with_description(
+                "Half-life (observations) for kappa EWMA smoothing. Default alpha=0.9",
+            )
+            .with_hard_bounds(0.5, 20.0),
+    );
+    reg.register(
+        EBParam::gamma("ewma_hl_sigma_ratio", 20.0, 15.0)
+            .with_category("ewma")
+            .with_description("Half-life (observations) for sigma ratio EWMA. Default alpha=0.05")
+            .with_hard_bounds(5.0, 100.0),
+    );
+    reg.register(
+        EBParam::gamma("ewma_hl_hjb_kappa_trade", 20.0, 15.0)
+            .with_category("ewma")
+            .with_description("Half-life (cycles) for HJB kappa_trade EWMA. Default alpha=0.05")
+            .with_hard_bounds(5.0, 100.0),
+    );
+    reg.register(
+        EBParam::gamma("ewma_hl_bias", 99.0, 15.0)
+            .with_category("ewma")
+            .with_description(
+                "Half-life (observations) for sampling bias EWMA. Default alpha=0.007",
+            )
+            .with_hard_bounds(20.0, 500.0),
+    );
+
+    // === Microstructure Toxicity Weights (Phase 5) ===
+    for (name, mean) in [
+        ("toxicity_w_impact", 0.22),
+        ("toxicity_w_run", 0.18),
+        ("toxicity_w_intensity", 0.12),
+        ("toxicity_w_arrival", 0.12),
+        ("toxicity_w_spread", 0.08),
+        ("toxicity_w_imbalance", 0.08),
+        ("toxicity_w_size", 0.05),
+        ("toxicity_w_size_conc", 0.08),
+        ("toxicity_w_dir_conc", 0.07),
+    ] {
+        reg.register(
+            EBParam::gamma(name, mean, 20.0)
+                .with_category("toxicity_weights")
+                .with_description(&format!(
+                    "Microstructure toxicity weight for {}",
+                    name.strip_prefix("toxicity_w_").unwrap_or(name)
+                ))
+                .with_hard_bounds(0.01, 0.5),
+        );
+    }
 
     // === Regime HMM (Phase 5) ===
     reg.register(
@@ -807,46 +910,46 @@ pub fn create_default_registry() -> ParameterRegistry {
             .with_hard_bounds(0.05, 0.80),
     );
 
-    // === Directional Kalman Observation Noise (Phase 3: Signal Weights) ===
-    // Base observation noise variance for each signal source in the directional
-    // Kalman filter (belief/central.rs). These are PRIOR R values; the online
-    // innovation tracker adapts them via adapted_dir_noise().
+    // === Directional Observation Noise (Phase 1: Adaptive Noise) ===
+    // Observation noise VARIANCE for each signal source in the directional
+    // Kalman filter (belief/central.rs). InverseGamma conjugate prior enables
+    // online variance learning from innovation residuals.
     //
     // Rationale for priors:
     // - Price: z-score Var≈1.0, so R=1.0 matches signal variance → neutral prior
-    // - Fill: binary ±1 with low directional info, Var=1.0 but R=16.0 → heavily discounted
+    // - Fill: binary ±1 with low directional info, R=16.0 → heavily discounted
     //   (fills are noisy directional indicators; ~50% informed at best)
     // - AS: magnitude-scaled ∈ [0,2], typical Var≈1.5, R=2.5 → mild discount
     // - Flow: direction ∈ [-1,1], Var≈1.0, R=1.0 → neutral
     // - Burst: rare high-info events, R=0.5 → trusted (2x weight vs price)
     reg.register(
-        EBParam::gamma("dir_noise_price", 1.0, 5.0)
-            .with_category("signal_weights")
-            .with_description("Kalman observation noise for price z-scores (Var≈1.0)")
+        EBParam::inverse_gamma("dir_noise_price", 1.0, 5.0)
+            .with_category("observation_noise")
+            .with_description("Observation noise variance for price-based directional signal")
             .with_hard_bounds(0.1, 10.0),
     );
     reg.register(
-        EBParam::gamma("dir_noise_fill", 16.0, 3.0)
-            .with_category("signal_weights")
-            .with_description("Kalman observation noise for fill side (binary, low info)")
-            .with_hard_bounds(1.0, 50.0),
+        EBParam::inverse_gamma("dir_noise_fill", 16.0, 5.0)
+            .with_category("observation_noise")
+            .with_description("Observation noise variance for fill-side evidence")
+            .with_hard_bounds(1.0, 100.0),
     );
     reg.register(
-        EBParam::gamma("dir_noise_as", 2.5, 4.0)
-            .with_category("signal_weights")
-            .with_description("Kalman observation noise for AS-direction evidence")
-            .with_hard_bounds(0.5, 20.0),
+        EBParam::inverse_gamma("dir_noise_as", 2.5, 5.0)
+            .with_category("observation_noise")
+            .with_description("Observation noise variance for AS-direction evidence")
+            .with_hard_bounds(0.1, 20.0),
     );
     reg.register(
-        EBParam::gamma("dir_noise_flow", 1.0, 5.0)
-            .with_category("signal_weights")
-            .with_description("Kalman observation noise for order flow direction")
+        EBParam::inverse_gamma("dir_noise_flow", 1.0, 5.0)
+            .with_category("observation_noise")
+            .with_description("Observation noise variance for order flow direction")
             .with_hard_bounds(0.1, 10.0),
     );
     reg.register(
-        EBParam::gamma("dir_noise_burst", 0.5, 5.0)
-            .with_category("signal_weights")
-            .with_description("Kalman observation noise for burst events (rare, high-info)")
+        EBParam::inverse_gamma("dir_noise_burst", 0.5, 5.0)
+            .with_category("observation_noise")
+            .with_description("Observation noise variance for burst/cascade events")
             .with_hard_bounds(0.05, 5.0),
     );
 

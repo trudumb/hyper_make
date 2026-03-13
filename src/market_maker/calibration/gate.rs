@@ -514,6 +514,8 @@ mod tests {
             as_fills_measured: 0,
             parameter_registry: Default::default(),
             fqi_q_table: Default::default(),
+            gmm_toxicity: Default::default(),
+            cox_fill: Default::default(),
         }
     }
 

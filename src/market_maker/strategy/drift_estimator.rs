@@ -233,6 +233,18 @@ impl KalmanDriftEstimator {
         self.update_single_observation(z, r);
     }
 
+    /// Cox process fill update: Bayesian-optimal fill-to-drift inference.
+    ///
+    /// z and r come from CoxFillModel::fill_observation():
+    /// - z = sign * beta * Sigma (signal proportional to uncertainty)
+    /// - r = beta^2 * Sigma (observation variance)
+    ///
+    /// With these values, K = 1/(1+beta^2) -- a fixed fraction independent of Sigma.
+    /// This replaces the heuristic distance_sigma scaling.
+    pub fn update_fill_cox(&mut self, z: f64, r: f64) {
+        self.update_single_observation(z, r);
+    }
+
     /// Trend observation from multi-timeframe trend detector.
     ///
     /// z = -magnitude × agreement × p_continuation

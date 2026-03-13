@@ -307,6 +307,18 @@ pub struct MarketParams {
     /// E[AS | fill] ≠ E[AS] unconditional. None during warmup.
     pub conditional_as_posterior_mean_bps: Option<f64>,
 
+    // === Tier 1: GMM Toxicity Posterior (Upgrade 2B) ===
+    /// GMM posterior P(informed | markout) for buy fills [0, 1].
+    /// From Gaussian Mixture Model: principled Bayesian classification.
+    pub gmm_p_informed_buy: f64,
+    /// GMM posterior P(informed | markout) for sell fills [0, 1].
+    pub gmm_p_informed_sell: f64,
+    /// GMM aggregate toxicity score [0, 1].
+    /// Average of per-side P(informed) EWMAs. Replaces heuristic toxicity_score when warmed.
+    pub gmm_toxicity_score: f64,
+    /// Whether GMM toxicity model is warmed up (has enough markout observations).
+    pub gmm_toxicity_warmed: bool,
+
     // === Tier 1: Pre-Fill AS Classifier (Phase 3) ===
     /// Pre-fill toxicity score for bid side [0, 1].
     /// Predicts how toxic a bid fill would be BEFORE it happens.
@@ -330,6 +342,16 @@ pub struct MarketParams {
     /// 0.0 = calm market, 1.0 = full cascade severity.
     /// Fed into CalibratedRiskModel beta_cascade.
     pub cascade_intensity: f64,
+
+    /// Circuit breaker intensity [0, 1] for continuous gamma routing (Phase 2).
+    /// 0 = no breaker active, 1 = PauseTrading/CancelAll (maps to ~5x gamma via beta_circuit_breaker).
+    /// Intermediate: WidenSpreads multiplier → intensity = ln(mult) / ln(5).
+    pub circuit_breaker_intensity: f64,
+
+    /// Risk severity score [0, 1] from stochastic controller (Phase 2E).
+    /// Normal = 0, proportional for Elevated, 1.0 for Emergency.
+    /// Routes through beta_risk_severity in CalibratedRiskModel.
+    pub risk_severity_score: f64,
 
     // === Tier 2: Hawkes Order Flow ===
     /// Hawkes buy intensity (λ_buy) - self-exciting arrival rate
@@ -1220,6 +1242,11 @@ impl Default for MarketParams {
             as_informed_ratio: 0.0, // No AS data yet
             depth_decay_as: None,   // No calibrated model initially
             conditional_as_posterior_mean_bps: None, // Learned from fill AS data, not magic number
+            // Tier 1: GMM Toxicity Posterior (Upgrade 2B)
+            gmm_p_informed_buy: 0.0,    // No GMM data yet
+            gmm_p_informed_sell: 0.0,   // No GMM data yet
+            gmm_toxicity_score: 0.0,    // No GMM data yet
+            gmm_toxicity_warmed: false, // Not warmed up
             // Tier 1: Pre-Fill AS Classifier (Phase 3)
             pre_fill_toxicity_bid: 0.0, // No toxicity initially
             pre_fill_toxicity_ask: 0.0, // No toxicity initially
@@ -1227,6 +1254,8 @@ impl Default for MarketParams {
             tail_risk_intensity: 0.0, // Default to 0 intensity (calm)
             should_pull_quotes: false,
             cascade_intensity: 0.0, // Default to 0 intensity (calm): full size
+            circuit_breaker_intensity: 0.0, // No breaker active
+            risk_severity_score: 0.0, // Normal risk level
             // Tier 2: Hawkes Order Flow
             hawkes_buy_intensity: 0.0,
             hawkes_sell_intensity: 0.0,

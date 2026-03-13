@@ -143,6 +143,12 @@ pub struct CascadeConfig {
     pub burst_count_window_secs: u64,
     /// Cooldown in seconds after burst-cancel before next can fire (default: 5).
     pub burst_cancel_cooldown_secs: u64,
+
+    /// Use Hawkes intensity ratio for burst detection instead of count window.
+    /// When true, burst detection uses `intensity_ratio > burst_intensity_ratio`
+    /// from the Hawkes process rather than counting fills in a time window.
+    /// Default: false (count-based is the legacy path; enable after validation).
+    pub use_hawkes_burst: bool,
 }
 
 impl Default for CascadeConfig {
@@ -163,6 +169,7 @@ impl Default for CascadeConfig {
             burst_count_threshold: 4,
             burst_count_window_secs: 2,
             burst_cancel_cooldown_secs: 5,
+            use_hawkes_burst: true,
         }
     }
 }

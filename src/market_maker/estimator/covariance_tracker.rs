@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 /// EWMA alpha for sigma ratio updates. 0.05 = ~20 observation half-life.
 const SIGMA_RATIO_ALPHA: f64 = 0.05;
 
+/// Default EWMA alpha for sigma ratio (used by serde default).
+fn default_sigma_ratio_alpha() -> f64 {
+    SIGMA_RATIO_ALPHA
+}
+
 /// Bayesian prior for sigma correction factor (starts at 1.0 = trust model).
 const SIGMA_PRIOR_MEAN: f64 = 1.0;
 
@@ -61,6 +66,11 @@ pub struct CovarianceTracker {
     observation_count: usize,
     /// Sum of squared prediction errors (for diagnostics).
     sum_sq_error: f64,
+    /// Learned EWMA alpha for sigma ratio updates (Phase 4).
+    /// Default: 0.05 (~20 observation half-life).
+    /// Set from EB registry via `set_sigma_ratio_alpha()`.
+    #[serde(default = "default_sigma_ratio_alpha")]
+    sigma_ratio_alpha: f64,
 }
 
 impl Default for CovarianceTracker {
@@ -71,6 +81,7 @@ impl Default for CovarianceTracker {
             sigma_ratio_ewma: 1.0,
             observation_count: 0,
             sum_sq_error: 0.0,
+            sigma_ratio_alpha: SIGMA_RATIO_ALPHA,
         }
     }
 }
@@ -101,8 +112,8 @@ impl CovarianceTracker {
         if self.observation_count == 0 {
             self.sigma_ratio_ewma = ratio;
         } else {
-            self.sigma_ratio_ewma =
-                SIGMA_RATIO_ALPHA * ratio + (1.0 - SIGMA_RATIO_ALPHA) * self.sigma_ratio_ewma;
+            self.sigma_ratio_ewma = self.sigma_ratio_alpha * ratio
+                + (1.0 - self.sigma_ratio_alpha) * self.sigma_ratio_ewma;
         }
 
         // Precision decay: forget old data to adapt to regime changes.
@@ -183,6 +194,11 @@ impl CovarianceTracker {
             return 0.0;
         }
         (self.sum_sq_error / self.observation_count as f64).sqrt()
+    }
+
+    /// Set EWMA alpha from learned half-life.
+    pub fn set_sigma_ratio_alpha(&mut self, alpha: f64) {
+        self.sigma_ratio_alpha = alpha.clamp(0.005, 0.5);
     }
 }
 

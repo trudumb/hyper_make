@@ -990,10 +990,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === Phase 2/3 Component Updates ===
         // Update regime HMM with trade observation for soft regime blending
-        let obs = HmmObservation::new(
+        let obs = HmmObservation::new_with_hawkes(
             self.estimator.sigma(),
             self.tier2.spread_tracker.current_spread_bps(),
             self.tier2.hawkes.flow_imbalance(),
+            self.tier2.hawkes.intensity_ratio(),
         );
         self.stochastic.regime_hmm.forward_update(&obs);
 
@@ -1330,10 +1331,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 timestamp: fill.time,
             };
 
-            // Feed fill to Kalman drift estimator: bid fill → bearish, ask fill → bullish
-            let sigma = self.estimator.sigma_effective();
-            self.drift_estimator
-                .update_fill(is_buy, fill_price, self.latest_mid, sigma);
+            // Cox process fill → drift update (Bayesian score function)
+            let (z, r) = self
+                .cox_fill_model
+                .fill_observation(is_buy, self.drift_estimator.state_variance());
+            self.drift_estimator.update_fill_cox(z, r);
+            self.cox_fill_model.record_fill(
+                is_buy,
+                self.drift_estimator.drift_bps_per_sec(),
+                fill.time,
+            );
 
             // Fix 13: Update EchoEstimator with current trend magnitude on own fill
             let position_value = (self.position.position().abs() * self.latest_mid).max(1.0);
